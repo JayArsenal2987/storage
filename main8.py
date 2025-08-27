@@ -21,7 +21,7 @@ SYMBOLS = {
 }
 
 # >>> per-symbol safe ASCII tags <<<
-SYMBOL_TAG = {"ADAUSDT":"ADA","BNBUSDT":"BNB","SOLUSDT":"SOL","XRPUSDT":"XRP"}
+SYMBOL_TAG = {"ADAUSDT":"ADA","XRPUSDT":"XRP"}
 
 # WMA periods in seconds
 SHORT_WMA_PERIOD = 4 * 60 * 60      # 4h (SHORT side)
@@ -43,6 +43,10 @@ ENTRY_GUARD_TTL_SEC   = float(os.getenv("ENTRY_GUARD_TTL_SEC", "5.0"))
 POSITION_CACHE_TTL    = float(os.getenv("POSITION_CACHE_TTL", "45.0"))
 RATE_LIMIT_BASE_SLEEP = float(os.getenv("RATE_LIMIT_BASE_SLEEP", "2.0"))
 RATE_LIMIT_MAX_SLEEP  = float(os.getenv("RATE_LIMIT_MAX_SLEEP", "60.0"))
+
+# ---- Price source for triggers (use same for trailing + stop) ----
+# Options: "CONTRACT_PRICE" (default, twitchier) or "MARK_PRICE" (steadier)
+PRICE_SOURCE = os.getenv("PRICE_SOURCE", "CONTRACT_PRICE").upper()
 
 # ---- Special ID tag for callback activation ----
 TRAIL_GUARD_TAG = os.getenv("TRAIL_GUARD_TAG", "CALLBK")
@@ -360,19 +364,20 @@ async def place_trailing(cli: AsyncClient, symbol: str, side: str,
         positionSide=position_side,
         callbackRate=cb,
         activationPrice=activation_str,
-        workingType="CONTRACT_PRICE",
+        workingType=PRICE_SOURCE,          # << unified price source
         newOrderRespType="ACK",
         newClientOrderId=cid,
     )
     if reduce_only_allowed:
         params["reduceOnly"] = True
 
-    logging.info(f"{symbol} placing trailing {side}: cb={cb:.3f}% act={activation_str} cid={cid}")
+    # bumped to WARNING so you see these during the quiet window
+    logging.warning(f"{symbol} placing trailing {side}: cb={cb:.3f}% act={activation_str} cid={cid} src={PRICE_SOURCE}")
     try:
         res = await call_binance(cli.futures_create_order, **params)
         oid = res.get("orderId")
         invalidate_position_cache(symbol)
-        logging.info(f"{symbol} placed trailing to close {side}: oid={oid} cid={cid}")
+        logging.warning(f"{symbol} placed trailing to close {side}: oid={oid} cid={cid} src={PRICE_SOURCE}")
         return oid, float(activation_str), cid
     except Exception as e:
         msg = str(e)
@@ -387,7 +392,7 @@ async def place_trailing(cli: AsyncClient, symbol: str, side: str,
                 res = await call_binance(cli.futures_create_order, **params)
                 oid = res.get("orderId")
                 invalidate_position_cache(symbol)
-                logging.info(f"{symbol} retried trailing {side}: oid={oid} act={activation_str} cid={cid}")
+                logging.warning(f"{symbol} retried trailing {side}: oid={oid} act={activation_str} cid={cid} src={PRICE_SOURCE}")
                 return oid, float(activation_str), cid
             except Exception as e2:
                 logging.error(f"{symbol} trailing retry failed: {e2} cid={cid}")
@@ -428,7 +433,7 @@ async def place_profit_lock(cli: AsyncClient, symbol: str, side: str,
         type="STOP_MARKET",
         positionSide=position_side,
         stopPrice=stop_str,
-        workingType="MARK_PRICE",
+        workingType=PRICE_SOURCE,          # << unified price source
         quantity=size,
         newOrderRespType="ACK",
         newClientOrderId=cid,
@@ -436,12 +441,13 @@ async def place_profit_lock(cli: AsyncClient, symbol: str, side: str,
     )
     params = {k: v for k, v in params.items() if v is not None}
 
-    logging.info(f"{symbol} placing PROFIT-LOCK {side}: stop={stop_str} qty={size} cid={cid}")
+    # bumped to WARNING so you see these during the quiet window
+    logging.warning(f"{symbol} placing PROFIT-LOCK {side}: stop={stop_str} qty={size} cid={cid} src={PRICE_SOURCE}")
     try:
         res = await call_binance(cli.futures_create_order, **params)
         oid = res.get("orderId")
         invalidate_position_cache(symbol)
-        logging.info(f"{symbol} placed PROFIT-LOCK {side}: oid={oid} stop={stop_str} cid={cid}")
+        logging.warning(f"{symbol} placed PROFIT-LOCK {side}: oid={oid} stop={stop_str} cid={cid} src={PRICE_SOURCE}")
         return oid, float(stop_str), cid
     except Exception as e:
         logging.error(f"{symbol} profit-lock place failed ({side}): {e}")
@@ -789,70 +795,15 @@ async def run(cli: AsyncClient):
                         st["wma4_cross_ts"] = now_ts
                         logging.info(f"{sym} WMA4 regime {'BELOW' if st['wma4_below'] else 'NOT BELOW'} flipped at {price:.6f}")
 
-                    # ---------------- HARD LOSS EXIT at ROE ≤ -25% ----------------
-                    roe_long = pnl_percent(st["long_entry_price"], price, "LONG")
-                    if st["in_long"] and (roe_long <= -25.0):
-                        async with st["order_lock"]:
-                            if st["in_long"]:
-                                await cancel_trailing(cli, sym, st["long_trailing"]["order_id"])
-                                await cancel_profit_lock(cli, sym, st["long_profit_lock"]["order_id"], "LONG")
-                                size = await get_position_size(cli, sym, "LONG")
-                                if size > 1e-12:
-                                    params = dict(symbol=sym, side="SELL", type="MARKET",
-                                                  quantity=size, positionSide="LONG")
-                                    success = await safe_order_execution(cli, params, sym, "LONG HARD EXIT (ROE ≤ -25%)")
-                                    if success:
-                                        exit_px = st["last_price"] or price
-                                        st["long_exit_history"].append(exit_px)
-                                        if len(st["long_exit_history"]) > EXIT_HISTORY_MAX:
-                                            st["long_exit_history"] = st["long_exit_history"][-EXIT_HISTORY_MAX:]
-                                        st["in_long"] = False
-                                        st["long_entry_price"] = None
-                                        st["long_peak"] = None
-                                        st["long_trailing"] = {"order_id": None, "callback": None, "activation": None}
-                                        st["long_trailing_guard_id"] = None
-                                        st["long_profit_lock"] = {"order_id": None, "stop_price": None}
-                                        logging.info(f"{sym} LONG HARD EXIT at ROE {roe_long:.2f}%")
-                        continue
-
-                    roe_short = pnl_percent(st["short_entry_price"], price, "SHORT")
-                    if st["in_short"] and (roe_short <= -25.0):
-                        async with st["order_lock"]:
-                            if st["in_short"]:
-                                await cancel_trailing(cli, sym, st["short_trailing"]["order_id"])
-                                await cancel_profit_lock(cli, sym, st["short_profit_lock"]["order_id"], "SHORT")
-                                size = await get_position_size(cli, sym, "SHORT")
-                                if size > 1e-12:
-                                    params = dict(symbol=sym, side="BUY", type="MARKET",
-                                                  quantity=size, positionSide="SHORT")
-                                    success = await safe_order_execution(cli, params, sym, "SHORT HARD EXIT (ROE ≤ -25%)")
-                                    if success:
-                                        exit_px = st["last_price"] or price
-                                        st["short_exit_history"].append(exit_px)
-                                        if len(st["short_exit_history"]) > EXIT_HISTORY_MAX:
-                                            st["short_exit_history"] = st["short_exit_history"][-EXIT_HISTORY_MAX:]
-                                        st["in_short"] = False
-                                        st["short_entry_price"] = None
-                                        st["short_trough"] = None
-                                        st["short_trailing"] = {"order_id": None, "callback": None, "activation": None}
-                                        st["short_trailing_guard_id"] = None
-                                        st["short_profit_lock"] = {"order_id": None, "stop_price": None}
-                                        logging.info(f"{sym} SHORT HARD EXIT at ROE {roe_short:.2f}%")
-                        continue
-
-                    # ---------------- POSITIVE SIDE: PROFIT-LOCK (+40% arm, +25% stop) ----------
+                    # ---------- PROFIT-LOCK & TRAILING MAINTENANCE ON TICKS ----------
                     if st["in_long"]:
                         await ensure_profit_lock(cli, sym, st, price, side="LONG",
                                                  reduce_only_allowed=(not dual_side))
-                    if st["in_short"]:
-                        await ensure_profit_lock(cli, sym, st, price, side="SHORT",
-                                                 reduce_only_allowed=(not dual_side))
-
-                    # ---------------- POSITIVE SIDE: TRAILING at +60% ROE (0.5% cb) ----------
-                    if st["in_long"]:
                         await ensure_trailing(cli, sym, st, price, side="LONG",
                                               reduce_only_allowed=(not dual_side))
                     if st["in_short"]:
+                        await ensure_profit_lock(cli, sym, st, price, side="SHORT",
+                                                 reduce_only_allowed=(not dual_side))
                         await ensure_trailing(cli, sym, st, price, side="SHORT",
                                               reduce_only_allowed=(not dual_side))
 
@@ -860,25 +811,25 @@ async def run(cli: AsyncClient):
                     if (not st["in_long"]) and (not st["long_pending"]):
                         entry_triggered = False; entry_type = ""
 
-                        # PRICE/WMA part (unchanged re-entry rules), but using current WMA regime
+                        # PRICE/WMA part reset
                         if len(st["long_exit_history"]) > 0 and not st["wma24_above"]:
                             st["long_exit_history"] = []
                             logging.info(f"{sym} LONG reset: price {price:.4f} <= 24h WMA {wma_long:.4f}")
 
                         if len(st["long_exit_history"]) == 0:
-                            if st["wma24_above"]:  # regime true now (price > 24h WMA)
+                            if st["wma24_above"]:
                                 entry_triggered = True; entry_type = "LONG FIRST ENTRY (WMA24 regime above)"
                         else:
                             H = max(st["long_exit_history"]) if st["long_exit_history"] else None
-                            if H and (price > H > wma_long):
+                            # Require BOTH price condition and RSI(288) > 50 at the same time
+                            if H and (price > H > wma_long) and (st["rsi288"] is not None and st["rsi288"] > 50.0):
                                 entry_triggered = True
-                                entry_type = f"LONG RE-ENTRY (price {price:.4f} > exit {H:.4f} > 24h WMA {wma_long:.4f})"
+                                entry_type = (f"LONG RE-ENTRY (price+RSI> exit {H:.4f} > 24h WMA {wma_long:.4f})")
 
                         # RSI(288) regime must be > 50 (persistent, last 5m close)
                         if entry_triggered:
                             if not (st["rsi288"] is not None and st["rsi288"] > 50.0):
                                 entry_triggered = False
-                                # ↓↓↓ CHANGED to DEBUG (hidden at INFO level)
                                 logging.debug(f"{sym} LONG gate blocked: need RSI(288) > 50 (current={st['rsi288']})")
 
                         if entry_triggered:
@@ -912,6 +863,16 @@ async def run(cli: AsyncClient):
                                     st["long_profit_lock"] = {"order_id": None, "stop_price": None}
                                     st["last_long_entry_ts"] = time.time()
                                     log_entry_details(sym, entry_type, price, st["long_exit_history"], "LONG")
+
+                                    # Immediate trailing (0.5% callback) on entry
+                                    oid, act, cid = await place_trailing(
+                                        cli, sym, "LONG", price, callback_rate_pct=0.5,
+                                        reduce_only_allowed=(not dual_side)
+                                    )
+                                    if oid:
+                                        st["long_trailing"].update({"order_id": oid, "callback": 0.5, "activation": act})
+                                        st["long_trailing_guard_id"] = cid
+                                        st["last_long_trailing_ts"] = time.time()
                                 else:
                                     st["long_entry_guard"] = None; st["long_entry_guard_ts"] = 0.0
                                     logging.error(f"{sym} {entry_type} failed")
@@ -925,25 +886,25 @@ async def run(cli: AsyncClient):
                     if (not st["in_short"]) and (not st["short_pending"]):
                         entry_triggered = False; entry_type = ""
 
-                        # PRICE/WMA part (unchanged re-entry rules), but using current WMA regime
+                        # PRICE/WMA part reset
                         if len(st["short_exit_history"]) > 0 and not st["wma4_below"]:
                             st["short_exit_history"] = []
                             logging.info(f"{sym} SHORT reset: price {price:.4f} >= 4h WMA {wma_short:.4f}")
 
                         if len(st["short_exit_history"]) == 0:
-                            if st["wma4_below"]:  # regime true now (price < 4h WMA)
+                            if st["wma4_below"]:
                                 entry_triggered = True; entry_type = "SHORT FIRST ENTRY (WMA4 regime below)"
                         else:
                             L = min(st["short_exit_history"]) if st["short_exit_history"] else None
-                            if L and (price < L < wma_short):
+                            # Require BOTH price condition and RSI(48) < 50 at the same time
+                            if L and (price < L < wma_short) and (st["rsi48"] is not None and st["rsi48"] < 50.0):
                                 entry_triggered = True
-                                entry_type = f"SHORT RE-ENTRY (price {price:.4f} < exit {L:.4f} < 4h WMA {wma_short:.4f})"
+                                entry_type = (f"SHORT RE-ENTRY (price+RSI< exit {L:.4f} < 4h WMA {wma_short:.4f})")
 
                         # RSI(48) regime must be < 50 (persistent, last 5m close)
                         if entry_triggered:
                             if not (st["rsi48"] is not None and st["rsi48"] < 50.0):
                                 entry_triggered = False
-                                # ↓↓↓ CHANGED to DEBUG (hidden at INFO level)
                                 logging.debug(f"{sym} SHORT gate blocked: need RSI(48) < 50 (current={st['rsi48']})")
 
                         if entry_triggered:
@@ -976,6 +937,16 @@ async def run(cli: AsyncClient):
                                     st["short_profit_lock"] = {"order_id": None, "stop_price": None}
                                     st["last_short_entry_ts"] = time.time()
                                     log_entry_details(sym, entry_type, price, st["short_exit_history"], "SHORT")
+
+                                    # Immediate trailing (0.5% callback) on entry
+                                    oid, act, cid = await place_trailing(
+                                        cli, sym, "SHORT", price, callback_rate_pct=0.5,
+                                        reduce_only_allowed=(not dual_side)
+                                    )
+                                    if oid:
+                                        st["short_trailing"].update({"order_id": oid, "callback": 0.5, "activation": act})
+                                        st["short_trailing_guard_id"] = cid
+                                        st["last_short_trailing_ts"] = time.time()
                                 else:
                                     st["short_entry_guard"] = None; st["short_entry_guard_ts"] = 0.0
                                     logging.error(f"{sym} {entry_type} failed")
