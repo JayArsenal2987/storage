@@ -17,9 +17,11 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
 
 SYMBOLS = {
-    "ADAUSDT": 10,  "BNBUSDT": 0.03,  "SOLUSDT": 0.10,
-    "XRPUSDT": 10,
+    "ADAUSDT": 10,  "XRPUSDT": 10,
 }
+
+# >>> per-symbol safe ASCII tags <<<
+SYMBOL_TAG = {"ADAUSDT":"ADA","BNBUSDT":"BNB","SOLUSDT":"SOL","XRPUSDT":"XRP"}
 
 # WMA periods in seconds
 SHORT_WMA_PERIOD = 4 * 60 * 60      # 4h (SHORT side)
@@ -52,6 +54,10 @@ EXIT_HISTORY_MAX = int(os.getenv("EXIT_HISTORY_MAX", "5"))
 SIGNAL_LONG_TAG  = "L|WMA24+RSI288>50"
 SIGNAL_SHORT_TAG = "S|WMA4+RSI48<50"
 
+# Profit-lock thresholds (ROE %)
+PROFIT_LOCK_ARM_ROE  = float(os.getenv("PROFIT_LOCK_ARM_ROE",  "40.0"))  # arm when ROE >= +40%
+PROFIT_LOCK_STOP_ROE = float(os.getenv("PROFIT_LOCK_STOP_ROE", "25.0"))  # lock at +25% ROE
+
 # ---- Logging quiet window (seconds). Only market order execs + errors will show.
 QUIET_FOR_SEC = int(os.getenv("QUIET_FOR_SEC", "3600"))  # 1 hour
 
@@ -76,6 +82,7 @@ class TickWMA:
         self.value: Optional[float] = None
         self.last_update: Optional[float] = None
         self.tick_buffer = deque(maxlen=10000)
+
     def update(self, price: float):
         now = time.time()
         self.tick_buffer.append((now, price))
@@ -102,9 +109,10 @@ def close_short(sym):
     return dict(symbol=sym, side="BUY",  type="MARKET",
                 quantity=SYMBOLS[sym], positionSide="SHORT")
 
-# NEW: simple client id for profit-lock orders
+# per-symbol client IDs using safe ASCII tags
 def profit_lock_client_id(symbol: str, side: str) -> str:
-    return f"LOCK-{symbol}-{side}-{int(time.time())}"
+    tag = SYMBOL_TAG.get(symbol, symbol)
+    return f"LOCK-{tag}-{side}-{int(time.time())}"
 
 # ========================= RUNTIME STATE =======================
 state = {
@@ -312,11 +320,13 @@ async def cancel_trailing(cli: AsyncClient, symbol: str, order_id: Optional[int]
         logging.warning(f"{symbol} failed to cancel trailing order {order_id}: {e}")
 
 def make_client_id(prefix: str, symbol: str, side: str, bucket_sec: float = 2.0) -> str:
+    tag = SYMBOL_TAG.get(symbol, symbol)
     bucket = int(time.time() / bucket_sec)
-    return f"{prefix}-{symbol}-{side}-{bucket}"
+    return f"{prefix}-{tag}-{side}-{bucket}"
 
 def trailing_client_id(symbol: str, side: str) -> str:
-    return f"{TRAIL_GUARD_TAG}-{symbol}-{side}-{int(time.time())}"
+    tag = SYMBOL_TAG.get(symbol, symbol)
+    return f"{TRAIL_GUARD_TAG}-{tag}-{side}-{int(time.time())}"
 
 def clamp_callback(cb: float) -> float:
     return max(0.1, min(5.0, cb))
@@ -384,6 +394,20 @@ async def place_trailing(cli: AsyncClient, symbol: str, side: str,
                 return None, None, cid
         logging.error(f"{symbol} trailing failed: {e} cid={cid}")
         return None, None, cid
+
+# ---- Profit-lock helpers ----
+def roe_stop_price(entry: Optional[float], side: str, target_roe_pct: float) -> Optional[float]:
+    """
+    Convert a target ROE% into a stop price relative to the entry.
+    Example (LONG, L=50, target=25%): +25% ROE ≈ +0.5% price -> stop = entry * 1.005
+    """
+    if not entry or entry <= 0:
+        return None
+    frac_change = (target_roe_pct / LEVERAGE) / 100.0  # ROE% -> raw price % change
+    if side.upper() == "LONG":
+        return entry * (1.0 + frac_change)
+    else:  # SHORT
+        return entry * (1.0 - frac_change)
 
 # NEW: place/cancel profit-lock STOP-MARKET orders
 async def place_profit_lock(cli: AsyncClient, symbol: str, side: str,
@@ -479,7 +503,7 @@ async def ensure_trailing(cli: AsyncClient, sym: str, st: dict, latest_price: fl
                     st["short_trailing_guard_id"] = cid
                     st["last_short_trailing_ts"] = time.time()
 
-# NEW: PROFIT-LOCK LOGIC (arms at ROE >= +25%, one-time)
+# PROFIT-LOCK: arm at +40% ROE; stop sits at +25% ROE from entry
 async def ensure_profit_lock(cli: AsyncClient, sym: str, st: dict, latest_price: float,
                              side: str, reduce_only_allowed: bool):
     lock = _ensure_lock(st, "long_trailing_lock" if side == "LONG" else "short_trailing_lock")
@@ -492,11 +516,17 @@ async def ensure_profit_lock(cli: AsyncClient, sym: str, st: dict, latest_price:
             roe = pnl_percent(entry, latest_price, "SHORT")
 
         if have["order_id"]:
-            return
+            return  # already armed
 
-        if roe >= 25.0:
-            oid, stop_px, cid = await place_profit_lock(cli, sym, side, latest_price,
-                                                        reduce_only_allowed=reduce_only_allowed)
+        # Arm only once when ROE first reaches the arm threshold
+        if entry and roe >= PROFIT_LOCK_ARM_ROE:
+            # Compute stop at the preserved-ROE level (e.g., +25% ROE)
+            stop_target = roe_stop_price(entry, side, PROFIT_LOCK_STOP_ROE)
+            if stop_target is None:
+                return
+            oid, stop_px, cid = await place_profit_lock(
+                cli, sym, side, stop_target, reduce_only_allowed=reduce_only_allowed
+            )
             if oid:
                 have.update({"order_id": oid, "stop_price": stop_px})
 
@@ -592,12 +622,12 @@ def _update_rsi_on_close(sym: str, close_price: float):
         rsi_new = _rsi_from_avgs(ag, al)
         st["rsi288_avg_gain"], st["rsi288_avg_loss"] = ag, al
         st["rsi288_prev"], st["rsi288"] = rsi_prev, rsi_new
-        if rsi_prev is not None and rsi_prev <= 50.0 and rsi_new > 50.0:
-            st["rsi288_cross_above_50_ts"] = now_ts
-            logging.info(f"{sym} RSI(288) crossed ABOVE 50 @ {rsi_prev:.2f}->{rsi_new:.2f}")
-        if rsi_prev is not None and rsi_prev >= 50.0 and rsi_new < 50.0:
-            st["rsi288_cross_below_50_ts"] = now_ts
-            logging.info(f"{sym} RSI(288) crossed BELOW 50 @ {rsi_prev:.2f}->{rsi_new:.2f}")
+        if rsi_prev is not None and rsi_prev <= 50.0:
+            if rsi_new > 50.0:
+                st["rsi288_cross_above_50_ts"] = now_ts
+        if rsi_prev is not None and rsi_prev >= 50.0:
+            if rsi_new < 50.0:
+                st["rsi288_cross_below_50_ts"] = now_ts
 
     st["rsi_last_close"] = close_price
 
@@ -684,7 +714,6 @@ async def run(cli: AsyncClient):
                         _update_rsi_on_close(sym, close_price)
 
                         st = state[sym]
-                        # RSI-based immediate hard exits (Option 1)
                         # LONG: RSI(288) crosses below 50 -> exit
                         if st["in_long"] and (st["rsi288_prev"] is not None and st["rsi288_prev"] >= 50.0 and st["rsi288"] is not None and st["rsi288"] < 50.0):
                             async with st["order_lock"]:
@@ -811,7 +840,7 @@ async def run(cli: AsyncClient):
                                         logging.info(f"{sym} SHORT HARD EXIT at ROE {roe_short:.2f}%")
                         continue
 
-                    # ---------------- POSITIVE SIDE: PROFIT-LOCK at +25% ROE ----------------
+                    # ---------------- POSITIVE SIDE: PROFIT-LOCK (+40% arm, +25% stop) ----------
                     if st["in_long"]:
                         await ensure_profit_lock(cli, sym, st, price, side="LONG",
                                                  reduce_only_allowed=(not dual_side))
@@ -849,7 +878,8 @@ async def run(cli: AsyncClient):
                         if entry_triggered:
                             if not (st["rsi288"] is not None and st["rsi288"] > 50.0):
                                 entry_triggered = False
-                                logging.info(f"{sym} LONG gate blocked: need RSI(288) > 50 (current={st['rsi288']})")
+                                # ↓↓↓ CHANGED to DEBUG (hidden at INFO level)
+                                logging.debug(f"{sym} LONG gate blocked: need RSI(288) > 50 (current={st['rsi288']})")
 
                         if entry_triggered:
                             async with st["order_lock"]:
@@ -913,7 +943,8 @@ async def run(cli: AsyncClient):
                         if entry_triggered:
                             if not (st["rsi48"] is not None and st["rsi48"] < 50.0):
                                 entry_triggered = False
-                                logging.info(f"{sym} SHORT gate blocked: need RSI(48) < 50 (current={st['rsi48']})")
+                                # ↓↓↓ CHANGED to DEBUG (hidden at INFO level)
+                                logging.debug(f"{sym} SHORT gate blocked: need RSI(48) < 50 (current={st['rsi48']})")
 
                         if entry_triggered:
                             async with st["order_lock"]:
