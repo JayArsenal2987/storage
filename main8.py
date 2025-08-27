@@ -17,7 +17,8 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
 
 SYMBOLS = {
-    "ADAUSDT": 10,  "XRPUSDT": 10,
+    "ADAUSDT": 10,
+    "XRPUSDT": 10,
 }
 
 # >>> per-symbol safe ASCII tags <<<
@@ -48,6 +49,9 @@ RATE_LIMIT_MAX_SLEEP  = float(os.getenv("RATE_LIMIT_MAX_SLEEP", "60.0"))
 # Options: "CONTRACT_PRICE" (default, twitchier) or "MARK_PRICE" (steadier)
 PRICE_SOURCE = os.getenv("PRICE_SOURCE", "CONTRACT_PRICE").upper()
 
+# Bias (in ticks) so trailing activation ARMS IMMEDIATELY
+ARM_EPS_TICKS = int(os.getenv("ARM_EPS_TICKS", "2"))
+
 # ---- Special ID tag for callback activation ----
 TRAIL_GUARD_TAG = os.getenv("TRAIL_GUARD_TAG", "CALLBK")
 
@@ -61,6 +65,16 @@ SIGNAL_SHORT_TAG = "S|WMA4+RSI48<50"
 # Profit-lock thresholds (ROE %)
 PROFIT_LOCK_ARM_ROE  = float(os.getenv("PROFIT_LOCK_ARM_ROE",  "40.0"))  # arm when ROE >= +40%
 PROFIT_LOCK_STOP_ROE = float(os.getenv("PROFIT_LOCK_STOP_ROE", "25.0"))  # lock at +25% ROE
+
+# === ATR gate (same timeframe for both long & short) ===
+ATR_PERIOD_5M = int(os.getenv("ATR_PERIOD_5M", "14"))
+ATR_MIN_PCT   = float(os.getenv("ATR_MIN_PCT", "0.7"))  # require ≥ this ATR% to allow entries
+
+# === WMA slope + distance (idea #4) ===
+WMA_SLOPE_LOOKBACK_SEC = float(os.getenv("WMA_SLOPE_LOOKBACK_SEC", "300"))  # 5 minutes
+WMA_SLOPE_MIN_BPS      = float(os.getenv("WMA_SLOPE_MIN_BPS", "2.0"))       # 2 bps = 0.02%
+DIST_ATR_MULT          = float(os.getenv("DIST_ATR_MULT", "0.50"))          # 50% of ATR% as distance
+DIST_MIN_BPS           = float(os.getenv("DIST_MIN_BPS", "5.0"))            # fallback = 0.05%
 
 # ---- Logging quiet window (seconds). Only market order execs + errors will show.
 QUIET_FOR_SEC = int(os.getenv("QUIET_FOR_SEC", "3600"))  # 1 hour
@@ -180,6 +194,18 @@ state = {
         # locks (ensure present even if state gets reloaded)
         "long_trailing_lock": asyncio.Lock(),
         "short_trailing_lock": asyncio.Lock(),
+
+        # === ATR(5m) state (shared timeframe long/short) ===
+        "atr_tr_seeded": False,
+        "atr_seed_count": 0,
+        "atr_seed_sum": 0.0,
+        "atr_prev_close": None,
+        "atr_wilder": None,      # Wilder-smoothed TR
+        "atr_pct_5m": None,      # ATR% = atr_wilder / close * 100
+
+        # === WMA slope snapshots (idea #4) ===
+        "wma24_snap": None, "wma24_snap_ts": 0.0,
+        "wma4_snap":  None, "wma4_snap_ts":  0.0,
     }
     for s in SYMBOLS
 }
@@ -335,24 +361,46 @@ def trailing_client_id(symbol: str, side: str) -> str:
 def clamp_callback(cb: float) -> float:
     return max(0.1, min(5.0, cb))
 
-def quant_activation(symbol: str, side: str, latest_price: float) -> str:
-    if side.upper() == "LONG":
-        raw_activation = latest_price * (1.0 + ACTIVATION_OFFSET)
+# Use chosen price source to get a reference price for activation
+async def reference_price_for_activation(cli: AsyncClient, symbol: str, fallback_trade_price: float) -> float:
+    if PRICE_SOURCE == "MARK_PRICE":
+        try:
+            mp = await call_binance(cli.futures_mark_price, symbol=symbol)
+            return float(mp["markPrice"])
+        except Exception:
+            return float(fallback_trade_price)
     else:
-        raw_activation = latest_price * (1.0 - ACTIVATION_OFFSET)
-    return quantize_price(symbol, raw_activation)
+        return float(fallback_trade_price)
+
+def immediate_activation(symbol: str, side: str, ref_price: float) -> float:
+    tick_dec = PRICE_TICK.get(symbol)
+    if tick_dec:
+        eps = float(tick_dec) * ARM_EPS_TICKS
+    else:
+        eps = max(ref_price * 0.0002, 1e-8)  # ~2 bps fallback
+    if side.upper() == "LONG":
+        # LONG arms when price >= activation → bias DOWN
+        return max(ref_price - eps, 0.0)
+    else:
+        # SHORT arms when price <= activation → bias UP
+        return ref_price + eps
 
 async def place_trailing(cli: AsyncClient, symbol: str, side: str,
-                         latest_price: float, callback_rate_pct: float,
+                         latest_trade_price: float, callback_rate_pct: float,
                          reduce_only_allowed: bool) -> Tuple[Optional[int], Optional[float], Optional[str]]:
-    """Place a TRIGGERING trailing stop with fixed callback (activation at current price)."""
-    if latest_price is None or not math.isfinite(latest_price) or latest_price <= 0.0:
-        logging.warning(f"{symbol} {side} trailing skipped: invalid latest_price={latest_price}")
+    """Place TRIGGERING trailing stop with activation biased to arm immediately."""
+    if latest_trade_price is None or not math.isfinite(latest_trade_price) or latest_trade_price <= 0.0:
+        logging.warning(f"{symbol} {side} trailing skipped: invalid price={latest_trade_price}")
         return None, None, None
 
     order_side = "SELL" if side.upper() == "LONG" else "BUY"
     position_side = side.upper()
-    activation_str = quantize_price(symbol, latest_price)  # avoid dead-zone
+
+    # Use unified source to compute activation that arms NOW
+    ref_price = await reference_price_for_activation(cli, symbol, latest_trade_price)
+    act_float = immediate_activation(symbol, side, ref_price)
+    activation_str = quantize_price(symbol, act_float)
+
     cb = clamp_callback(float(callback_rate_pct))
     cid = trailing_client_id(symbol, side)
 
@@ -364,14 +412,13 @@ async def place_trailing(cli: AsyncClient, symbol: str, side: str,
         positionSide=position_side,
         callbackRate=cb,
         activationPrice=activation_str,
-        workingType=PRICE_SOURCE,          # << unified price source
+        workingType=PRICE_SOURCE,          # unified price source
         newOrderRespType="ACK",
         newClientOrderId=cid,
     )
     if reduce_only_allowed:
         params["reduceOnly"] = True
 
-    # bumped to WARNING so you see these during the quiet window
     logging.warning(f"{symbol} placing trailing {side}: cb={cb:.3f}% act={activation_str} cid={cid} src={PRICE_SOURCE}")
     try:
         res = await call_binance(cli.futures_create_order, **params)
@@ -382,11 +429,12 @@ async def place_trailing(cli: AsyncClient, symbol: str, side: str,
     except Exception as e:
         msg = str(e)
         if "-2021" in msg or "-1102" in msg:
-            bump = ACTIVATION_OFFSET * 2.0
-            activation_str = quantize_price(
-                symbol,
-                (latest_price * (1.0 + bump)) if side.upper() == "LONG" else (latest_price * (1.0 - bump))
-            )
+            # widen bias and retry once
+            if PRICE_TICK.get(symbol):
+                widened = act_float + (float(PRICE_TICK[symbol]) * (ARM_EPS_TICKS if side.upper()=="SHORT" else -ARM_EPS_TICKS))
+            else:
+                widened = act_float
+            activation_str = quantize_price(symbol, widened)
             params["activationPrice"] = activation_str
             try:
                 res = await call_binance(cli.futures_create_order, **params)
@@ -433,7 +481,7 @@ async def place_profit_lock(cli: AsyncClient, symbol: str, side: str,
         type="STOP_MARKET",
         positionSide=position_side,
         stopPrice=stop_str,
-        workingType=PRICE_SOURCE,          # << unified price source
+        workingType=PRICE_SOURCE,          # unified source
         quantity=size,
         newOrderRespType="ACK",
         newClientOrderId=cid,
@@ -441,7 +489,6 @@ async def place_profit_lock(cli: AsyncClient, symbol: str, side: str,
     )
     params = {k: v for k, v in params.items() if v is not None}
 
-    # bumped to WARNING so you see these during the quiet window
     logging.warning(f"{symbol} placing PROFIT-LOCK {side}: stop={stop_str} qty={size} cid={cid} src={PRICE_SOURCE}")
     try:
         res = await call_binance(cli.futures_create_order, **params)
@@ -461,11 +508,10 @@ async def cancel_profit_lock(cli: AsyncClient, symbol: str, order_id: Optional[i
         invalidate_position_cache(symbol)
         logging.info(f"{symbol} cancelled PROFIT-LOCK {side_label} order {order_id}")
     except Exception as e:
-        logging.warning(f"{symbol} failed to cancel PROFIT-LOCK {side_label} order {order_id}: {e}")
+        logging.warning(f"{symbol} failed to cancel PROFIT-LOCK {side_label} order {e}")
 
 # ========================= SIMPLE TRAILING LOGIC ==================
 def _ensure_lock(st: dict, key: str) -> asyncio.Lock:
-    """Guarantee presence of a lock in state (fixes KeyError 'long_trailing_lock')."""
     lock = st.get(key)
     if lock is None or not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
@@ -524,9 +570,7 @@ async def ensure_profit_lock(cli: AsyncClient, sym: str, st: dict, latest_price:
         if have["order_id"]:
             return  # already armed
 
-        # Arm only once when ROE first reaches the arm threshold
         if entry and roe >= PROFIT_LOCK_ARM_ROE:
-            # Compute stop at the preserved-ROE level (e.g., +25% ROE)
             stop_target = roe_stop_price(entry, side, PROFIT_LOCK_STOP_ROE)
             if stop_target is None:
                 return
@@ -710,7 +754,7 @@ async def run(cli: AsyncClient):
                     m     = json.loads(raw)
                     stype = m["stream"]; d = m["data"]
 
-                    # ---------- 5m kline (RSI updates + RSI-based exits on close) ----------
+                    # ---------- 5m kline (RSI & ATR updates + RSI-based exits on close) ----------
                     if stype.endswith("@kline_5m"):
                         k = d.get("k", {})
                         if not k.get("x", False):
@@ -720,6 +764,28 @@ async def run(cli: AsyncClient):
                         _update_rsi_on_close(sym, close_price)
 
                         st = state[sym]
+
+                        # --- ATR(5m) Wilder update (same timeframe for both sides) ---
+                        h = float(k["h"]); l = float(k["l"]); c = close_price
+                        pc = st.get("atr_prev_close")
+                        if pc is None:
+                            pc = c
+                        tr = max(h - l, abs(h - pc), abs(l - pc))
+
+                        if not st.get("atr_tr_seeded"):
+                            st["atr_seed_count"] = (st.get("atr_seed_count", 0) + 1)
+                            st["atr_seed_sum"] = (st.get("atr_seed_sum", 0.0) + tr)
+                            if st["atr_seed_count"] >= ATR_PERIOD_5M:
+                                st["atr_wilder"] = st["atr_seed_sum"] / ATR_PERIOD_5M
+                                st["atr_tr_seeded"] = True
+                        else:
+                            n = ATR_PERIOD_5M
+                            st["atr_wilder"] = (st["atr_wilder"] * (n - 1) + tr) / n
+
+                        st["atr_prev_close"] = c
+                        st["atr_pct_5m"] = (st["atr_wilder"] / c * 100.0) if (st["atr_wilder"] and c > 0) else None
+
+                        # RSI-based immediate hard exits on close (unchanged)
                         # LONG: RSI(288) crosses below 50 -> exit
                         if st["in_long"] and (st["rsi288_prev"] is not None and st["rsi288_prev"] >= 50.0 and st["rsi288"] is not None and st["rsi288"] < 50.0):
                             async with st["order_lock"]:
@@ -795,6 +861,14 @@ async def run(cli: AsyncClient):
                         st["wma4_cross_ts"] = now_ts
                         logging.info(f"{sym} WMA4 regime {'BELOW' if st['wma4_below'] else 'NOT BELOW'} flipped at {price:.6f}")
 
+                    # --- slope snapshots (idea #4) ---
+                    if now_ts - st.get("wma24_snap_ts", 0.0) >= WMA_SLOPE_LOOKBACK_SEC:
+                        st["wma24_snap"] = wma_long
+                        st["wma24_snap_ts"] = now_ts
+                    if now_ts - st.get("wma4_snap_ts", 0.0) >= WMA_SLOPE_LOOKBACK_SEC:
+                        st["wma4_snap"] = wma_short
+                        st["wma4_snap_ts"] = now_ts
+
                     # ---------- PROFIT-LOCK & TRAILING MAINTENANCE ON TICKS ----------
                     if st["in_long"]:
                         await ensure_profit_lock(cli, sym, st, price, side="LONG",
@@ -830,7 +904,31 @@ async def run(cli: AsyncClient):
                         if entry_triggered:
                             if not (st["rsi288"] is not None and st["rsi288"] > 50.0):
                                 entry_triggered = False
-                                logging.debug(f"{sym} LONG gate blocked: need RSI(288) > 50 (current={st['rsi288']})")
+
+                        # --- ATR gate (must have enough volatility) ---
+                        if entry_triggered:
+                            atr_pct = st.get("atr_pct_5m")
+                            if (atr_pct is None) or (atr_pct < ATR_MIN_PCT):
+                                entry_triggered = False
+                                logging.info(f"{sym} LONG gate: ATR% {atr_pct if atr_pct is not None else float('nan'):.2f} < {ATR_MIN_PCT}% — skip")
+
+                        # --- WMA24 slope + distance (trend + decisive distance) ---
+                        if entry_triggered:
+                            w0 = st.get("wma24_snap"); w1 = wma_long
+                            slope_ok = True
+                            slope_bps = 0.0
+                            if w0 and w0 > 0:
+                                slope_bps = ((w1 - w0) / w0 * 10000.0)
+                                slope_ok = slope_bps >= WMA_SLOPE_MIN_BPS
+
+                            atr_pct = st.get("atr_pct_5m")
+                            dist_bps_needed = max(DIST_MIN_BPS, (atr_pct or 0.0) * DIST_ATR_MULT * 100.0)
+                            dist_ok = (price >= wma_long * (1.0 + dist_bps_needed / 10000.0))
+
+                            if not slope_ok or not dist_ok:
+                                entry_triggered = False
+                                logging.info(f"{sym} LONG gate: slope {slope_bps:.2f}bps (≥{WMA_SLOPE_MIN_BPS}?), "
+                                             f"dist {'OK' if dist_ok else 'NO'} need ≥{dist_bps_needed:.2f}bps")
 
                         if entry_triggered:
                             async with st["order_lock"]:
@@ -863,16 +961,6 @@ async def run(cli: AsyncClient):
                                     st["long_profit_lock"] = {"order_id": None, "stop_price": None}
                                     st["last_long_entry_ts"] = time.time()
                                     log_entry_details(sym, entry_type, price, st["long_exit_history"], "LONG")
-
-                                    # Immediate trailing (0.5% callback) on entry
-                                    oid, act, cid = await place_trailing(
-                                        cli, sym, "LONG", price, callback_rate_pct=0.5,
-                                        reduce_only_allowed=(not dual_side)
-                                    )
-                                    if oid:
-                                        st["long_trailing"].update({"order_id": oid, "callback": 0.5, "activation": act})
-                                        st["long_trailing_guard_id"] = cid
-                                        st["last_long_trailing_ts"] = time.time()
                                 else:
                                     st["long_entry_guard"] = None; st["long_entry_guard_ts"] = 0.0
                                     logging.error(f"{sym} {entry_type} failed")
@@ -905,7 +993,31 @@ async def run(cli: AsyncClient):
                         if entry_triggered:
                             if not (st["rsi48"] is not None and st["rsi48"] < 50.0):
                                 entry_triggered = False
-                                logging.debug(f"{sym} SHORT gate blocked: need RSI(48) < 50 (current={st['rsi48']})")
+
+                        # --- ATR gate (same ATR% as LONG) ---
+                        if entry_triggered:
+                            atr_pct = st.get("atr_pct_5m")
+                            if (atr_pct is None) or (atr_pct < ATR_MIN_PCT):
+                                entry_triggered = False
+                                logging.info(f"{sym} SHORT gate: ATR% {atr_pct if atr_pct is not None else float('nan'):.2f} < {ATR_MIN_PCT}% — skip")
+
+                        # --- WMA4 slope + distance ---
+                        if entry_triggered:
+                            w0 = st.get("wma4_snap"); w1 = wma_short
+                            slope_ok = True
+                            slope_bps = 0.0
+                            if w0 and w0 > 0:
+                                slope_bps = ((w1 - w0) / w0 * 10000.0)
+                                slope_ok = slope_bps <= -WMA_SLOPE_MIN_BPS
+
+                            atr_pct = st.get("atr_pct_5m")
+                            dist_bps_needed = max(DIST_MIN_BPS, (atr_pct or 0.0) * DIST_ATR_MULT * 100.0)
+                            dist_ok = (price <= wma_short * (1.0 - dist_bps_needed / 10000.0))
+
+                            if not slope_ok or not dist_ok:
+                                entry_triggered = False
+                                logging.info(f"{sym} SHORT gate: slope {slope_bps:.2f}bps (≤{-WMA_SLOPE_MIN_BPS}?), "
+                                             f"dist {'OK' if dist_ok else 'NO'} need ≥{dist_bps_needed:.2f}bps")
 
                         if entry_triggered:
                             async with st["order_lock"]:
@@ -937,16 +1049,6 @@ async def run(cli: AsyncClient):
                                     st["short_profit_lock"] = {"order_id": None, "stop_price": None}
                                     st["last_short_entry_ts"] = time.time()
                                     log_entry_details(sym, entry_type, price, st["short_exit_history"], "SHORT")
-
-                                    # Immediate trailing (0.5% callback) on entry
-                                    oid, act, cid = await place_trailing(
-                                        cli, sym, "SHORT", price, callback_rate_pct=0.5,
-                                        reduce_only_allowed=(not dual_side)
-                                    )
-                                    if oid:
-                                        st["short_trailing"].update({"order_id": oid, "callback": 0.5, "activation": act})
-                                        st["short_trailing_guard_id"] = cid
-                                        st["last_short_trailing_ts"] = time.time()
                                 else:
                                     st["short_entry_guard"] = None; st["short_entry_guard_ts"] = 0.0
                                     logging.error(f"{sym} {entry_type} failed")
