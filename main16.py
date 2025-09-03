@@ -20,7 +20,7 @@ LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
 BASE_QTY_PER_SIDE = float(os.getenv("BASE_QTY_PER_SIDE", "100.0"))   # 100 ADA target for LONG and SHORT
 STEP_QTY          = float(os.getenv("STEP_QTY", "10.0"))             # trim 10 ADA per step on indicated side
 STEP_PCT          = float(os.getenv("STEP_PCT", "0.5")) / 100.0      # 0.5% move per step
-MAX_STEPS_PER_BURST = int(os.getenv("MAX_STEPS_PER_BURST", "5"))     # cap steps in one burst from a single jump
+MAX_STEPS_PER_BURST = int(os.getenv("MAX_STEPS_PER_BURST", "5"))     # cap steps executed back-to-back in one check
 BURST_COOLDOWN_SEC  = float(os.getenv("BURST_COOLDOWN_SEC", "2.0"))  # small cooldown to avoid thrashing
 
 # ---- FIXED-QUANTITY MODE (legacy; unused by this strategy for entries) ----
@@ -272,8 +272,8 @@ state: Dict[str, Dict[str, Any]] = {
         "last_order_id": None,
         "fifo_sync_error_count": 0,
         # realtime anchor/cooldown
-        "anchor_price": None,     # last processed anchor price
-        "last_burst_ts": 0.0,     # last time we executed a burst of steps
+        "anchor_price": None,     # last processed anchor price (rung base)
+        "last_burst_ts": 0.0,     # last time we executed any step(s)
     } for s in SYMBOLS
 }
 
@@ -509,14 +509,15 @@ async def price_feed_loop(cli: AsyncClient):
             await asyncio.sleep(2.0 + random.uniform(0.0, 0.8))
             continue
 
-# ========================= REALTIME DRIVER =====================
+# ========================= REALTIME DRIVER (STRICT 0.5% => 10 ADA) =====================
 async def realtime_driver(cli: AsyncClient):
-    """Realtime step strategy:
+    """Strict step strategy (no aggregation):
        - Keep 100/100 baseline (hedged).
-       - Each time price moves +0.5% from last anchor → reduce SHORT by 10 ADA.
-       - Each time price moves -0.5% from last anchor → reduce LONG by 10 ADA.
-       - Multi-step bursts allowed (capped), re-anchor to current price after burst.
-       - If any side hits 0 after a reduction → reset (cancel, close both) and rebuild to 100/100 immediately.
+       - Each time price >= anchor*(1+STEP_PCT) -> trim SHORT by exactly STEP_QTY (10 ADA), then move anchor up by one rung.
+       - Each time price <= anchor*(1-STEP_PCT) -> trim LONG  by exactly STEP_QTY (10 ADA), then move anchor down by one rung.
+       - If price jumps across multiple rungs, execute multiple separate 10-ADA orders back-to-back (capped by MAX_STEPS_PER_BURST).
+       - After any steps, apply a short cooldown to avoid thrashing.
+       - If any side hits 0 after a step -> reset (cancel, close both) and rebuild to 100/100 immediately.
     """
     POLL_SEC = 0.25  # check trigger frequently
 
@@ -532,7 +533,6 @@ async def realtime_driver(cli: AsyncClient):
             # Initialize: ensure baseline and set anchor on first run
             if st["anchor_price"] is None:
                 async with st["order_lock"]:
-                    # ensure we still have a price
                     price = st["last_price"]
                     if price is None:
                         continue
@@ -542,69 +542,83 @@ async def realtime_driver(cli: AsyncClient):
                     st["last_burst_ts"] = 0.0
                 continue
 
-            # Cooldown guard
+            # Cooldown guard (after a burst of one or more steps)
             if time.time() - st["last_burst_ts"] < BURST_COOLDOWN_SEC:
                 continue
 
-            anchor = st["anchor_price"]
-            if anchor <= 0:
-                st["anchor_price"] = price
-                continue
-
-            move = (price - anchor) / anchor  # fraction
-            steps = 0
-            direction_up = False
-
-            if move >= STEP_PCT:
-                steps = int(move // STEP_PCT)
-                direction_up = True
-            elif move <= -STEP_PCT:
-                steps = int((-move) // STEP_PCT)
-                direction_up = False
-
-            if steps <= 0:
-                continue
-
-            steps = min(steps, MAX_STEPS_PER_BURST)
-
             async with st["order_lock"]:
-                # refresh reference values under lock
-                price = st["last_price"] or price
-                anchor = st["anchor_price"] or anchor
-                move = (price - anchor) / anchor
-                if direction_up and move < STEP_PCT:
-                    continue
-                if (not direction_up) and move > -STEP_PCT:
+                # refresh under lock
+                price  = st["last_price"] or price
+                anchor = st["anchor_price"]
+                if not anchor or anchor <= 0:
+                    st["anchor_price"] = price
                     continue
 
-                # Compute reduction amount (aggregate steps)
-                if direction_up:
-                    # price UP: reduce SHORT
+                tol_qty = _zero_tolerance(sym)
+                steps_done = 0
+
+                # Walk UP rungs: each rung -> trim SHORT by exactly STEP_QTY
+                while price >= anchor * (1.0 + STEP_PCT) - 1e-12:
                     short_sz = await get_position_size_fresh(cli, sym, "SHORT")
-                    reduce_amt = quantize_qty(sym, min(STEP_QTY * steps, max(0.0, short_sz)))
-                    if reduce_amt > _zero_tolerance(sym):
-                        await safe_order_execution(cli, exit_short(sym, reduce_amt), sym, f"EXIT STEP SHORT ({steps}x)")
-                else:
-                    # price DOWN: reduce LONG
-                    long_sz = await get_position_size_fresh(cli, sym, "LONG")
-                    reduce_amt = quantize_qty(sym, min(STEP_QTY * steps, max(0.0, long_sz)))
-                    if reduce_amt > _zero_tolerance(sym):
-                        await safe_order_execution(cli, exit_long(sym, reduce_amt), sym, f"EXIT STEP LONG ({steps}x)")
+                    amt = quantize_qty(sym, min(STEP_QTY, max(0.0, short_sz)))
+                    if amt <= tol_qty:
+                        break
 
-                # Zero-hit reset check
-                long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
-                short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
-                if long_sz2 <= _zero_tolerance(sym) or short_sz2 <= _zero_tolerance(sym):
-                    logging.warning(f"{sym} ZERO-HIT after step burst → RESET & REBUILD")
-                    await flatten_all_and_rebaseline(cli, sym)
-                    # re-anchor to current price after rebuild
-                    st["anchor_price"] = state[sym]["last_price"] or price
+                    logging.warning(
+                        f"{sym} STEP UP -> trim SHORT by {amt} | price={price:.6f} anchor={anchor:.6f}"
+                    )
+                    await safe_order_execution(cli, exit_short(sym, amt), sym, "EXIT STEP SHORT (1x)")
+                    steps_done += 1
+
+                    # zero-hit check after EACH step
+                    long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
+                    short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
+                    if long_sz2 <= tol_qty or short_sz2 <= tol_qty:
+                        logging.warning(f"{sym} ZERO-HIT after step -> RESET & REBUILD")
+                        await flatten_all_and_rebaseline(cli, sym)
+                        # re-anchor to current price after rebuild and stop this burst
+                        st["anchor_price"] = state[sym]["last_price"] or price
+                        break
+
+                    # advance anchor by exactly one rung up
+                    anchor = anchor * (1.0 + STEP_PCT)
+                    st["anchor_price"] = anchor
+
+                    if steps_done >= MAX_STEPS_PER_BURST:
+                        break
+
+                # If we didn't reset above, walk DOWN rungs similarly
+                if steps_done < MAX_STEPS_PER_BURST and st["anchor_price"] == anchor:
+                    while price <= anchor * (1.0 - STEP_PCT) + 1e-12:
+                        long_sz = await get_position_size_fresh(cli, sym, "LONG")
+                        amt = quantize_qty(sym, min(STEP_QTY, max(0.0, long_sz)))
+                        if amt <= tol_qty:
+                            break
+
+                        logging.warning(
+                            f"{sym} STEP DOWN -> trim LONG by {amt} | price={price:.6f} anchor={anchor:.6f}"
+                        )
+                        await safe_order_execution(cli, exit_long(sym, amt), sym, "EXIT STEP LONG (1x)")
+                        steps_done += 1
+
+                        long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
+                        short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
+                        if long_sz2 <= tol_qty or short_sz2 <= tol_qty:
+                            logging.warning(f"{sym} ZERO-HIT after step -> RESET & REBUILD")
+                            await flatten_all_and_rebaseline(cli, sym)
+                            st["anchor_price"] = state[sym]["last_price"] or price
+                            break
+
+                        # advance anchor by exactly one rung down
+                        anchor = anchor * (1.0 - STEP_PCT)
+                        st["anchor_price"] = anchor
+
+                        if steps_done >= MAX_STEPS_PER_BURST:
+                            break
+
+                # If we executed any steps, start cooldown
+                if steps_done > 0:
                     st["last_burst_ts"] = time.time()
-                    continue
-
-                # Re-anchor to current price after burst and set cooldown
-                st["anchor_price"] = price
-                st["last_burst_ts"] = time.time()
 
 # ========================= PNL SUMMARY =========================
 async def pnl_summary_loop(cli: AsyncClient):
