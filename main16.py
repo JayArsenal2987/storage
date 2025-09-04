@@ -480,15 +480,47 @@ async def price_feed_loop(cli: AsyncClient):
             await asyncio.sleep(2.0 + random.uniform(0.0, 0.8))
             continue
 
-# ========================= REALTIME DRIVER (STRICT 0.5% STEP + CONFIRM) =====================
+# ========================= IMMEDIATE EXIT FUNCTIONS =============
+async def immediate_exit_all(cli: AsyncClient, symbol: str, reason: str) -> bool:
+    """Exit all positions immediately at market price"""
+    st = state[symbol]
+    async with st["order_lock"]:
+        try:
+            # Cancel all open orders first
+            await call_binance(cli.futures_cancel_all_open_orders, symbol=symbol)
+        except Exception as e:
+            logging.warning(f"{symbol} cancel_all_open failed: {e}")
+        
+        # Get fresh positions
+        long_sz = await get_position_size_fresh(cli, symbol, "LONG")
+        short_sz = await get_position_size_fresh(cli, symbol, "SHORT")
+        
+        success = True
+        
+        # Exit LONG position if exists
+        if long_sz > 0:
+            qty = quantize_qty(symbol, long_sz)
+            logging.warning(f"{symbol} IMMEDIATE EXIT LONG {qty} ADA - Reason: {reason}")
+            success &= await safe_order_execution(cli, exit_long(symbol, qty), symbol, f"IMMEDIATE EXIT LONG - {reason}")
+        
+        # Exit SHORT position if exists
+        if short_sz > 0:
+            qty = quantize_qty(symbol, short_sz)
+            logging.warning(f"{symbol} IMMEDIATE EXIT SHORT {qty} ADA - Reason: {reason}")
+            success &= await safe_order_execution(cli, exit_short(symbol, qty), symbol, f"IMMEDIATE EXIT SHORT - {reason}")
+        
+        # Reset state
+        st["anchor_price"] = st["last_price"]
+        st["above_since"] = None
+        st["below_since"] = None
+        st["last_burst_ts"] = time.time()
+        
+        logging.error(f"{symbol} ALL POSITIONS CLOSED - {reason}")
+        return success
+
+# ========================= REALTIME DRIVER (STRICT 0.5% STEP + CONFIRM + IMMEDIATE EXIT) =====================
 async def realtime_driver(cli: AsyncClient):
-    """Strict step strategy (no aggregation) with glitch protection:
-       - Keep 100/100 baseline (hedged).
-       - Require price to remain beyond the rung (±0.5%) for CROSS_CONFIRM_SEC before any trim.
-       - Ignore bad ticks and massive jumps.
-       - After each step, move anchor by exactly one rung and cool down briefly.
-       - If any side hits ~0 after a step, reset & rebuild to baseline immediately.
-    """
+    """Strict step strategy with immediate exit when either side reaches zero"""
     POLL_SEC = 0.25  # check trigger frequently
 
     while True:
@@ -499,6 +531,20 @@ async def realtime_driver(cli: AsyncClient):
             st = state[sym]
             lp = st["last_price"]
             if lp is None or lp <= 0.0:
+                continue
+
+            # CRITICAL FIX: Check position health FIRST and CONTINUOUSLY
+            tol_qty = _zero_tolerance(sym)
+            long_sz = await get_position_size_fresh(cli, sym, "LONG")
+            short_sz = await get_position_size_fresh(cli, sym, "SHORT")
+            
+            # IMMEDIATE EXIT if either side is zero or near-zero
+            if long_sz <= tol_qty or short_sz <= tol_qty:
+                await immediate_exit_all(cli, sym, f"ZERO POSITION DETECTED - L:{long_sz:.4f} S:{short_sz:.4f}")
+                # Wait before rebuilding to avoid thrashing
+                await asyncio.sleep(5.0)  
+                # Rebuild baseline after exit
+                await ensure_baseline(cli, sym)
                 continue
 
             # Initialize baseline & anchor once we have a valid price
@@ -561,7 +607,6 @@ async def realtime_driver(cli: AsyncClient):
                     st["below_since"] = None
                     continue
 
-                tol_qty   = _zero_tolerance(sym)
                 steps_done = 0
 
                 # Re-evaluate confirm flags with fresh now_ts while under lock
@@ -584,16 +629,14 @@ async def realtime_driver(cli: AsyncClient):
                         await safe_order_execution(cli, exit_short(sym, amt), sym, "EXIT STEP SHORT (1x)")
                         steps_done += 1
 
+                        # IMMEDIATE CHECK AFTER EACH STEP
                         long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
                         short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
                         if long_sz2 <= tol_qty or short_sz2 <= tol_qty:
-                            logging.warning(f"{sym} ZERO-HIT after step -> RESET & REBUILD")
-                            await flatten_all_and_rebaseline(cli, sym)
-                            st["anchor_price"] = state[sym]["last_price"] if state[sym]["last_price"] else price
-                            st["above_since"] = None
-                            st["below_since"] = None
-                            break
-
+                            logging.error(f"{sym} ZERO-HIT DETECTED after step -> IMMEDIATE EXIT ALL")
+                            await immediate_exit_all(cli, sym, f"ZERO-HIT after STEP UP - L:{long_sz2:.4f} S:{short_sz2:.4f}")
+                            return  # Exit driver loop to prevent further processing
+                        
                         # advance anchor up one rung & reset timers
                         anchor = anchor * (1.0 + STEP_PCT)
                         st["anchor_price"] = anchor
@@ -616,15 +659,13 @@ async def realtime_driver(cli: AsyncClient):
                         await safe_order_execution(cli, exit_long(sym, amt), sym, "EXIT STEP LONG (1x)")
                         steps_done += 1
 
+                        # IMMEDIATE CHECK AFTER EACH STEP
                         long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
                         short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
                         if long_sz2 <= tol_qty or short_sz2 <= tol_qty:
-                            logging.warning(f"{sym} ZERO-HIT after step -> RESET & REBUILD")
-                            await flatten_all_and_rebaseline(cli, sym)
-                            st["anchor_price"] = state[sym]["last_price"] if state[sym]["last_price"] else price
-                            st["above_since"] = None
-                            st["below_since"] = None
-                            break
+                            logging.error(f"{sym} ZERO-HIT DETECTED after step -> IMMEDIATE EXIT ALL")
+                            await immediate_exit_all(cli, sym, f"ZERO-HIT after STEP DOWN - L:{long_sz2:.4f} S:{short_sz2:.4f}")
+                            return  # Exit driver loop to prevent further processing
 
                         # advance anchor down one rung & reset timers
                         anchor = anchor * (1.0 - STEP_PCT)
@@ -764,7 +805,7 @@ if __name__ == "__main__":
         datefmt="%b %d %H:%M:%S"
     )
 
-    # ---- PNL-only log filter: allow 15-min summaries + WARN/ERROR ----
+    # ---- PNL-only log filter: allow 15-min summaries + warnings/errors ----
     class PNLOnlyFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
@@ -786,6 +827,7 @@ if __name__ == "__main__":
     logging.info(f"Step Percentage: {STEP_PCT*100:.3f}%")
     logging.info(f"Cross Confirmation: {CROSS_CONFIRM_SEC}s")
     logging.info(f"Price Glitch Filter: {PRICE_GLITCH_PCT*100:.1f}%")
+    logging.info(f"CRITICAL: IMMEDIATE EXIT enabled when either side hits zero")
     logging.info(f"==========================")
     
     asyncio.run(main())
