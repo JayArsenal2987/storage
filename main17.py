@@ -45,8 +45,8 @@ SYMBOLS = {
 CAP_VALUES: Dict[str, float] = { s: 0.0 for s in SYMBOLS }  # unused here
 
 # ---- WMA Strategy config (requested) ----
-TICK_WMA_PERIOD = 4 * 60 * 60        # 4 hours in seconds
-WMA_ACTIVATION_THRESHOLD = 0.0005    # 0.05% distance to WMA to activate
+TICK_WMA_PERIOD = 5 * 60 * 60        # 5 hours in seconds
+WMA_ACTIVATION_THRESHOLD = 0.001     # 0.1% distance to WMA to activate (±0.1%)
 MOVEMENT_THRESHOLD = 0.05            # 5% adverse-only (log) cumulative movement to exit
 
 # Quiet logging summary cadence (requested 30 minutes)
@@ -69,7 +69,7 @@ class Ping(BaseHTTPRequestHandler):
         if self.path == "/ping":
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"pong")
+        # Keep empty body quiet
     def log_message(self, *_):
         pass
 
@@ -382,13 +382,13 @@ async def price_feed_loop(cli: AsyncClient):
 
 # ========================= WMA SEED (1m klines) =================
 async def seed_tick_wma(cli: AsyncClient):
-    """Initialize WMA per symbol with recent 1-minute closes (4h)."""
+    """Initialize WMA per symbol with recent 1-minute closes (5h)."""
     for s in SYMBOLS:
         closes = []
         try:
-            kl = await call_binance(cli.futures_klines, symbol=s, interval="1m", limit=240)
+            kl = await call_binance(cli.futures_klines, symbol=s, interval="1m", limit=300)
         except Exception:
-            kl = await call_binance(cli.get_klines, symbol=s, interval="1m", limit=240)
+            kl = await call_binance(cli.get_klines, symbol=s, interval="1m", limit=300)
         try:
             closes = [float(k[4]) for k in kl]
         except Exception:
@@ -400,7 +400,7 @@ async def seed_tick_wma(cli: AsyncClient):
         for c in closes:
             wma.update(c)
         if wma.value is not None:
-            logging.info(f"{s} Tick WMA initialized: {wma.value:.6f} (4h)")
+            logging.info(f"{s} Tick WMA initialized: {wma.value:.6f} (5h)")
 
 # ========================= WMA LOGIC HELPERS ===================
 def get_target_exit_price(exit_history: list, is_long: bool) -> Optional[float]:
@@ -427,25 +427,27 @@ def log_exit_details(symbol: str, direction: str, entry_price: float, exit_price
 
 def update_cumulative_movement(st: dict, current_price: float, position_type: str):
     """
-    Adverse-only log-return accumulation:
-      - LONG: only count down ticks (current < prev)
-      - SHORT: only count up ticks (current > prev)
-    Adds abs(log(current/prev)) to the side's accumulator.
+    Adverse-only accumulation:
+      LONG  -> add only if price went DOWN (negative log-return)
+      SHORT -> add only if price went UP   (positive log-return)
     """
     if position_type == "long":
-        last_tick_key = "long_last_tick_price"
-        accum_key     = "long_accumulated_movement"
+        last_key  = "long_last_tick_price"
+        accum_key = "long_accumulated_movement"
+        adverse   = lambda r: r < 0.0
     else:
-        last_tick_key = "short_last_tick_price"
-        accum_key     = "short_accumulated_movement"
+        last_key  = "short_last_tick_price"
+        accum_key = "short_accumulated_movement"
+        adverse   = lambda r: r > 0.0
 
-    prev = st[last_tick_key]
-    if prev is not None and prev > 0:
-        delta_log = math.log(current_price / prev)
-        is_adverse = (delta_log < 0.0) if (position_type == "long") else (delta_log > 0.0)
-        if is_adverse:
-            st[accum_key] += abs(delta_log)
-    st[last_tick_key] = current_price
+    prev = st[last_key]
+    if prev is not None and prev > 0.0 and current_price > 0.0:
+        r = math.log(current_price / prev)
+        if adverse(r):
+            st[accum_key] += abs(r)
+
+    # Always update reference price for next tick
+    st[last_key] = current_price
 
 # ========================= WMA TRADING DRIVER ==================
 async def wma_driver(cli: AsyncClient):
@@ -453,7 +455,6 @@ async def wma_driver(cli: AsyncClient):
 
     while True:
         await asyncio.sleep(POLL_SEC)
-        now = time.time()
 
         for sym in SYMBOLS:
             st = state[sym]
