@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, json, asyncio, threading, logging, websockets, time, math, random
+import os, json, asyncio, threading, logging, websockets, time, random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from binance import AsyncClient
 from collections import deque
-from typing import Optional, Tuple, Deque, Dict, Any, Union
+from typing import Optional, Tuple, Dict, Any
 from decimal import Decimal, ROUND_HALF_UP, getcontext
-getcontext().prec = 28  # safe precision
+getcontext().prec = 28
 
 # ========================= CONFIG =========================
 load_dotenv()
@@ -16,83 +16,81 @@ API_KEY    = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
 
-# ---- STRATEGY PARAMETERS ----
-BASE_QTY_PER_SIDE = float(os.getenv("BASE_QTY_PER_SIDE", "100.0"))   # 100 ADA target for LONG and SHORT
-STEP_QTY          = float(os.getenv("STEP_QTY", "10.0"))             # reduce 10 ADA on the indicated side
+# ---- Core parameters ----
+POSITION_SIZE_ADA   = float(os.getenv("POSITION_SIZE_ADA", "10.0"))
+SIGNAL_CONFIRM_SEC  = float(os.getenv("SIGNAL_CONFIRM_SEC", "3.0"))     # confirm new signal
+TRADE_COOLDOWN_SEC  = float(os.getenv("TRADE_COOLDOWN_SEC", "10.0"))    # gap between trades
+PRICE_GLITCH_PCT    = float(os.getenv("PRICE_GLITCH_PCT", "0.03"))      # drop bad ticks
 
-# ---- FIXED-QUANTITY MODE (legacy; unused by this strategy for entries) ----
-USE_NOTIONAL_MODE = False
+# Exit/flip protection (anti-churn)
+CALLBACK_RATE_PCT   = float(os.getenv("CALLBACK_RATE_PCT", "0.005"))    # 0.5% retrace gate
+MIN_HOLD_SEC        = float(os.getenv("MIN_HOLD_SEC", "30.0"))          # hold before exit/flip
+
+# ---- PRICE SOURCE ----
+PRICE_SOURCE = os.getenv("PRICE_SOURCE", "mark").lower()
+def _ws_host() -> str:
+    return "fstream.binance.com" if PRICE_SOURCE in ("futures", "mark") else "stream.binance.com:9443"
+def _stream_name(sym: str) -> str:
+    return f"{sym.lower()}@markPrice@1s" if PRICE_SOURCE == "mark" else f"{sym.lower()}@trade"
+
+# ---- SYMBOLS ----
 SYMBOLS = {
-    "ADAUSDT": 10.0,   # kept for compatibility; not used for strategy sizing
+    "BTCUSDT": 0.001,
+    "ETHUSDT": 0.01,
+    "BNBUSDT": 0.03,
+    "XRPUSDT": 10.0,
+    "SOLUSDT": 0.1,
+    "ADAUSDT": 10.0,
 }
-CAP_VALUES: Dict[str, float] = {
-    "ADAUSDT": 200.0,  # unused by this strategy
-}
 
-# Quiet logging: 15-min summaries + warnings/errors
-PNL_SUMMARY_SEC = 900.0
+# ---- Bounce (24h latest extreme) ----
+BOUNCE_ENABLED       = True
+BOUNCE_WINDOWS_SEC   = [24*3600]  # 24h only as requested
+BOUNCE_THRESHOLD_PCT = float(os.getenv("BOUNCE_THRESHOLD_PCT", "1.0")) / 100.0  # 1.0%
+BOUNCE_COOLDOWN_SEC  = float(os.getenv("BOUNCE_COOLDOWN_SEC", "30.0"))  # between separate bounces
 
-# ====== 1-hour bars (strict) ======
-BAR_SECONDS = 3600  # 1 hour
+# ---- Exchange-level trailing stop right after entry (NEW) ----
+EXCHANGE_TRAIL_ENABLED       = True
+# 0.5 here means 0.5% for Binance's callbackRate parameter
+EXCHANGE_TRAIL_CALLBACK_RATE = float(os.getenv("EXCHANGE_TRAIL_CALLBACK_RATE", "0.5"))
 
-# REST backoff / position cache
-POSITION_CACHE_TTL    = float(os.getenv("POSITION_CACHE_TTL", "45.0"))
+# Risk / misc
+MAX_CONSECUTIVE_FAILURES = 3
+CIRCUIT_BREAKER_BASE_SEC = 300
+PRICE_STALENESS_SEC = 5.0
+PNL_SUMMARY_SEC       = 1800.0
 RATE_LIMIT_BASE_SLEEP = float(os.getenv("RATE_LIMIT_BASE_SLEEP", "2.0"))
 RATE_LIMIT_MAX_SLEEP  = float(os.getenv("RATE_LIMIT_MAX_SLEEP", "60.0"))
 
-# ====== MAKER-FIRST ENTRY (entries/repairs only; reductions/resets are market) ======
-MAKER_FIRST          = True
-MAKER_WAIT_SEC       = float(os.getenv("MAKER_WAIT_SEC", "2.0"))      # short wait for maker fills
-MAKER_RETRY_TICKS    = int(os.getenv("MAKER_RETRY_TICKS", "1"))       # small price nudge if GTX rejected
-MAKER_MIN_FILL_RATIO = float(os.getenv("MAKER_MIN_FILL_RATIO", "0.995"))
+# Order validation parameters
+ORDER_FILL_TIMEOUT_SEC = 10.0
+MAX_FILL_CHECK_ATTEMPTS = 5
 
-# ====== PRICE FEED SOURCE ======
-# PRICE_SOURCE: "futures" (default), "spot", or "mark"
-PRICE_SOURCE = os.getenv("PRICE_SOURCE", "futures").lower()
-
-def _ws_host() -> str:
-    # USD-M futures default (fstream). Spot uses stream.binance.com:9443
-    return "fstream.binance.com" if PRICE_SOURCE in ("futures", "mark") else "stream.binance.com:9443"
-
-def _stream_name(sym: str) -> str:
-    # use 1s mark price stream if PRICE_SOURCE == "mark", else trade stream
-    return f"{sym.lower()}@markPrice@1s" if PRICE_SOURCE == "mark" else f"{sym.lower()}@trade"
-
-# ========================= QUIET /ping =========================
+# ========================= UTILITY CLASSES =========================
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/ping":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"pong")
-    def log_message(self, *_):
-        pass
+            self.send_response(200); self.end_headers()
+    def log_message(self, *_): pass
 
 def start_ping():
     HTTPServer(("0.0.0.0", 10000), Ping).serve_forever()
 
-# ========================= PRICE & QUANTITY FILTERS =============
+# ========================= PRICE & QTY FILTERS =================
 PRICE_TICK: Dict[str, Decimal] = {}
 PRICE_DECIMALS: Dict[str, int] = {}
 QUANTITY_STEP: Dict[str, Decimal] = {}
 QUANTITY_DECIMALS: Dict[str, int] = {}
-
 def _dec(x) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
-
 def _decimals_from_tick(tick: str) -> int:
     if "." not in tick: return 0
     return len(tick.split(".")[1].rstrip("0"))
-
 def quantize_price(symbol: str, price: float) -> str:
     tick = PRICE_TICK.get(symbol)
-    if not tick:
-        return f"{price:.8f}"  # fallback
-    p = _dec(price)
-    q = (p / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
-    decs = PRICE_DECIMALS.get(symbol, 8)
-    return f"{q:.{decs}f}"
-
+    if not tick: return f"{price:.8f}"
+    q = (_dec(price) / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+    return f"{q:.{PRICE_DECIMALS.get(symbol, 8)}f}"
 def quantize_qty(symbol: str, qty: float) -> float:
     step = QUANTITY_STEP.get(symbol)
     if step:
@@ -100,18 +98,14 @@ def quantize_qty(symbol: str, qty: float) -> float:
         return float(q)
     return round(qty, QUANTITY_DECIMALS.get(symbol, 3))
 
-def calculate_order_quantity(symbol: str, _: float) -> float:
-    # legacy interface not used for strategy sizing
-    return float(SYMBOLS[symbol])
-
 # ========================= SAFE BINANCE CALL ===================
 _last_rest_ts = 0.0
 async def call_binance(fn, *args, **kwargs):
     global _last_rest_ts
     now = time.time()
-    min_gap = 0.08
+    min_gap = 0.2
     if now - _last_rest_ts < min_gap:
-        await asyncio.sleep(min_gap - (now - _last_rest_ts) + random.uniform(0.01, 0.03))
+        await asyncio.sleep(min_gap - (now - _last_rest_ts) + random.uniform(0.01, 0.05))
     _last_rest_ts = time.time()
     delay = RATE_LIMIT_BASE_SLEEP
     while True:
@@ -121,63 +115,44 @@ async def call_binance(fn, *args, **kwargs):
             msg = str(e)
             if "429" in msg or "-1003" in msg or "Too many requests" in msg or "IP banned" in msg:
                 sleep_for = min(delay, RATE_LIMIT_MAX_SLEEP)
-                logging.warning(f"Rate limit/backoff: sleeping {sleep_for:.1f}s ({msg})")
+                logging.warning(f"Rate limit: sleeping {sleep_for:.1f}s")
                 await asyncio.sleep(sleep_for + random.uniform(0.0, 0.5))
                 delay = min(delay * 2.0, RATE_LIMIT_MAX_SLEEP)
                 continue
             raise
 
 # ========================= POSITION HELPERS ====================
-position_cache = {
-    s: {"LONG": {"size": 0.0, "ts": 0.0}, "SHORT": {"size": 0.0, "ts": 0.0}}
-    for s in SYMBOLS
-}
+position_cache = { s: {"LONG": {"size": 0.0, "ts": 0.0}, "SHORT": {"size": 0.0, "ts": 0.0}} for s in SYMBOLS }
 def invalidate_position_cache(symbol: str):
-    position_cache[symbol]["LONG"]["ts"] = 0.0
-    position_cache[symbol]["SHORT"]["ts"] = 0.0
-
+    position_cache[symbol]["LONG"]["ts"] = 0.0; position_cache[symbol]["SHORT"]["ts"] = 0.0
 async def get_dual_side(cli: AsyncClient) -> bool:
     try:
         res = await call_binance(cli.futures_get_position_mode)
         return bool(res.get("dualSidePosition", False))
     except Exception:
         return False
-
 async def refresh_position_cache(cli: AsyncClient, symbol: str):
     try:
         positions = await call_binance(cli.futures_position_information, symbol=symbol)
         sizes = {"LONG": 0.0, "SHORT": 0.0}
         for pos in positions:
             side = pos.get("positionSide")
-            if side in sizes:
-                sizes[side] = abs(float(pos.get("positionAmt", 0.0)))
+            if side in sizes: sizes[side] = abs(float(pos.get("positionAmt", 0.0)))
         now = time.time()
-        for side in ("LONG", "SHORT"):
+        for side in ("LONG","SHORT"):
             position_cache[symbol][side]["size"] = sizes[side]
             position_cache[symbol][side]["ts"] = now
     except Exception as e:
         logging.warning(f"{symbol} refresh_position_cache failed: {e}")
-
-async def get_position_size(cli: AsyncClient, symbol: str, side: str) -> float:
-    now = time.time()
-    pc = position_cache[symbol][side]
-    if now - pc["ts"] <= POSITION_CACHE_TTL:
-        return pc["size"]
-    await refresh_position_cache(cli, symbol)
-    return position_cache[symbol][side]["size"]
-
 async def get_position_size_fresh(cli: AsyncClient, symbol: str, side: str) -> float:
-    await refresh_position_cache(cli, symbol)
-    return position_cache[symbol][side]["size"]
-
+    await refresh_position_cache(cli, symbol); return position_cache[symbol][side]["size"]
 async def get_positions_snapshot(cli: AsyncClient, symbol: str) -> Dict[str, Dict[str, float]]:
-    snap = {"LONG": {"size": 0.0, "entry": 0.0, "uPnL": 0.0},
-            "SHORT": {"size": 0.0, "entry": 0.0, "uPnL": 0.0}}
+    snap = {"LONG": {"size": 0.0, "entry": 0.0, "uPnL": 0.0}, "SHORT": {"size": 0.0, "entry": 0.0, "uPnL": 0.0}}
     try:
         positions = await call_binance(cli.futures_position_information, symbol=symbol)
         for pos in positions:
             side = pos.get("positionSide")
-            if side in ("LONG", "SHORT"):
+            if side in ("LONG","SHORT"):
                 snap[side]["size"]  = abs(float(pos.get("positionAmt", 0.0)))
                 snap[side]["entry"] = float(pos.get("entryPrice", 0.0) or 0.0)
                 snap[side]["uPnL"]  = float(pos.get("unRealizedProfit", pos.get("unrealizedProfit", 0.0)) or 0.0)
@@ -186,99 +161,91 @@ async def get_positions_snapshot(cli: AsyncClient, symbol: str) -> Dict[str, Dic
     return snap
 
 # ========================= ORDER BUILDERS ======================
-DUAL_SIDE = False  # set in main()
-
+DUAL_SIDE = False
 def _maybe_pos_side(params: dict, side: str) -> dict:
-    # side is "LONG" or "SHORT"
-    if DUAL_SIDE:
-        params["positionSide"] = side
-    else:
-        params.pop("positionSide", None)  # omit in one-way mode
+    if DUAL_SIDE: params["positionSide"] = side
+    else: params.pop("positionSide", None)
     return params
-
-def open_long(sym: str, qty: float):
-    p = dict(symbol=sym, side="BUY",  type="MARKET",
-             quantity=quantize_qty(sym, qty))
-    return _maybe_pos_side(p, "LONG")
-
-def open_short(sym: str, qty: float):
-    p = dict(symbol=sym, side="SELL", type="MARKET",
-             quantity=quantize_qty(sym, qty))
-    return _maybe_pos_side(p, "SHORT")
-
+def open_long(sym: str, qty: float):  return _maybe_pos_side(dict(symbol=sym, side="BUY",  type="MARKET", quantity=quantize_qty(sym, qty)), "LONG")
+def open_short(sym: str, qty: float): return _maybe_pos_side(dict(symbol=sym, side="SELL", type="MARKET", quantity=quantize_qty(sym, qty)), "SHORT")
 def exit_long(sym: str, qty: float):
-    p = dict(symbol=sym, side="SELL", type="MARKET",
-             quantity=quantize_qty(sym, qty))
-    if not DUAL_SIDE:
-        p["reduceOnly"] = True
+    p = dict(symbol=sym, side="SELL", type="MARKET", quantity=quantize_qty(sym, qty))
+    if not DUAL_SIDE: p["reduceOnly"] = True
     return _maybe_pos_side(p, "LONG")
-
 def exit_short(sym: str, qty: float):
-    p = dict(symbol=sym, side="BUY", type="MARKET",
-             quantity=quantize_qty(sym, qty))
-    if not DUAL_SIDE:
-        p["reduceOnly"] = True
+    p = dict(symbol=sym, side="BUY", type="MARKET", quantity=quantize_qty(sym, qty))
+    if not DUAL_SIDE: p["reduceOnly"] = True
     return _maybe_pos_side(p, "SHORT")
 
-# ========================= EXECUTION WRAPPER ===================
-async def safe_order_execution(cli: AsyncClient, order_params: dict, symbol: str, action: str) -> bool:
-    """Executes and logs quietly. On exits, verifies available size.
-       If -1106 due to reduceOnly, retry once without reduceOnly."""
-    try:
-        if action.startswith("CLOSE") or "EXIT" in action or "FLATTEN" in action:
-            side = "LONG" if "LONG" in action else "SHORT"
-            # fresh size to avoid false 'insufficient position' due to cache
-            current_pos = await get_position_size_fresh(cli, symbol, side)
-            required_qty = float(order_params["quantity"])
-            if current_pos < required_qty * 0.995:
-                logging.warning(f"{symbol} {action}: Insufficient position {current_pos} < {required_qty}")
-                return False
-
+# ========================= IMPROVED ORDER VALIDATION ===================
+async def wait_for_order_fill(cli: AsyncClient, symbol: str, order_id: str) -> Dict[str, Any]:
+    """Wait for order to fill and return order status"""
+    for attempt in range(MAX_FILL_CHECK_ATTEMPTS):
         try:
-            res = await call_binance(cli.futures_create_order, **order_params)
+            order_status = await call_binance(cli.futures_get_order, symbol=symbol, orderId=order_id)
+            status = order_status.get("status")
+            if status == "FILLED":
+                return {
+                    "success": True,
+                    "filled_qty": float(order_status.get("executedQty", 0)),
+                    "avg_price": float(order_status.get("avgPrice", 0)),
+                    "order_status": order_status
+                }
+            elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
+                return {"success": False, "error": f"Order {status.lower()}", "order_status": order_status}
+            if attempt < MAX_FILL_CHECK_ATTEMPTS - 1:
+                await asyncio.sleep(ORDER_FILL_TIMEOUT_SEC / MAX_FILL_CHECK_ATTEMPTS)
         except Exception as e:
-            msg = str(e)
-            if "-1106" in msg and "reduceonly" in msg.lower() and ("reduceOnly" in order_params):
-                params_wo = {k: v for k, v in order_params.items() if k != "reduceOnly"}
-                logging.warning(f"{symbol} {action}: retrying without reduceOnly due to -1106")
-                res = await call_binance(cli.futures_create_order, **params_wo)
-            else:
-                raise
+            logging.warning(f"{symbol} Order status check failed (attempt {attempt + 1}): {e}")
+            if attempt < MAX_FILL_CHECK_ATTEMPTS - 1:
+                await asyncio.sleep(1.0)
+    return {"success": False, "error": "Fill verification timeout"}
 
-        oid = res.get("orderId")
-        state[symbol]["last_order_id"] = oid
-        invalidate_position_cache(symbol)
-        logging.info(f"{symbol} {action} executed - OrderID: {oid}")
+async def verify_position_after_trade(cli: AsyncClient, symbol: str, expected_long: float, expected_short: float) -> bool:
+    """Verify actual positions match expected after trade"""
+    try:
+        await refresh_position_cache(cli, symbol)
+        actual_long = position_cache[symbol]["LONG"]["size"]
+        actual_short = position_cache[symbol]["SHORT"]["size"]
+        tolerance = max(0.1, max(expected_long, expected_short) * 0.001)
+        long_match = abs(actual_long - expected_long) <= tolerance
+        short_match = abs(actual_short - expected_short) <= tolerance
+        if not (long_match and short_match):
+            logging.warning(f"{symbol} Position mismatch - Expected L:{expected_long:.3f} S:{expected_short:.3f}, "
+                            f"Actual L:{actual_long:.3f} S:{actual_short:.3f}, Tolerance:{tolerance:.3f}")
+            return False
         return True
     except Exception as e:
-        logging.error(f"{symbol} {action} failed: {e}")
+        logging.error(f"{symbol} Position verification failed: {e}")
         return False
 
 # ========================= STATE ===============================
-class MicroEntry(dict):
-    # (legacy; not used by this strategy)
-    pass
-
-def calculate_max_slots(symbol: str) -> int:
-    return 1  # not used; keep minimal compatibility
-
 state: Dict[str, Dict[str, Any]] = {
     s: {
-        "last_price": None,
-        "price_buffer": deque(maxlen=5000),
-        "micro_fifo": deque(),               # legacy; unused
-        "max_slots": calculate_max_slots(s),
-        "order_lock": asyncio.Lock(),
-        "last_order_id": None,
-        "fifo_sync_error_count": 0,
-        # --- 1h bar manager ---
-        "bar_open": None,
-        "bar_start": None,
-        "bars_in_cycle": 0,
-        "cycle_start_ts": None,
-        "prev_close": None,         # previous bar close (for signal)
+        "last_price": None, "last_good_price": None, "price_timestamp": None,
+        "price_buffer": deque(maxlen=5000), "ext_price_buffer": deque(maxlen=100000),
+        "ws_last_heartbeat": 0.0,
+        "bot_active": False, "manual_override": False,
+        "current_signal": None, "signal_since": None, "last_trade_ts": 0.0, "active_signal_source": None,
+        # trailing extremes for callback exit/flip
+        "trail_peak": None, "trail_trough": None,
+        # bounce state
+        "last_bounce_ts": 0.0,
+        # risk
+        "consecutive_failures": 0, "circuit_breaker_until": 0.0, "position_state": "IDLE",
+        # misc
+        "order_lock": asyncio.Lock(), "last_position_entry_ts": 0.0,
     } for s in SYMBOLS
 }
+
+# Track trailing stop order ids per side (NEW)
+trailing_orders: Dict[str, Dict[str, Optional[int]]] = {
+    s: {"LONG": None, "SHORT": None} for s in SYMBOLS
+}
+
+# ========================= SYMBOL TARGET SIZE ==================
+def symbol_target_qty(sym: str) -> float:
+    return float(SYMBOLS.get(sym, POSITION_SIZE_ADA))
 
 # ========================= SYMBOL FILTERS ======================
 async def seed_symbol_filters(cli: AsyncClient):
@@ -287,8 +254,7 @@ async def seed_symbol_filters(cli: AsyncClient):
         symbols_info = {s["symbol"]: s for s in info.get("symbols", [])}
         for sym in SYMBOLS:
             si = symbols_info.get(sym)
-            if not si:
-                continue
+            if not si: continue
             filters = si.get("filters", [])
             pf = next((f for f in filters if f.get("filterType") == "PRICE_FILTER"), None)
             if pf:
@@ -296,373 +262,387 @@ async def seed_symbol_filters(cli: AsyncClient):
                 if tick:
                     PRICE_TICK[sym] = _dec(tick)
                     PRICE_DECIMALS[sym] = _decimals_from_tick(tick)
-                    logging.info(f"{sym} tickSize={tick} decimals={PRICE_DECIMALS[sym]}")
             qf = next((f for f in filters if f.get("filterType") == "LOT_SIZE"), None)
             if qf:
                 step = qf.get("stepSize")
                 if step:
                     QUANTITY_STEP[sym] = _dec(step)
                     QUANTITY_DECIMALS[sym] = _decimals_from_tick(step)
-                    logging.info(f"{sym} stepSize={step} qty_decimals={QUANTITY_DECIMALS[sym]}")
     except Exception as e:
         logging.warning(f"seed_symbol_filters failed: {e}")
 
-# ========================= STRATEGY HELPERS ====================
-def _zero_tolerance(symbol: str) -> float:
-    step = QUANTITY_STEP.get(symbol, Decimal("0.000001"))
-    try:
-        return float(step) * 0.51
-    except Exception:
-        return 1e-8
+# ========================= PRICE FEED ===========================
+def _parse_price_from_event(d: dict) -> Optional[float]:
+    p_str = d.get("p") or d.get("c") or d.get("ap") or d.get("a")
+    if p_str is None: return None
+    try: return float(p_str)
+    except Exception: return None
 
-async def maker_add(cli: AsyncClient, symbol: str, side: str, qty: float) -> float:
-    """Open/add exposure using maker-first entry."""
-    qty = quantize_qty(symbol, max(0.0, qty))
-    if qty <= 0:
-        return 0.0
-    return await maker_first_entry(cli, symbol, side, qty)
-
-async def ensure_target_side(cli: AsyncClient, symbol: str, side: str, target_qty: float):
-    """Adjust a side to exactly target_qty (add via maker-first; trim via market)."""
-    current = await get_position_size_fresh(cli, symbol, side)
-    tol = _zero_tolerance(symbol)
-    target_qty = quantize_qty(symbol, max(0.0, target_qty))
-    if current < target_qty - tol:
-        await maker_add(cli, symbol, side, target_qty - current)
-    elif current > target_qty + tol:
-        delta = quantize_qty(symbol, current - target_qty)
-        params = exit_long(symbol, delta) if side == "LONG" else exit_short(symbol, delta)
-        await safe_order_execution(cli, params, symbol, f"TRIM TO TARGET {side}")
-
-async def ensure_baseline(cli: AsyncClient, symbol: str):
-    """Bring both LONG and SHORT to BASE_QTY_PER_SIDE."""
-    await ensure_target_side(cli, symbol, "LONG",  BASE_QTY_PER_SIDE)
-    await ensure_target_side(cli, symbol, "SHORT", BASE_QTY_PER_SIDE)
-
-async def flatten_all(cli: AsyncClient, symbol: str) -> bool:
-    st = state[symbol]
-    async with st["order_lock"]:
-        # cancel all, then close both sides at market
-        try:
-            await call_binance(cli.futures_cancel_all_open_orders, symbol=symbol)
-        except Exception as e:
-            logging.warning(f"{symbol} cancel_all_open failed: {e}")
-        long_sz  = await get_position_size_fresh(cli, symbol, "LONG")
-        short_sz = await get_position_size_fresh(cli, symbol, "SHORT")
-        ok = True
-        if long_sz > 0:
-            ok &= await safe_order_execution(cli, exit_long(symbol, quantize_qty(symbol, long_sz)), symbol, "FLATTEN LONG")
-        if short_sz > 0:
-            ok &= await safe_order_execution(cli, exit_short(symbol, quantize_qty(symbol, short_sz)), symbol, "FLATTEN SHORT")
-        # clear legacy state fields
-        st["micro_fifo"].clear()
-        st["bars_in_cycle"] = 0
-        st["cycle_start_ts"] = time.time()
-        logging.warning(f"{symbol} FLATTENED ALL")
-        return ok
-
-async def flatten_all_and_rebaseline(cli: AsyncClient, symbol: str):
-    await flatten_all(cli, symbol)
-    await ensure_baseline(cli, symbol)
-    logging.warning(f"{symbol} RESET → REBUILT to {BASE_QTY_PER_SIDE} ADA each side")
-
-# ========================= MAKER-FIRST HELPERS =================
-async def get_best_bid_ask(cli: AsyncClient, symbol: str) -> Optional[Tuple[float, float]]:
-    try:
-        ob = await call_binance(cli.futures_order_book, symbol=symbol, limit=5)
-        bids = ob.get("bids") or []
-        asks = ob.get("asks") or []
-        if not bids or not asks:
-            return None
-        return float(bids[0][0]), float(asks[0][0])
-    except Exception as e:
-        logging.warning(f"{symbol} get_best_bid_ask failed: {e}")
-        return None
-
-def _tick_float(symbol: str) -> float:
-    t = PRICE_TICK.get(symbol)
-    return float(t) if t else 0.0001
-
-def maker_limit_price(symbol: str, side: str, bid: float, ask: float) -> str:
-    tick = _tick_float(symbol)
-    if side == "LONG":  # BUY
-        p = min(bid, ask - tick)
-        if p <= 0:
-            p = max(bid - tick, 0.0)
-    else:               # SELL
-        p = max(ask, bid + tick)
-    q = float(quantize_price(symbol, p))
-    if side == "LONG" and q >= ask:
-        q = ask - tick
-    if side == "SHORT" and q <= bid:
-        q = bid + tick
-    return quantize_price(symbol, max(q, tick))
-
-async def cancel_order(cli: AsyncClient, symbol: str, order_id: Any):
-    try:
-        await call_binance(cli.futures_cancel_order, symbol=symbol, orderId=order_id)
-    except Exception as e:
-        logging.warning(f"{symbol} cancel order {order_id} failed: {e}")
-
-async def maker_first_entry(cli: AsyncClient, symbol: str, side: str, qty: float) -> float:
-    """Return actual executed qty (0.0 if failed)."""
-    if not MAKER_FIRST:
-        params = open_long(symbol, qty) if side == "LONG" else open_short(symbol, qty)
-        ok = await safe_order_execution(cli, params, symbol, f"ENTRY {side}")
-        return qty if ok else 0.0
-
-    pre_sz = await get_position_size_fresh(cli, symbol, side)
-    ba = await get_best_bid_ask(cli, symbol)
-    if not ba:
-        params = open_long(symbol, qty) if side == "LONG" else open_short(symbol, qty)
-        ok = await safe_order_execution(cli, params, symbol, f"ENTRY {side}")
-        return qty if ok else 0.0
-    bid, ask = ba
-    price = maker_limit_price(symbol, side, bid, ask)
-    order = dict(
-        symbol=symbol,
-        side=("BUY" if side == "LONG" else "SELL"),
-        type="LIMIT",
-        timeInForce="GTX",
-        quantity=quantize_qty(symbol, qty),
-        price=price,
-        newOrderRespType="ACK",
-    )
-    if DUAL_SIDE:
-        order["positionSide"] = side
-
-    oid = None
-    for _ in range(2):
-        try:
-            res = await call_binance(cli.futures_create_order, **order)
-            oid = res.get("orderId")
-            break
-        except Exception as e:
-            msg = str(e)
-            if "-5022" in msg or "GTX" in msg.upper():
-                tick = _tick_float(symbol) * max(1, MAKER_RETRY_TICKS)
-                price = float(price) - tick if side == "LONG" else float(price) + tick
-                order["price"] = quantize_price(symbol, price)
-                continue
-            logging.warning(f"{symbol} GTX place failed ({msg}); falling back to MARKET")
-            params = open_long(symbol, qty) if side == "LONG" else open_short(symbol, qty)
-            ok = await safe_order_execution(cli, params, symbol, f"ENTRY {side}")
-            return qty if ok else 0.0
-
-    if not oid:
-        params = open_long(symbol, qty) if side == "LONG" else open_short(symbol, qty)
-        ok = await safe_order_execution(cli, params, symbol, f"ENTRY {side}")
-        return qty if ok else 0.0
-
-    await asyncio.sleep(MAKER_WAIT_SEC)
-
-    post_sz = await get_position_size_fresh(cli, symbol, side)
-    filled = max(0.0, post_sz - pre_sz)
-
-    if filled >= qty * MAKER_MIN_FILL_RATIO:
-        invalidate_position_cache(symbol)
-        logging.info(f"{symbol} ENTRY {side} filled as MAKER ~{filled:.6f}/{qty:.6f} at {order['price']}")
-        return filled
-
-    # cancel just that order (not all)
-    await cancel_order(cli, symbol, oid)
-
-    post_sz2 = await get_position_size_fresh(cli, symbol, side)
-    filled2 = max(0.0, post_sz2 - pre_sz)
-    remaining = max(0.0, qty - filled2)
-    remaining = quantize_qty(symbol, remaining)
-    if remaining <= 0:
-        invalidate_position_cache(symbol)
-        return filled2
-
-    logging.warning(f"{symbol} ENTRY {side} maker underfilled {filled2:.6f}/{qty:.6f}; MARKET remaining {remaining:.6f}")
-    params = open_long(symbol, remaining) if side == "LONG" else open_short(symbol, remaining)
-    ok = await safe_order_execution(cli, params, symbol, f"ENTRY {side} (market remainder)")
-    if not ok:
-        return filled2
-    post_sz3 = await get_position_size_fresh(cli, symbol, side)
-    return max(0.0, post_sz3 - pre_sz)
-
-# ========================= FEEDS & ENGINES =====================
 async def price_feed_loop(cli: AsyncClient):
     streams = [_stream_name(s) for s in SYMBOLS]
     url = f"wss://{_ws_host()}/stream?streams={'/'.join(streams)}"
-    suffix_trade = "@trade"
-    suffix_mark  = "@markPrice@1s"
+    reconnect_delay = 1.0; max_reconnect_delay = 60.0
     while True:
         try:
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-                max_queue=1000,
-            ) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5, max_queue=1000) as ws:
+                reconnect_delay = 1.0
+                logging.info("WebSocket price feed connected")
                 async for raw in ws:
-                    m = json.loads(raw)
-                    stream = m.get("stream", "")
-                    if not (stream.endswith(suffix_trade) or stream.endswith(suffix_mark)):
-                        continue
-                    d = m.get("data", {})
-                    sym = d.get("s")
-                    if not sym:
-                        continue
-                    price = float(d.get("p"))
-                    st = state[sym]
-                    st["last_price"] = price
-                    st["price_buffer"].append((time.time(), price))
+                    now = time.time()
+                    for sym in SYMBOLS: state[sym]["ws_last_heartbeat"] = now
+                    m = json.loads(raw); d = m.get("data", {}); sym = d.get("s")
+                    if not sym or sym not in state: continue
+                    p = _parse_price_from_event(d)
+                    if p is None or p <= 0.0: continue
+                    st = state[sym]; prev = st["last_price"]
+                    if prev is not None and abs(p / prev - 1.0) > PRICE_GLITCH_PCT:
+                        logging.warning(f"{sym} Price glitch filtered: {prev:.6f} -> {p:.6f}"); continue
+                    st["last_price"] = p; st["last_good_price"] = p; st["price_timestamp"] = now
+                    st["price_buffer"].append((now, p)); st["ext_price_buffer"].append((now, p))
         except Exception as e:
-            logging.warning(f"WebSocket dropped: {e}. Reconnecting shortly...")
-            await asyncio.sleep(2.0 + random.uniform(0.0, 0.8))
-            continue
+            logging.warning(f"WebSocket dropped: {e}. Reconnecting in {reconnect_delay:.1f}s...")
+            await asyncio.sleep(reconnect_delay + random.uniform(0.0, 0.8))
+            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
-async def hourly_driver(cli: AsyncClient):
-    """Single-rule strategy:
-       - Maintain 100 ADA LONG and 100 ADA SHORT (hedged).
-       - Hourly: if close > prev_close → reduce SHORT by 10; if close < prev_close → reduce LONG by 10.
-       - If any side hits 0 → exit all and rebuild to 100/100 immediately."""
-    def next_hour_t(now=None):
-        if now is None: now = time.time()
-        return (int(now // BAR_SECONDS) + 1) * BAR_SECONDS
+# ========================= INITIALIZATION ===================
+async def seed_extremes_buffer(cli: AsyncClient):
+    for s in SYMBOLS:
+        try:
+            kl = await call_binance(cli.futures_klines, symbol=s, interval="1m", limit=1440)
+            buf = state[s]["ext_price_buffer"]
+            for k in kl:
+                ts = float(k[0]) / 1000.0; c = float(k[4])
+                buf.append((ts, c))
+            if buf: logging.info(f"{s} extremes buffer seeded with {len(buf)} points")
+        except Exception as e:
+            logging.warning(f"{s} extremes buffer seed failed: {e}")
 
+# ========================= BOUNCE-ONLY SIGNALS ============================
+def _rolling_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Return (low, low_ts, high, high_ts) in last window_sec; ties choose latest ts."""
+    now = time.time(); buf = st["ext_price_buffer"]
+    if not buf: return None, None, None, None
+    low = high = None; low_ts = high_ts = None
+    for ts, p in reversed(buf):
+        if now - ts > window_sec: break
+        if low is None or p < low or (p == low and (low_ts is None or ts > low_ts)): low, low_ts = p, ts
+        if high is None or p > high or (p == high and (high_ts is None or ts > high_ts)): high, high_ts = p, ts
+    return low, low_ts, high, high_ts
+
+def bounce_signal(st: dict) -> Optional[str]:
+    """
+    Bounce uses distance-based priority when both conditions are met.
+    Choose LONG/SHORT based on which trigger level is closer to current price.
+    """
+    if not BOUNCE_ENABLED:
+        return None
+
+    price = st.get("last_price")
+    if price is None:
+        return None
+
+    now = time.time()
+    if now - st.get("last_bounce_ts", 0.0) < BOUNCE_COOLDOWN_SEC:
+        return None
+
+    low_24, low_ts_24, high_24, high_ts_24 = _rolling_extremes_with_ts(st, 24 * 3600)
+    if low_ts_24 is None and high_ts_24 is None:
+        return None
+
+    # Calculate bounce trigger levels
+    long_trigger = float(low_24) * (1.0 + BOUNCE_THRESHOLD_PCT) if low_ts_24 is not None else None
+    short_trigger = float(high_24) * (1.0 - BOUNCE_THRESHOLD_PCT) if high_ts_24 is not None else None
+
+    long_ok = (long_trigger is not None) and (price >= long_trigger)
+    short_ok = (short_trigger is not None) and (price <= short_trigger)
+
+    if long_ok and short_ok:
+        distance_to_long_trigger = abs(price - long_trigger)
+        distance_to_short_trigger = abs(price - short_trigger)
+        pick = "LONG" if distance_to_long_trigger < distance_to_short_trigger else "SHORT"
+        st["last_bounce_ts"] = now
+        logging.info(
+            f"Bounce conflict resolved: price={price:.6f}, long_trigger={long_trigger:.6f}(dist:{distance_to_long_trigger:.6f}), "
+            f"short_trigger={short_trigger:.6f}(dist:{distance_to_short_trigger:.6f}) -> {pick}"
+        )
+        return pick
+    elif long_ok:
+        st["last_bounce_ts"] = now
+        return "LONG"
+    elif short_ok:
+        st["last_bounce_ts"] = now
+        return "SHORT"
+    return None
+
+def get_target_signal(st: dict) -> Tuple[Optional[str], str]:
+    b = bounce_signal(st)
+    if b in ("LONG","SHORT"): return b, "BOUNCE"
+    return None, "NONE"
+
+# ========================= EXCHANGE TRAILING STOP (NEW) ==================
+async def place_exchange_trailing_stop(cli: AsyncClient, symbol: str, side_pos: str, qty: float, activation_price: float) -> Optional[int]:
+    """
+    side_pos: 'LONG' or 'SHORT' (positionSide).
+    For LONG positions we place a SELL trailing stop; for SHORT positions we place a BUY trailing stop.
+    """
+    if not EXCHANGE_TRAIL_ENABLED:
+        return None
+    if qty <= 0 or activation_price <= 0:
+        return None
+
+    working_type = "MARK_PRICE" if PRICE_SOURCE == "mark" else "CONTRACT_PRICE"
+    side = "SELL" if side_pos == "LONG" else "BUY"
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TRAILING_STOP_MARKET",
+        "quantity": quantize_qty(symbol, qty),
+        "activationPrice": quantize_price(symbol, activation_price),
+        "callbackRate": EXCHANGE_TRAIL_CALLBACK_RATE,  # 0.5 => 0.5%
+        "workingType": working_type,
+        "reduceOnly": True,
+    }
+    if DUAL_SIDE:
+        params["positionSide"] = side_pos
+
+    # strip Nones
+    params = {k: v for k, v in params.items() if v is not None}
+
+    try:
+        res = await call_binance(cli.futures_create_order, **params)
+    except Exception as e:
+        msg = str(e)
+        # Retry without reduceOnly if the exchange rejects it for trailing stops
+        if "-1106" in msg and "reduceonly" in msg.lower() and ("reduceOnly" in params):
+            params_wo = {k: v for k, v in params.items() if k != "reduceOnly"}
+            logging.warning(f"{symbol} TRAIL {side_pos}: retrying without reduceOnly")
+            res = await call_binance(cli.futures_create_order, **params_wo)
+        else:
+            logging.warning(f"{symbol} TRAIL {side_pos}: create failed: {e}")
+            return None
+
+    oid = res.get("orderId")
+    if oid is not None:
+        trailing_orders[symbol][side_pos] = int(oid)
+        logging.info(f"{symbol} TRAIL {side_pos}: set 0.5% (orderId={oid}) at act={activation_price:.6f}")
+    return trailing_orders[symbol][side_pos]
+
+# ========================= IMPROVED POSITION MGMT =======================
+async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str):
+    st = state[symbol]
+    async with st["order_lock"]:
+        if st["position_state"] != "IDLE": return False
+        st["position_state"] = "PROCESSING"
+        try:
+            long_size = await get_position_size_fresh(cli, symbol, "LONG")
+            short_size = await get_position_size_fresh(cli, symbol, "SHORT")
+
+            target_qty = symbol_target_qty(symbol)
+            target_long = target_qty if target_signal == "LONG" else 0.0
+            target_short = target_qty if target_signal == "SHORT" else 0.0
+
+            tolerance = max(0.1, max(target_long, target_short, long_size, short_size) * 0.001)
+
+            ok_all = True
+
+            # Close unwanted positions first
+            if short_size > tolerance and target_signal != "SHORT":
+                ok_all &= await safe_order_execution(cli, exit_short(symbol, short_size), symbol, "CLOSE SHORT")
+            if long_size > tolerance and target_signal != "LONG":
+                ok_all &= await safe_order_execution(cli, exit_long(symbol, long_size), symbol, "CLOSE LONG")
+
+            # Open new positions
+            if target_signal == "LONG" and long_size < target_long - tolerance:
+                delta = target_long - long_size
+                ok = await safe_order_execution(cli, open_long(symbol, delta), symbol, "OPEN LONG")
+                if ok:
+                    st["last_position_entry_ts"] = time.time()
+                    st["trail_peak"] = st.get("last_price")
+                    st["trail_trough"] = None
+                    # NEW: place exchange trailing stop @ 0.5%
+                    actual_long = await get_position_size_fresh(cli, symbol, "LONG")
+                    await place_exchange_trailing_stop(cli, symbol, "LONG", actual_long, st.get("last_price") or 0.0)
+                ok_all &= ok
+            elif target_signal == "SHORT" and short_size < target_short - tolerance:
+                delta = target_short - short_size
+                ok = await safe_order_execution(cli, open_short(symbol, delta), symbol, "OPEN SHORT")
+                if ok:
+                    st["last_position_entry_ts"] = time.time()
+                    st["trail_trough"] = st.get("last_price")
+                    st["trail_peak"] = None
+                    # NEW: place exchange trailing stop @ 0.5%
+                    actual_short = await get_position_size_fresh(cli, symbol, "SHORT")
+                    await place_exchange_trailing_stop(cli, symbol, "SHORT", actual_short, st.get("last_price") or 0.0)
+                ok_all &= ok
+            elif target_signal == "FLAT":
+                st["trail_peak"] = None
+                st["trail_trough"] = None
+
+            # Verify final positions match expectations
+            if ok_all:
+                position_verified = await verify_position_after_trade(cli, symbol, target_long, target_short)
+                if not position_verified:
+                    logging.warning(f"{symbol} Position verification failed after successful orders")
+                st["consecutive_failures"] = 0
+            else:
+                st["consecutive_failures"] += 1
+                st["circuit_breaker_until"] = time.time() + (CIRCUIT_BREAKER_BASE_SEC * st["consecutive_failures"])
+
+            return ok_all
+        finally:
+            st["position_state"] = "IDLE"
+
+# ========================= MAIN LOOP ===========================
+def _callback_retrace_hit(st: dict, price: float, side: str) -> bool:
+    if CALLBACK_RATE_PCT <= 0.0: return True
+    if side == "LONG":
+        peak = st.get("trail_peak") or price
+        return ((peak - price) / peak) >= CALLBACK_RATE_PCT
+    if side == "SHORT":
+        trough = st.get("trail_trough") or price
+        return ((price - trough) / trough) >= CALLBACK_RATE_PCT
+    return True
+
+async def simplified_trading_loop(cli: AsyncClient):
+    POLL_SEC = 0.25
     while True:
-        # wait until next hour boundary
-        await asyncio.sleep(max(0.0, next_hour_t() - time.time()) + 0.05)
-
+        await asyncio.sleep(POLL_SEC)
         for sym in SYMBOLS:
             st = state[sym]
-            async with st["order_lock"]:
-                close_price = st["last_price"]
-                if close_price is None:
+            price = st["last_price"]; ts = st.get("price_timestamp", 0); now = time.time()
+            if price is None or ts is None or (now - ts) > PRICE_STALENESS_SEC: continue
+
+            # Circuit breaker
+            if st["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES:
+                if now < st["circuit_breaker_until"]: continue
+                st["consecutive_failures"] = 0; logging.info(f"{sym} Circuit breaker reset")
+
+            # Activation: allow bounce signal to start the bot (bounce-only mode)
+            if not st["bot_active"] and not st["manual_override"]:
+                b = bounce_signal(st)
+                if b in ("LONG","SHORT"):
+                    st["bot_active"] = True
+                    logging.info(f"{sym} BOT ACTIVATED")
+                else:
                     continue
 
-                # first boundary after start: initialize refs and ensure baseline 100/100
-                if st["prev_close"] is None:
-                    st["prev_close"] = close_price
-                    st["bar_open"]   = close_price
-                    st["bar_start"]  = int(time.time() // BAR_SECONDS) * BAR_SECONDS
-                    logging.info(f"{sym} init prev_close/bar_open={close_price} — ensuring baseline")
-                    await ensure_baseline(cli, sym)
+            # Update trailing extremes while holding (for callback exits)
+            if st["current_signal"] == "LONG":
+                st["trail_peak"] = price if st["trail_peak"] is None else max(st["trail_peak"], price); st["trail_trough"] = None
+            elif st["current_signal"] == "SHORT":
+                st["trail_trough"] = price if st["trail_trough"] is None else min(st["trail_trough"], price); st["trail_peak"] = None
+            else:
+                st["trail_peak"] = None; st["trail_trough"] = None
+
+            # Decide target (bounce-only)
+            target, source = get_target_signal(st)
+            if target is None: continue
+            current = st["current_signal"]
+
+            # Anti-churn: only allow exit/flip after hold + callback retrace
+            if target != current and current in ("LONG","SHORT") and st.get("last_position_entry_ts",0) > 0:
+                if now - st["last_position_entry_ts"] < MIN_HOLD_SEC:
+                    continue
+                if not _callback_retrace_hit(st, price, current):
                     continue
 
-                prev = st["prev_close"]
-                up   = close_price > prev
-                down = close_price < prev
+            # Apply signal change / confirmation / cooldown
+            if target != current:
+                st["current_signal"] = target
+                st["signal_since"] = now
+                st["active_signal_source"] = source
+                logging.info(f"{sym} Signal change: {current} -> {target} (source={source})")
 
-                # Apply 10-ADA reduction on the indicated side (market), bounded by current size
-                if up or down:
-                    # compute fresh sizes to bound the reduction
-                    long_sz  = await get_position_size_fresh(cli, sym, "LONG")
-                    short_sz = await get_position_size_fresh(cli, sym, "SHORT")
-                    tol = _zero_tolerance(sym)
+            if st["signal_since"] is None: continue
+            if (now - st["signal_since"]) < SIGNAL_CONFIRM_SEC: continue
+            if now - st["last_trade_ts"] < TRADE_COOLDOWN_SEC: continue
 
-                    if up:
-                        reduce_amt = quantize_qty(sym, min(STEP_QTY, max(0.0, short_sz)))
-                        if reduce_amt > tol:
-                            await safe_order_execution(cli, exit_short(sym, reduce_amt), sym, "EXIT STEP SHORT")
-                    else:  # down
-                        reduce_amt = quantize_qty(sym, min(STEP_QTY, max(0.0, long_sz)))
-                        if reduce_amt > tol:
-                            await safe_order_execution(cli, exit_long(sym, reduce_amt), sym, "EXIT STEP LONG")
+            # --- Staggered Execution ---
+            symbol_delay = (hash(sym) % len(SYMBOLS)) * 0.5  # 0-2.5s stagger
+            await asyncio.sleep(symbol_delay)
 
-                    # after reduction, check zero-hit reset
-                    long_sz2  = await get_position_size_fresh(cli, sym, "LONG")
-                    short_sz2 = await get_position_size_fresh(cli, sym, "SHORT")
-                    if long_sz2 <= tol or short_sz2 <= tol:
-                        logging.warning(f"{sym} ZERO-HIT: L={long_sz2:.6f}, S={short_sz2:.6f} → RESET & REBUILD")
-                        await flatten_all_and_rebaseline(cli, sym)
+            try:
+                success = await set_target_position(cli, sym, target)
+                if success:
+                    st["last_trade_ts"] = now
+                    if target in ("LONG","SHORT"):
+                        st["last_position_entry_ts"] = now
+                        if target == "LONG": st["trail_peak"] = price; st["trail_trough"] = None
+                        else: st["trail_trough"] = price; st["trail_peak"] = None
+                    else:
+                        st["trail_peak"] = None; st["trail_trough"] = None
+            except Exception as e:
+                logging.error(f"{sym} Position update failed: {e}")
+                st["consecutive_failures"] += 1
 
-                # update references for next hour
-                st["prev_close"] = close_price
-                st["bar_open"]   = close_price
-                st["bar_start"]  = int(time.time() // BAR_SECONDS) * BAR_SECONDS
-                st["bars_in_cycle"] = (st["bars_in_cycle"] or 0) + 1
+# ========================= MONITORING ===========================
+async def websocket_health_monitor():
+    while True:
+        await asyncio.sleep(30.0)
+        now = time.time()
+        for sym in SYMBOLS:
+            st = state[sym]; hb = st["ws_last_heartbeat"]
+            if hb > 0 and (now - hb) > 60.0:
+                logging.error(f"{sym} WebSocket stale! {now - hb:.1f}s"); st["bot_active"] = False
 
 async def pnl_summary_loop(cli: AsyncClient):
     while True:
         total_upnl = 0.0
-        lines = []
         for sym in SYMBOLS:
-            snap = await get_positions_snapshot(cli, sym)
-            lp = state[sym]["last_price"]
-            L = snap["LONG"]; S = snap["SHORT"]
-            upnl_sym = (L["uPnL"] or 0.0) + (S["uPnL"] or 0.0)
-            total_upnl += upnl_sym
-            lines.append(
-                f"[SUMMARY15] {sym} "
-                f"uPnL: L={L['uPnL']:.2f} S={S['uPnL']:.2f} USDT | "
-                f"sizes: L={L['size']:.4f}@{L['entry']:.6f} "
-                f"S={S['size']:.4f}@{S['entry']:.6f} | "
-                f"last={lp if lp is not None else 'n/a'} | "
-                f"target={BASE_QTY_PER_SIDE} step={STEP_QTY}"
+            snap = await get_positions_snapshot(cli, sym); st = state[sym]
+            price = st["last_price"] or 0.0
+            L = snap["LONG"]; S = snap["SHORT"]; upnl_sym = (L["uPnL"] or 0.0) + (S["uPnL"] or 0.0); total_upnl += upnl_sym
+            ws_health = "OK" if (time.time() - st["ws_last_heartbeat"]) < 60.0 else "STALE"
+            circuit = f"CB:{st['consecutive_failures']}" if st["consecutive_failures"]>0 else "OK"
+            logging.info(
+                f"[SUMMARY] {sym} active={st['bot_active']} | price={price:.6f} | WS={ws_health} | "
+                f"source={st.get('active_signal_source','NONE')} signal={st.get('current_signal')} | risk={circuit} | "
+                f"LONG={L['size']:.1f}({L['uPnL']:.2f}) SHORT={S['size']:.1f}({S['uPnL']:.2f})"
             )
-        for line in lines:
-            logging.info(line)
-        logging.info(f"[SUMMARY15] TOTAL uPnL across {len(SYMBOLS)} syms: {total_upnl:.2f} USDT")
+        logging.info(f"[SUMMARY] TOTAL uPnL: {total_upnl:.2f} USDT")
         await asyncio.sleep(PNL_SUMMARY_SEC)
 
-# ========================= STARTUP =============================
+# ========================= MAIN ================================
 async def main():
     threading.Thread(target=start_ping, daemon=True).start()
-    if not (API_KEY and API_SECRET):
-        raise RuntimeError("Missing Binance API creds")
-
+    if not (API_KEY and API_SECRET): raise RuntimeError("Missing Binance API credentials")
     cli = await AsyncClient.create(API_KEY, API_SECRET)
     try:
         global DUAL_SIDE
         DUAL_SIDE = await get_dual_side(cli)
         if not DUAL_SIDE:
-            logging.error("This strategy REQUIRES Hedge (dual-side) Mode on Binance Futures.")
-            raise RuntimeError("Hedge Mode (dualSidePosition) is OFF. Enable it in Binance Futures settings.")
-        logging.info("Hedge Mode detected — long & short sides will be managed independently.")
-        # Set leverage per symbol
+            logging.error("Hedge Mode (dual-side) required!")
+            raise RuntimeError("Enable Hedge Mode in Binance Futures settings")
+        logging.info("Hedge Mode confirmed")
         for s in SYMBOLS:
-            try:
-                await call_binance(cli.futures_change_leverage, symbol=s, leverage=LEVERAGE)
-            except Exception as e:
-                logging.warning(f"{s} set leverage failed: {e}")
-
+            try: await call_binance(cli.futures_change_leverage, symbol=s, leverage=LEVERAGE)
+            except Exception as e: logging.warning(f"{s} leverage setting failed: {e}")
         await seed_symbol_filters(cli)
-
-        # Start price feed first so last_price populates
-        logging.info("Starting price feed...")
+        await seed_extremes_buffer(cli)
         feed_task = asyncio.create_task(price_feed_loop(cli))
-
-        # Give price feed time to establish
-        await asyncio.sleep(5.0)
-
-        # No FIFO adoption needed; strategy ensures baseline on first hour boundary
-
-        # Launch remaining tasks
-        driver_task = asyncio.create_task(hourly_driver(cli))
-        pnl_task    = asyncio.create_task(pnl_summary_loop(cli))
-
-        await asyncio.gather(feed_task, driver_task, pnl_task)
+        health_task = asyncio.create_task(websocket_health_monitor())
+        trading_task = asyncio.create_task(simplified_trading_loop(cli))
+        summary_task = asyncio.create_task(pnl_summary_loop(cli))
+        await asyncio.gather(feed_task, trading_task, summary_task, health_task)
     finally:
-        try:
-            await cli.close_connection()
-        except Exception:
-            pass
+        try: await cli.close_connection()
+        except Exception: pass
 
-# ========================= ENTRYPOINT ==========================
+# ========================= ENTRYPOINT ===========================
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s: %(message)s",
-        datefmt="%b %d %H:%M:%S"
-    )
-
-    # ---- PNL-only log filter: allow 15-min summaries + WARN/ERROR ----
-    class PNLOnlyFilter(logging.Filter):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%b %d %H:%M:%S")
+    class CleanLogFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
-            if "[SUMMARY15]" in msg:
-                return True
-            if record.levelno >= logging.WARNING:
-                if "executed - OrderID" in msg:
-                    return False
-                return True
+            if "[SUMMARY]" in msg: return True
+            if record.levelno >= logging.WARNING: return True
+            if any(x in msg for x in ["executed - OrderID", "Signal change", "BOT ACTIVATED", "Circuit breaker", "FILLED", "Bounce conflict resolved", "TRAIL"]): return True
             return False
-
-    logging.getLogger().addFilter(PNLOnlyFilter())
+    logging.getLogger().addFilter(CleanLogFilter())
+    logging.info("=== IMPROVED TRADING BOT (Bounce-Only Mode + Order Validation + Exchange Trailing 0.5%) ===")
+    logging.info(f"Position Size: {POSITION_SIZE_ADA} ADA | Leverage: {LEVERAGE}x")
+    logging.info(f"Bounce: distance-based priority, threshold={BOUNCE_THRESHOLD_PCT*100:.1f}% | Exit protection: callback={CALLBACK_RATE_PCT*100:.2f}%, min_hold={MIN_HOLD_SEC}s")
+    logging.info(f"Exchange trailing: {EXCHANGE_TRAIL_CALLBACK_RATE:.3f}% after each entry (TRAILING_STOP_MARKET)")
+    logging.info(f"Order validation: timeout={ORDER_FILL_TIMEOUT_SEC}s, attempts={MAX_FILL_CHECK_ATTEMPTS}")
     asyncio.run(main())
