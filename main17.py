@@ -70,8 +70,39 @@ BREAKOUT_WINDOWS_SEC   = [h * 3600 for h in BREAKOUT_WINDOWS_HOURS]
 
 # ---- Bounce (Donchian, now strict candle High/Low) ----
 BOUNCE_ENABLED       = True
-BOUNCE_THRESHOLD_PCT = float(os.getenv("BOUNCE_THRESHOLD_PCT", "0.7")) / 100.0  # 0.7%
+BOUNCE_THRESHOLD_PCT = float(os.getenv("BOUNCE_THRESHOLD_PCT", "0.7")) / 100.0  # default 0.7% (as fraction)
 BOUNCE_COOLDOWN_SEC  = float(os.getenv("BOUNCE_COOLDOWN_SEC", "10.0"))  # between separate bounces
+
+# Per-symbol percent overrides, e.g. "BTCUSDT:0.3,ETHUSDT:0.5"
+def _parse_pct_by_symbol_env(key: str) -> Dict[str, Decimal]:
+    out: Dict[str, Decimal] = {}
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return out
+    # Accept comma or semicolon separated
+    parts = [p for chunk in raw.split(";") for p in chunk.split(",")]
+    for part in parts:
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        sym, val = part.split(":", 1)
+        sym = sym.strip().upper()
+        try:
+            # value is in percent units, e.g., "0.3" => 0.3% => 0.003 fraction
+            frac = (Decimal(val.strip()) / Decimal("100"))
+            if frac >= 0:
+                out[sym] = frac
+        except Exception:
+            continue
+    return out
+
+BOUNCE_PCT_BY_SYMBOL: Dict[str, Decimal] = _parse_pct_by_symbol_env("BOUNCE_PCT_BY_SYMBOL")
+
+def _get_bounce_pct_for_symbol(sym: str) -> Decimal:
+    """Return the effective bounce percent (as fraction, e.g. 0.007) for a symbol."""
+    if sym in BOUNCE_PCT_BY_SYMBOL:
+        return BOUNCE_PCT_BY_SYMBOL[sym]
+    return Decimal(str(BOUNCE_THRESHOLD_PCT))
 
 # ---- Breakout/Momentum (Donchian breakout on strict High/Low) ----
 BREAKOUT_ENABLED      = True
@@ -357,11 +388,14 @@ async def seed_symbol_filters(cli: AsyncClient):
         logging.warning(f"seed_symbol_filters failed: {e}")
 
 # ========================= FIXED PRICE FEED (Compatible) ===========================
-def _parse_price_from_event(d: dict) -> Optional[float]:
+def _parse_price_from_event(d: dict) -> Optional[Decimal]:
     p_str = d.get("p") or d.get("c") or d.get("ap") or d.get("a")
-    if p_str is None: return None
-    try: return float(p_str)
-    except Exception: return None
+    if p_str is None: 
+        return None
+    try:
+        return Decimal(p_str)  # construct from string (no float!)
+    except Exception:
+        return None
 
 def _minute_bucket(ts: float) -> int:
     return int(ts // 60)  # minute-open epoch bucket
@@ -418,14 +452,18 @@ async def price_feed_loop(cli: AsyncClient):
                         if not sym or sym not in state:
                             continue
                         p = _parse_price_from_event(d)
-                        if p is None or p <= 0.0:
+                        if p is None or p <= 0:
                             continue
                         st = state[sym]
                         prev = st["last_price"]
-                        if prev is not None and abs(p / prev - 1.0) > PRICE_GLITCH_PCT:
-                            logging.warning(f"{sym} Price glitch filtered: {prev:.6f} -> {p:.6f}")
-                            continue
-                        # Update price/tick buffers
+
+                        # glitch filter in Decimal
+                        if prev is not None:
+                            if (p / prev - Decimal("1")).copy_abs() > Decimal(str(PRICE_GLITCH_PCT)):
+                                logging.warning(f"{sym} Price glitch filtered: {prev:.6f} -> {p:.6f}")
+                                continue
+
+                        # Update price/tick buffers (store Decimal price)
                         st["last_price"] = p
                         st["last_good_price"] = p
                         st["price_timestamp"] = now
@@ -488,8 +526,8 @@ async def seed_extremes_buffer(cli: AsyncClient):
             hbuf = state[s]["kline_hl_buffer"]
             for k in kl:
                 ts_open = float(k[0]) / 1000.0
-                hi = float(k[2]); lo = float(k[3])
-                c  = float(k[4])
+                hi = Decimal(str(k[2])); lo = Decimal(str(k[3]))
+                c  = Decimal(str(k[4]))
                 pbuf.append((ts_open, c))
                 hbuf.append((int(ts_open // 60), hi, lo))
             if hbuf: logging.info(f"{s} seeded: {len(hbuf)} x 1m Hi/Lo candles (strict)")
@@ -497,7 +535,7 @@ async def seed_extremes_buffer(cli: AsyncClient):
             logging.warning(f"{s} extremes buffer seed failed: {e}")
 
 # ========================= DUAL STRATEGY SIGNALS ============================
-def _rolling_candle_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[int]]:
+def _rolling_candle_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[Decimal], Optional[int], Optional[Decimal], Optional[int]]:
     """
     Strict Donchian over 1-minute candles (High/Low).
     Scans kline_hl_buffer (historical finalized minutes) plus the current live minute.
@@ -531,14 +569,64 @@ def _rolling_candle_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optiona
     return low, low_ts, high, high_ts
 
 # Legacy name kept for compatibility (now strict candle-based)
-def _rolling_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[int]]:
+def _rolling_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[Decimal], Optional[int], Optional[Decimal], Optional[int]]:
     return _rolling_candle_extremes_with_ts(st, window_sec)
+
+# --- Adaptive / safe thresholds to avoid inversion on narrow channels ---
+ADAPTIVE_GAP_MAX_FRAC_OF_RANGE = 0.49   # thresholds stay inside the band (low+gap, high-gap)
+MIN_SEPARATION_PPM             = 5e-6   # ~5 ppm of mid-price as last-resort tiny separation
+
+def _state_to_symbol(st: dict) -> Optional[str]:
+    for sym, sref in state.items():
+        if sref is st:
+            return sym
+    return None
+
+def _compute_adaptive_bounce_thresholds(low_val: Optional[Decimal],
+                                        high_val: Optional[Decimal],
+                                        pct_frac: Decimal) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    """
+    Returns (low_threshold, high_threshold, mode)
+    mode ∈ {'raw','adaptive','clamped','invalid'}.
+    Keeps thresholds ordered (low_thr < high_thr); if impossible, returns (None, None, 'invalid').
+
+    pct_frac is a fraction (e.g., Decimal('0.007') for 0.7%).
+    """
+    if low_val is None or high_val is None:
+        return None, None, "invalid"
+    if high_val <= low_val:
+        return None, None, "invalid"
+
+    channel = high_val - low_val
+    mid     = (high_val + low_val) / Decimal("2")
+
+    # 1) Raw (backward compatible per-symbol)
+    raw_low_thr  = low_val  * (Decimal("1") + pct_frac)
+    raw_high_thr = high_val * (Decimal("1") - pct_frac)
+    if raw_low_thr < raw_high_thr:
+        return raw_low_thr, raw_high_thr, "raw"
+
+    # 2) Adaptive gap based on band width (stay inside the band)
+    gap_abs = min(pct_frac * mid, Decimal(str(ADAPTIVE_GAP_MAX_FRAC_OF_RANGE)) * channel)
+    low_thr  = low_val  + gap_abs
+    high_thr = high_val - gap_abs
+    if low_thr < high_thr:
+        return low_thr, high_thr, "adaptive"
+
+    # 3) Last resort: tiny separation around the mid
+    sep = max(Decimal(str(MIN_SEPARATION_PPM)) * mid, Decimal("0"))
+    low_thr  = mid - sep
+    high_thr = mid + sep
+    if low_thr < high_thr:
+        return low_thr, high_thr, "clamped"
+
+    return None, None, "invalid"
 
 # ========================= BOUNCE STRATEGY (strict Donchian Hi/Lo) ===================
 def update_bounce_thresholds(st: dict):
     """
-    Update bounce thresholds from strict Donchian over the (largest) configured bounce window.
-    (Backward compatible: single threshold pair stored, using the widest window.)
+    Update bounce thresholds from strict Donchian over the (largest) configured bounce window,
+    using the symbol's effective percent and preventing inversion on narrow ranges.
     """
     if not BOUNCE_WINDOWS_SEC:
         wsec = 20 * 3600
@@ -547,13 +635,24 @@ def update_bounce_thresholds(st: dict):
     low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
     bs = st["bounce_state"]
 
-    new_low_threshold  = (float(low_w)  * (1.0 + BOUNCE_THRESHOLD_PCT)) if low_w  is not None else None
-    new_high_threshold = (float(high_w) * (1.0 - BOUNCE_THRESHOLD_PCT)) if high_w is not None else None
+    sym = _state_to_symbol(st) or ""
+    pct_frac = _get_bounce_pct_for_symbol(sym)
 
-    def moved_materially(old, new) -> bool:
+    # Compute safe thresholds
+    new_low_threshold, new_high_threshold, _mode = _compute_adaptive_bounce_thresholds(low_w, high_w, pct_frac)
+
+    # If invalid (missing/flat band), clear breaches and keep previous thresholds
+    if new_low_threshold is None or new_high_threshold is None:
+        bs["breached_low"] = False
+        bs["breached_high"] = False
+        bs["low_breach_price"] = None
+        bs["high_breach_price"] = None
+        return
+
+    def moved_materially(old: Optional[Decimal], new: Optional[Decimal]) -> bool:
         if old is None or new is None: return True
         if old == 0: return True
-        return abs(new - old) / abs(old) > 0.001  # >0.1% move
+        return ((new - old).copy_abs() / old.copy_abs()) > Decimal("0.001")  # >0.1% move
 
     if moved_materially(bs["low_threshold"], new_low_threshold):
         bs["breached_low"] = False
@@ -568,7 +667,8 @@ def update_bounce_thresholds(st: dict):
 def true_bounce_signal(st: dict) -> Optional[str]:
     """
     SIMPLIFIED bounce logic (unchanged): breach → cross back through threshold → signal.
-    Thresholds now come from strict candle Hi/Lo Donchian (widest configured window).
+    Thresholds now come from strict candle Hi/Lo Donchian (widest configured window),
+    with per-symbol percent and adaptive anti-inversion.
     """
     if not BOUNCE_ENABLED:
         return None
@@ -606,7 +706,9 @@ def true_bounce_signal(st: dict) -> Optional[str]:
             bs["high_breach_price"] = max(bs["high_breach_price"] or price, price)
 
     # Step 2: cross-back confirmation
-    min_depth_ratio = BOUNCE_THRESHOLD_PCT * 0.01
+    sym = _state_to_symbol(st) or ""
+    pct_frac = _get_bounce_pct_for_symbol(sym)  # fraction, e.g., 0.007
+    min_depth_ratio = pct_frac * Decimal("0.01")  # e.g., 1% of pct
 
     if (bs["breached_low"] and low_threshold is not None and 
         bs["low_breach_price"] is not None and price >= low_threshold):
@@ -654,16 +756,12 @@ def breakout_signal(st: dict) -> Optional[str]:
     windows = BREAKOUT_WINDOWS_SEC or [20 * 3600]
 
     fired = None
-    high_any = None
-    low_any  = None
 
     # Compute and test each window; fire if ANY window is broken
     for wsec in windows:
         low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
         if low_w is None or high_w is None:
             continue
-        high_any = high_w if high_any is None else max(high_any, high_w)
-        low_any  = low_w  if low_any  is None else min(low_any,  low_w)
 
         if price > high_w:
             fired = "LONG"; break
@@ -673,11 +771,7 @@ def breakout_signal(st: dict) -> Optional[str]:
     # Periodic debug (every 5 min) using the widest window for display
     if now - bos.get("last_debug_log_ts", 0.0) >= 300.0:
         # find symbol name
-        symbol = None
-        for sym, symbol_state in state.items():
-            if symbol_state is st:
-                symbol = sym
-                break
+        symbol = _state_to_symbol(st)
         if symbol:
             # show widest window ref for clarity
             wdisp = max(windows)
@@ -911,12 +1005,19 @@ async def pnl_summary_loop(cli: AsyncClient):
 
 # >>> Diagnostics (entrypoint snapshot + 30-minute reasons-why-no-order)
 def _compute_threshold_preview(st: dict) -> Tuple[Optional[float], Optional[float]]:
-    """Preview thresholds from strict Donchian over the widest bounce window (no side effects)."""
+    """Preview thresholds from strict Donchian over the widest bounce window (no side effects),
+       using the symbol's effective percent and adaptive safety."""
     wsec = max(BOUNCE_WINDOWS_SEC) if BOUNCE_WINDOWS_SEC else 20*3600
     low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
-    low_thr  = (float(low_w)  * (1.0 + BOUNCE_THRESHOLD_PCT)) if low_w  is not None else None
-    high_thr = (float(high_w) * (1.0 - BOUNCE_THRESHOLD_PCT)) if high_w is not None else None
-    return low_thr, high_thr
+
+    sym = _state_to_symbol(st) or ""
+    pct_frac = _get_bounce_pct_for_symbol(sym)
+
+    low_thr, high_thr, _ = _compute_adaptive_bounce_thresholds(low_w, high_w, pct_frac)
+    # Cast to float for pretty logging (None stays None)
+    low_out  = float(low_thr)  if low_thr  is not None else None
+    high_out = float(high_thr) if high_thr is not None else None
+    return low_out, high_out
 
 def _fmt(o):
     if o is None: return "n/a"
@@ -935,8 +1036,10 @@ async def entrypoint_diagnostic_once():
         bos = st["breakout_state"]
         cool_left = max(0.0, (st.get("last_bounce_ts", 0.0) + BOUNCE_COOLDOWN_SEC) - time.time())
         breakout_cool_left = max(0.0, (bos["last_breakout_ts"] + BREAKOUT_COOLDOWN_SEC) - time.time())
+        eff_pct = _get_bounce_pct_for_symbol(sym) * Decimal("100")
         logging.info(
-            f"[DIAG-ENTRY] {sym} price={_fmt(price)} | bounce_thr_low={_fmt(low_thr)} bounce_thr_high={_fmt(high_thr)} | "
+            f"[DIAG-ENTRY] {sym} price={_fmt(price)} | bounce_pct={eff_pct:.4f}% | "
+            f"bounce_thr_low={_fmt(low_thr)} bounce_thr_high={_fmt(high_thr)} | "
             f"breakout_last_20h_low={_fmt(bos['last_20h_low'])} breakout_last_20h_high={_fmt(bos['last_20h_high'])} | "
             f"bounce_breached_low={bs['breached_low']} bounce_breached_high={bs['breached_high']} | "
             f"bounce_cooldown={cool_left:.1f}s breakout_cooldown={breakout_cool_left:.1f}s"
@@ -976,14 +1079,16 @@ async def diagnostic_summary_loop():
                 if high_thr is not None and price > high_thr and not bs["breached_high"]:
                     reason.append("await breach above bounce_high_thr")
                 if bs["breached_low"] and (low_thr is not None) and price < low_thr:
-                    depth = (low_thr - (bs["low_breach_price"] or low_thr)) / low_thr if low_thr else 0.0
+                    depth = (Decimal(str(low_thr)) - Decimal(str(bs["low_breach_price"] or low_thr))) / Decimal(str(low_thr)) if low_thr else Decimal("0")
                     reason.append(f"bounce_breached_low depth={depth*100:.2f}% waiting cross↑")
                 if bs["breached_high"] and (high_thr is not None) and price > high_thr:
-                    depth = ((bs["high_breach_price"] or high_thr) - high_thr) / high_thr if high_thr else 0.0
+                    depth = (Decimal(str(bs["high_breach_price"] or high_thr)) - Decimal(str(high_thr))) / Decimal(str(high_thr)) if high_thr else Decimal("0")
                     reason.append(f"bounce_breached_high depth={depth*100:.2f}% waiting cross↓")
             reason_str = "; ".join(reason) if reason else "ready→pending confirm/cooldown"
+            eff_pct = _get_bounce_pct_for_symbol(sym) * Decimal("100")
             logging.info(
-                f"[DIAG] {sym} price={_fmt(price)} | BREAKOUT Donchian({int(wsec/3600)}h)_low={_fmt(low_20h)} _high={_fmt(high_20h)} | "
+                f"[DIAG] {sym} price={_fmt(price)} | bounce_pct={eff_pct:.4f}% | "
+                f"BREAKOUT Donchian({int(wsec/3600)}h)_low={_fmt(low_20h)} _high={_fmt(high_20h)} | "
                 f"BOUNCE thr_low={_fmt(low_thr)} thr_high={_fmt(high_thr)} | "
                 f"bounce_breached_low={bs['breached_low']} bounce_breached_high={bs['breached_high']} | "
                 f"why_not_order= {reason_str}"
@@ -1049,7 +1154,9 @@ if __name__ == "__main__":
 
     logging.info("=== DUAL STRATEGY TRADING BOT (Breakout + Bounce with Priority System | STRICT Donchian Hi/Lo + Adaptive Windows) ===")
     logging.info(f"Symbols & target sizes: {SYMBOLS}")
-    logging.info(f"Leverage: {LEVERAGE}x | Bounce threshold={BOUNCE_THRESHOLD_PCT*100:.1f}% | Min hold={MIN_HOLD_SEC}s")
+    # Show default and any per-symbol overrides
+    _pct_overrides_readable = {k: f"{(v*Decimal('100')):.4f}%" for k, v in BOUNCE_PCT_BY_SYMBOL.items()}
+    logging.info(f"Leverage: {LEVERAGE}x | Bounce default={BOUNCE_THRESHOLD_PCT*100:.6f}% | Overrides={_pct_overrides_readable} | Min hold={MIN_HOLD_SEC}s")
     logging.info(f"STRATEGY PRIORITY: 1st=BREAKOUT (strict Donchian), 2nd=BOUNCE (strict Donchian thresholds)")
     logging.info(f"Exchange trailing: {EXCHANGE_TRAIL_CALLBACK_RATE:.3f}% (internal callback disabled)")
     logging.info(f"Bounce windows (h): {BOUNCE_WINDOWS_HOURS} | Breakout windows (h): {BREAKOUT_WINDOWS_HOURS}")
