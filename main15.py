@@ -6,7 +6,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from binance import AsyncClient
 from collections import deque
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 getcontext().prec = 28
 
@@ -22,9 +22,9 @@ SIGNAL_CONFIRM_SEC  = float(os.getenv("SIGNAL_CONFIRM_SEC", "3.0"))     # confir
 TRADE_COOLDOWN_SEC  = float(os.getenv("TRADE_COOLDOWN_SEC", "10.0"))    # gap between trades
 PRICE_GLITCH_PCT    = float(os.getenv("PRICE_GLITCH_PCT", "0.03"))      # drop bad ticks
 
-# Exit/flip protection (anti-churn)
-CALLBACK_RATE_PCT   = float(os.getenv("CALLBACK_RATE_PCT", "0.005"))    # 0.5% retrace gate
-MIN_HOLD_SEC        = float(os.getenv("MIN_HOLD_SEC", "30.0"))          # hold before exit/flip
+# Exit/flip protection (anti-churn) - OPTION A: DISABLED
+CALLBACK_RATE_PCT   = 0.0  # DISABLED - using exchange trailing only
+MIN_HOLD_SEC        = float(os.getenv("MIN_HOLD_SEC", "10.0"))          # hold before exit/flip
 
 # ---- PRICE SOURCE ----
 PRICE_SOURCE = os.getenv("PRICE_SOURCE", "mark").lower()
@@ -41,18 +41,45 @@ SYMBOLS = {
     "XRPUSDT": 10.0,
     "SOLUSDT": 0.1,
     "ADAUSDT": 10.0,
+    "DOGEUSDT": 40.0,
+    "TRXUSDT": 20.0,
 }
 
-# ---- Bounce (24h latest extreme) ----
-BOUNCE_ENABLED       = True
-BOUNCE_WINDOWS_SEC   = [24*3600]  # 24h only as requested
-BOUNCE_THRESHOLD_PCT = float(os.getenv("BOUNCE_THRESHOLD_PCT", "1.0")) / 100.0  # 1.0%
-BOUNCE_COOLDOWN_SEC  = float(os.getenv("BOUNCE_COOLDOWN_SEC", "30.0"))  # between separate bounces
+# ---- Adaptive window helpers (env-configurable; defaults keep 20h behavior) ----
+def _parse_hours_env(key: str, default_csv: str) -> List[int]:
+    raw = os.getenv(key, default_csv).strip()
+    hours = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part: continue
+        try:
+            h = int(float(part))
+            if h > 0: hours.append(h)
+        except Exception:
+            continue
+    # dedupe & sort
+    return sorted(set(hours))
 
-# ---- Exchange-level trailing stop right after entry (NEW) ----
+# Bounce windows (hours) — default: 20h only (backward compatible)
+BOUNCE_WINDOWS_HOURS = _parse_hours_env("BOUNCE_WINDOWS_HOURS", "20")
+BOUNCE_WINDOWS_SEC   = [h * 3600 for h in BOUNCE_WINDOWS_HOURS]
+
+# Breakout windows (hours) — default: 20h only (backward compatible)
+BREAKOUT_WINDOWS_HOURS = _parse_hours_env("BREAKOUT_WINDOWS_HOURS", "20")
+BREAKOUT_WINDOWS_SEC   = [h * 3600 for h in BREAKOUT_WINDOWS_HOURS]
+
+# ---- Bounce (Donchian, now strict candle High/Low) ----
+BOUNCE_ENABLED       = True
+BOUNCE_THRESHOLD_PCT = float(os.getenv("BOUNCE_THRESHOLD_PCT", "0.7")) / 100.0  # 0.7%
+BOUNCE_COOLDOWN_SEC  = float(os.getenv("BOUNCE_COOLDOWN_SEC", "10.0"))  # between separate bounces
+
+# ---- Breakout/Momentum (Donchian breakout on strict High/Low) ----
+BREAKOUT_ENABLED      = True
+BREAKOUT_COOLDOWN_SEC = float(os.getenv("BREAKOUT_COOLDOWN_SEC", "10.0"))  # between separate breakouts
+
+# ---- Exchange-level trailing stop right after entry ----
 EXCHANGE_TRAIL_ENABLED       = True
-# 0.5 here means 0.5% for Binance's callbackRate parameter
-EXCHANGE_TRAIL_CALLBACK_RATE = float(os.getenv("EXCHANGE_TRAIL_CALLBACK_RATE", "0.5"))
+EXCHANGE_TRAIL_CALLBACK_RATE = float(os.getenv("EXCHANGE_TRAIL_CALLBACK_RATE", "0.5"))  # 0.5%
 
 # Risk / misc
 MAX_CONSECUTIVE_FAILURES = 3
@@ -65,6 +92,9 @@ RATE_LIMIT_MAX_SLEEP  = float(os.getenv("RATE_LIMIT_MAX_SLEEP", "60.0"))
 # Order validation parameters
 ORDER_FILL_TIMEOUT_SEC = 10.0
 MAX_FILL_CHECK_ATTEMPTS = 5
+
+# >>> Diagnostic cadence (30 minutes)
+DIAG_SUMMARY_SEC = 1800.0  # 30 minutes
 
 # ========================= UTILITY CLASSES =========================
 class Ping(BaseHTTPRequestHandler):
@@ -219,26 +249,81 @@ async def verify_position_after_trade(cli: AsyncClient, symbol: str, expected_lo
         logging.error(f"{symbol} Position verification failed: {e}")
         return False
 
+# ========================= SAFE ORDER EXECUTION =================
+async def safe_order_execution(cli: AsyncClient, order_params: dict, symbol: str, action: str) -> bool:
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            try:
+                res = await call_binance(cli.futures_create_order, **order_params)
+            except Exception as e:
+                msg = str(e)
+                if "-1106" in msg and "reduceonly" in msg.lower() and ("reduceOnly" in order_params):
+                    params_wo = {k: v for k, v in order_params.items() if k != "reduceOnly"}
+                    logging.warning(f"{symbol} {action}: retrying without reduceOnly")
+                    res = await call_binance(cli.futures_create_order, **params_wo)
+                else:
+                    raise
+            oid = res.get("orderId")
+            logging.info(f"{symbol} {action} submitted - OrderID: {oid}")
+            fill_result = await wait_for_order_fill(cli, symbol, str(oid))
+            if fill_result["success"]:
+                filled_qty = fill_result["filled_qty"]
+                avg_price = fill_result["avg_price"]
+                logging.info(f"{symbol} {action} FILLED - Qty: {filled_qty:.3f} @ {avg_price:.6f}")
+                invalidate_position_cache(symbol)
+                return True
+            else:
+                logging.error(f"{symbol} {action} FAILED - {fill_result.get('error', 'Unknown error')}")
+                return False
+        except Exception as e:
+            if attempt < max_retries:
+                logging.warning(f"{symbol} {action} attempt {attempt + 1} failed: {e}, retrying...")
+                await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))
+                continue
+            logging.error(f"{symbol} {action} failed after {max_retries + 1} attempts: {e}")
+            return False
+
 # ========================= STATE ===============================
 state: Dict[str, Dict[str, Any]] = {
     s: {
         "last_price": None, "last_good_price": None, "price_timestamp": None,
-        "price_buffer": deque(maxlen=5000), "ext_price_buffer": deque(maxlen=100000),
+        "price_buffer": deque(maxlen=5000),
+        "ext_price_buffer": deque(maxlen=100000),  # (ts, last price) — kept for compatibility/logs
+        # NEW: strict candle Hi/Lo buffer (1-min bars), plus rolling live minute Hi/Lo
+        "kline_hl_buffer": deque(maxlen=2000),     # (ts_open_minute, high, low)
+        "curr_minute_ts": None,
+        "curr_minute_high": None,
+        "curr_minute_low": None,
+
         "ws_last_heartbeat": 0.0,
-        "bot_active": False, "manual_override": False,
+        "bot_active": True, "manual_override": False,
         "current_signal": None, "signal_since": None, "last_trade_ts": 0.0, "active_signal_source": None,
-        # trailing extremes for callback exit/flip
         "trail_peak": None, "trail_trough": None,
-        # bounce state
         "last_bounce_ts": 0.0,
-        # risk
         "consecutive_failures": 0, "circuit_breaker_until": 0.0, "position_state": "IDLE",
-        # misc
         "order_lock": asyncio.Lock(), "last_position_entry_ts": 0.0,
+        "pending_signal": None,
+        # TRUE BOUNCE STATE TRACKING
+        "bounce_state": {
+            "breached_low": False,
+            "breached_high": False,
+            "low_breach_price": None,
+            "high_breach_price": None,
+            "low_threshold": None,
+            "high_threshold": None,
+        },
+        # BREAKOUT STATE TRACKING
+        "breakout_state": {
+            "last_breakout_ts": 0.0,
+            "last_20h_high": None,
+            "last_20h_low": None,
+            "last_debug_log_ts": 0.0,
+        }
     } for s in SYMBOLS
 }
 
-# Track trailing stop order ids per side (NEW)
+# Track trailing stop order ids per side
 trailing_orders: Dict[str, Dict[str, Optional[int]]] = {
     s: {"LONG": None, "SHORT": None} for s in SYMBOLS
 }
@@ -271,68 +356,278 @@ async def seed_symbol_filters(cli: AsyncClient):
     except Exception as e:
         logging.warning(f"seed_symbol_filters failed: {e}")
 
-# ========================= PRICE FEED ===========================
-def _parse_price_from_event(d: dict) -> Optional[float]:
+# ========================= FIXED PRICE FEED (Compatible) ===========================
+def _parse_price_from_event(d: dict) -> Optional[Decimal]:
     p_str = d.get("p") or d.get("c") or d.get("ap") or d.get("a")
-    if p_str is None: return None
-    try: return float(p_str)
-    except Exception: return None
+    if p_str is None: 
+        return None
+    try:
+        return Decimal(p_str)  # construct from string (no float!)
+    except Exception:
+        return None
+
+def _minute_bucket(ts: float) -> int:
+    return int(ts // 60)  # minute-open epoch bucket
+
+def _append_finalized_minute(st: dict):
+    """When a minute rolls over, push the finished minute's high/low into the kline_hl_buffer."""
+    mts = st["curr_minute_ts"]
+    hi  = st["curr_minute_high"]
+    lo  = st["curr_minute_low"]
+    if mts is not None and hi is not None and lo is not None:
+        st["kline_hl_buffer"].append((mts, hi, lo))
+    # reset for the next minute
+    st["curr_minute_ts"] = None
+    st["curr_minute_high"] = None
+    st["curr_minute_low"] = None
 
 async def price_feed_loop(cli: AsyncClient):
     streams = [_stream_name(s) for s in SYMBOLS]
     url = f"wss://{_ws_host()}/stream?streams={'/'.join(streams)}"
     reconnect_delay = 1.0; max_reconnect_delay = 60.0
+    connection_attempts = 0
+    
     while True:
+        connection_attempts += 1
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5, max_queue=1000) as ws:
+            logging.info(f"WebSocket connecting (attempt {connection_attempts}) to: {url}")
+            async with websockets.connect(
+                url, 
+                ping_interval=20, 
+                ping_timeout=10, 
+                close_timeout=5, 
+                max_queue=2000
+            ) as ws:
                 reconnect_delay = 1.0
-                logging.info("WebSocket price feed connected")
+                connection_attempts = 0
+                logging.info("WebSocket price feed connected successfully")
+                message_count = 0
+                
                 async for raw in ws:
-                    now = time.time()
-                    for sym in SYMBOLS: state[sym]["ws_last_heartbeat"] = now
-                    m = json.loads(raw); d = m.get("data", {}); sym = d.get("s")
-                    if not sym or sym not in state: continue
-                    p = _parse_price_from_event(d)
-                    if p is None or p <= 0.0: continue
-                    st = state[sym]; prev = st["last_price"]
-                    if prev is not None and abs(p / prev - 1.0) > PRICE_GLITCH_PCT:
-                        logging.warning(f"{sym} Price glitch filtered: {prev:.6f} -> {p:.6f}"); continue
-                    st["last_price"] = p; st["last_good_price"] = p; st["price_timestamp"] = now
-                    st["price_buffer"].append((now, p)); st["ext_price_buffer"].append((now, p))
+                    try:
+                        now = time.time()
+                        message_count += 1
+                        for sym in SYMBOLS: 
+                            state[sym]["ws_last_heartbeat"] = now
+                        try:
+                            m = json.loads(raw)
+                        except json.JSONDecodeError as e:
+                            logging.warning(f"WebSocket JSON decode error: {e}")
+                            continue
+                        d = m.get("data", {})
+                        if not d:
+                            continue
+                        sym = d.get("s")
+                        if not sym or sym not in state:
+                            continue
+                        p = _parse_price_from_event(d)
+                        if p is None or p <= 0:
+                            continue
+                        st = state[sym]
+                        prev = st["last_price"]
+
+                        # glitch filter in Decimal
+                        if prev is not None:
+                            if (p / prev - Decimal("1")).copy_abs() > Decimal(str(PRICE_GLITCH_PCT)):
+                                logging.warning(f"{sym} Price glitch filtered: {prev:.6f} -> {p:.6f}")
+                                continue
+
+                        # Update price/tick buffers (store Decimal price)
+                        st["last_price"] = p
+                        st["last_good_price"] = p
+                        st["price_timestamp"] = now
+                        st["price_buffer"].append((now, p))
+                        st["ext_price_buffer"].append((now, p))  # still kept for logs/compat
+
+                        # ---- NEW: maintain a rolling live 1-min high/low (strict candle Hi/Lo) ----
+                        curr_bucket = _minute_bucket(now)
+                        if st["curr_minute_ts"] is None:
+                            st["curr_minute_ts"] = curr_bucket
+                            st["curr_minute_high"] = p
+                            st["curr_minute_low"]  = p
+                        elif curr_bucket != st["curr_minute_ts"]:
+                            # minute rolled — finalize previous minute into kline buffer
+                            _append_finalized_minute(st)
+                            st["curr_minute_ts"]   = curr_bucket
+                            st["curr_minute_high"] = p
+                            st["curr_minute_low"]  = p
+                        else:
+                            # same minute → update hi/lo
+                            st["curr_minute_high"] = p if st["curr_minute_high"] is None else max(st["curr_minute_high"], p)
+                            st["curr_minute_low"]  = p if st["curr_minute_low"]  is None else min(st["curr_minute_low"],  p)
+
+                        if prev is None:
+                            logging.info(f"First price received for {sym}: {p:.6f}")
+                        if message_count % 500 == 0:
+                            active_symbols = sum(1 for s in SYMBOLS if state[s]["last_price"] is not None)
+                            logging.info(f"WebSocket health: {message_count} messages, {active_symbols}/{len(SYMBOLS)} symbols active")
+                    except Exception as msg_error:
+                        logging.warning(f"WebSocket message processing error: {msg_error}")
+                        continue
+                        
+        except websockets.exceptions.ConnectionClosed as e:
+            logging.warning(f"WebSocket connection closed: {e}. Reconnecting in {reconnect_delay:.1f}s...")
+        except websockets.exceptions.WebSocketException as e:
+            logging.warning(f"WebSocket error: {e}. Reconnecting in {reconnect_delay:.1f}s...")
+        except OSError as e:
+            logging.warning(f"Network error: {e}. Reconnecting in {reconnect_delay:.1f}s...")
         except Exception as e:
-            logging.warning(f"WebSocket dropped: {e}. Reconnecting in {reconnect_delay:.1f}s...")
-            await asyncio.sleep(reconnect_delay + random.uniform(0.0, 0.8))
-            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+            logging.error(f"Unexpected WebSocket error: {e}. Reconnecting in {reconnect_delay:.1f}s...")
+        
+        # On reconnect, finalize any in-progress minute to avoid gaps
+        for sym in SYMBOLS:
+            st = state[sym]
+            _append_finalized_minute(st)
+            if st.get("last_price") is not None:
+                logging.info(f"Resetting stale price data for {sym}")
+                st["last_price"] = None
+                st["price_timestamp"] = None
+        await asyncio.sleep(reconnect_delay + random.uniform(0.0, 1.0))
+        reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
 # ========================= INITIALIZATION ===================
 async def seed_extremes_buffer(cli: AsyncClient):
+    """Seed both: (1) price close buffer (compat) and (2) strict 1m candle high/low buffer."""
     for s in SYMBOLS:
         try:
             kl = await call_binance(cli.futures_klines, symbol=s, interval="1m", limit=1440)
-            buf = state[s]["ext_price_buffer"]
+            pbuf = state[s]["ext_price_buffer"]
+            hbuf = state[s]["kline_hl_buffer"]
             for k in kl:
-                ts = float(k[0]) / 1000.0; c = float(k[4])
-                buf.append((ts, c))
-            if buf: logging.info(f"{s} extremes buffer seeded with {len(buf)} points")
+                ts_open = float(k[0]) / 1000.0
+                hi = Decimal(str(k[2])); lo = Decimal(str(k[3]))
+                c  = Decimal(str(k[4]))
+                pbuf.append((ts_open, c))
+                hbuf.append((int(ts_open // 60), hi, lo))
+            if hbuf: logging.info(f"{s} seeded: {len(hbuf)} x 1m Hi/Lo candles (strict)")
         except Exception as e:
             logging.warning(f"{s} extremes buffer seed failed: {e}")
 
-# ========================= BOUNCE-ONLY SIGNALS ============================
-def _rolling_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Return (low, low_ts, high, high_ts) in last window_sec; ties choose latest ts."""
-    now = time.time(); buf = st["ext_price_buffer"]
-    if not buf: return None, None, None, None
-    low = high = None; low_ts = high_ts = None
-    for ts, p in reversed(buf):
-        if now - ts > window_sec: break
-        if low is None or p < low or (p == low and (low_ts is None or ts > low_ts)): low, low_ts = p, ts
-        if high is None or p > high or (p == high and (high_ts is None or ts > high_ts)): high, high_ts = p, ts
+# ========================= DUAL STRATEGY SIGNALS ============================
+def _rolling_candle_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[Decimal], Optional[int], Optional[Decimal], Optional[int]]:
+    """
+    Strict Donchian over 1-minute candles (High/Low).
+    Scans kline_hl_buffer (historical finalized minutes) plus the current live minute.
+    Returns: low, low_bucket_ts, high, high_bucket_ts (bucket is minute epoch int)
+    """
+    now = time.time()
+    start_bucket = _minute_bucket(now - window_sec)
+    hbuf: deque = st["kline_hl_buffer"]
+
+    low = None; high = None
+    low_ts = None; high_ts = None
+
+    # historical finalized minutes
+    for mts, hi, lo in reversed(hbuf):
+        if mts < start_bucket: break
+        if low is None or lo < low or (lo == low and (low_ts is None or mts > low_ts)):
+            low, low_ts = lo, mts
+        if high is None or hi > high or (hi == high and (high_ts is None or mts > high_ts)):
+            high, high_ts = hi, mts
+
+    # include current (still forming) minute
+    if st["curr_minute_ts"] is not None and st["curr_minute_ts"] >= start_bucket:
+        c_hi = st["curr_minute_high"]
+        c_lo = st["curr_minute_low"]
+        mts = st["curr_minute_ts"]
+        if c_lo is not None and (low is None or c_lo < low or (c_lo == low and (low_ts is None or mts > low_ts))):
+            low, low_ts = c_lo, mts
+        if c_hi is not None and (high is None or c_hi > high or (c_hi == high and (high_ts is None or mts > high_ts))):
+            high, high_ts = c_hi, mts
+
     return low, low_ts, high, high_ts
 
-def bounce_signal(st: dict) -> Optional[str]:
+# Legacy name kept for compatibility (now strict candle-based)
+def _rolling_extremes_with_ts(st: dict, window_sec: int) -> Tuple[Optional[Decimal], Optional[int], Optional[Decimal], Optional[int]]:
+    return _rolling_candle_extremes_with_ts(st, window_sec)
+
+# --- Adaptive / safe thresholds to avoid inversion on narrow channels ---
+ADAPTIVE_GAP_MAX_FRAC_OF_RANGE = 0.49   # thresholds stay inside the band (low+gap, high-gap)
+MIN_SEPARATION_PPM             = 5e-6   # ~5 ppm of mid-price as last-resort tiny separation
+
+def _compute_adaptive_bounce_thresholds(low_val: Optional[Decimal],
+                                        high_val: Optional[Decimal],
+                                        pct: float) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
     """
-    Bounce uses distance-based priority when both conditions are met.
-    Choose LONG/SHORT based on which trigger level is closer to current price.
+    Returns (low_threshold, high_threshold, mode)
+    mode ∈ {'raw','adaptive','clamped','invalid'}.
+    Keeps thresholds ordered (low_thr < high_thr); if impossible, returns (None, None, 'invalid').
+    """
+    if low_val is None or high_val is None:
+        return None, None, "invalid"
+    if high_val <= low_val:
+        return None, None, "invalid"
+
+    channel = high_val - low_val
+    mid     = (high_val + low_val) / Decimal("2")
+
+    pctD = Decimal(str(pct))
+
+    # 1) Raw (backward compatible)
+    raw_low_thr  = low_val  * (Decimal("1") + pctD)
+    raw_high_thr = high_val * (Decimal("1") - pctD)
+    if raw_low_thr < raw_high_thr:
+        return raw_low_thr, raw_high_thr, "raw"
+
+    # 2) Adaptive gap based on band width (stay inside the band)
+    gap_abs = min(pctD * mid, Decimal(str(ADAPTIVE_GAP_MAX_FRAC_OF_RANGE)) * channel)
+    low_thr  = low_val  + gap_abs
+    high_thr = high_val - gap_abs
+    if low_thr < high_thr:
+        return low_thr, high_thr, "adaptive"
+
+    # 3) Last resort: tiny separation around the mid
+    sep = max(Decimal(str(MIN_SEPARATION_PPM)) * mid, Decimal("0"))
+    low_thr  = mid - sep
+    high_thr = mid + sep
+    if low_thr < high_thr:
+        return low_thr, high_thr, "clamped"
+
+    return None, None, "invalid"
+
+# ========================= BOUNCE STRATEGY (strict Donchian Hi/Lo) ===================
+def update_bounce_thresholds(st: dict):
+    """
+    Update bounce thresholds from strict Donchian over the (largest) configured bounce window,
+    but safely so they never invert on narrow ranges (prevents stuck breached-both state).
+    """
+    if not BOUNCE_WINDOWS_SEC:
+        wsec = 20 * 3600
+    else:
+        wsec = max(BOUNCE_WINDOWS_SEC)  # use widest to remain stable vs noise
+    low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
+    bs = st["bounce_state"]
+
+    # Compute safe thresholds
+    new_low_threshold, new_high_threshold, _mode = _compute_adaptive_bounce_thresholds(low_w, high_w, BOUNCE_THRESHOLD_PCT)
+
+    # If invalid (missing/flat band), clear breaches and keep previous thresholds
+    if new_low_threshold is None or new_high_threshold is None:
+        bs["breached_low"] = False
+        bs["breached_high"] = False
+        bs["low_breach_price"] = None
+        bs["high_breach_price"] = None
+        return
+
+    def moved_materially(old: Optional[Decimal], new: Optional[Decimal]) -> bool:
+        if old is None or new is None: return True
+        if old == 0: return True
+        return ((new - old).copy_abs() / old.copy_abs()) > Decimal("0.001")  # >0.1% move
+
+    if moved_materially(bs["low_threshold"], new_low_threshold):
+        bs["breached_low"] = False
+        bs["low_breach_price"] = None
+    if moved_materially(bs["high_threshold"], new_high_threshold):
+        bs["breached_high"] = False
+        bs["high_breach_price"] = None
+
+    bs["low_threshold"]  = new_low_threshold
+    bs["high_threshold"] = new_high_threshold
+
+def true_bounce_signal(st: dict) -> Optional[str]:
+    """
+    SIMPLIFIED bounce logic (unchanged): breach → cross back through threshold → signal.
+    Thresholds now come from strict candle Hi/Lo Donchian (widest configured window).
     """
     if not BOUNCE_ENABLED:
         return None
@@ -345,75 +640,151 @@ def bounce_signal(st: dict) -> Optional[str]:
     if now - st.get("last_bounce_ts", 0.0) < BOUNCE_COOLDOWN_SEC:
         return None
 
-    low_24, low_ts_24, high_24, high_ts_24 = _rolling_extremes_with_ts(st, 24 * 3600)
-    if low_ts_24 is None and high_ts_24 is None:
+    update_bounce_thresholds(st)
+    bs = st["bounce_state"]
+    low_threshold  = bs["low_threshold"]
+    high_threshold = bs["high_threshold"]
+    if low_threshold is None and high_threshold is None:
         return None
 
-    # Calculate bounce trigger levels
-    long_trigger = float(low_24) * (1.0 + BOUNCE_THRESHOLD_PCT) if low_ts_24 is not None else None
-    short_trigger = float(high_24) * (1.0 - BOUNCE_THRESHOLD_PCT) if high_ts_24 is not None else None
+    # Step 1: track breaches
+    if low_threshold is not None and price < low_threshold:
+        if not bs["breached_low"]:
+            bs["breached_low"] = True
+            bs["low_breach_price"] = price
+            logging.info(f"BOUNCE: Breached LOW threshold {low_threshold:.6f} at {price:.6f}")
+        else:
+            bs["low_breach_price"] = min(bs["low_breach_price"] or price, price)
 
-    long_ok = (long_trigger is not None) and (price >= long_trigger)
-    short_ok = (short_trigger is not None) and (price <= short_trigger)
+    if high_threshold is not None and price > high_threshold:
+        if not bs["breached_high"]:
+            bs["breached_high"] = True
+            bs["high_breach_price"] = price
+            logging.info(f"BOUNCE: Breached HIGH threshold {high_threshold:.6f} at {price:.6f}")
+        else:
+            bs["high_breach_price"] = max(bs["high_breach_price"] or price, price)
 
-    if long_ok and short_ok:
-        distance_to_long_trigger = abs(price - long_trigger)
-        distance_to_short_trigger = abs(price - short_trigger)
-        pick = "LONG" if distance_to_long_trigger < distance_to_short_trigger else "SHORT"
-        st["last_bounce_ts"] = now
-        logging.info(
-            f"Bounce conflict resolved: price={price:.6f}, long_trigger={long_trigger:.6f}(dist:{distance_to_long_trigger:.6f}), "
-            f"short_trigger={short_trigger:.6f}(dist:{distance_to_short_trigger:.6f}) -> {pick}"
-        )
-        return pick
-    elif long_ok:
-        st["last_bounce_ts"] = now
-        return "LONG"
-    elif short_ok:
-        st["last_bounce_ts"] = now
-        return "SHORT"
+    # Step 2: cross-back confirmation
+    min_depth_ratio = Decimal(str(BOUNCE_THRESHOLD_PCT)) * Decimal("0.01")  # 1% of threshold distance
+
+    if (bs["breached_low"] and low_threshold is not None and 
+        bs["low_breach_price"] is not None and price >= low_threshold):
+        breach_depth = (low_threshold - bs["low_breach_price"]) / low_threshold
+        if breach_depth >= min_depth_ratio:
+            bs["breached_low"] = False
+            bs["low_breach_price"] = None
+            st["last_bounce_ts"] = now
+            logging.info(f"BOUNCE LONG: Price {price:.6f} bounced UP through {low_threshold:.6f} (depth {breach_depth*100:.3f}%)")
+            return "LONG"
+    
+    if (bs["breached_high"] and high_threshold is not None and 
+        bs["high_breach_price"] is not None and price <= high_threshold):
+        breach_depth = (bs["high_breach_price"] - high_threshold) / high_threshold
+        if breach_depth >= min_depth_ratio:
+            bs["breached_high"] = False
+            bs["high_breach_price"] = None
+            st["last_bounce_ts"] = now
+            logging.info(f"BOUNCE SHORT: Price {price:.6f} bounced DOWN through {high_threshold:.6f} (depth {breach_depth*100:.3f}%)")
+            return "SHORT"
+
     return None
 
+# ========================= BREAKOUT STRATEGY (strict Donchian Hi/Lo) =======================
+def breakout_signal(st: dict) -> Optional[str]:
+    """
+    Breakout/Momentum strategy (priority):
+    - LONG if price > Donchian High of ANY configured breakout window
+    - SHORT if price < Donchian Low  of ANY configured breakout window
+    Uses strict candle High/Low.
+    """
+    if not BREAKOUT_ENABLED:
+        return None
+
+    price = st.get("last_price")
+    if price is None:
+        return None
+
+    now = time.time()
+    bos = st["breakout_state"]
+    if now - bos["last_breakout_ts"] < BREAKOUT_COOLDOWN_SEC:
+        return None
+
+    # If no windows configured (shouldn't happen), fallback to 20h
+    windows = BREAKOUT_WINDOWS_SEC or [20 * 3600]
+
+    fired = None
+
+    # Compute and test each window; fire if ANY window is broken
+    for wsec in windows:
+        low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
+        if low_w is None or high_w is None:
+            continue
+
+        if price > high_w:
+            fired = "LONG"; break
+        if price < low_w:
+            fired = "SHORT"; break
+
+    # Periodic debug (every 5 min) using the widest window for display
+    if now - bos.get("last_debug_log_ts", 0.0) >= 300.0:
+        # find symbol name
+        symbol = None
+        for sym, symbol_state in state.items():
+            if symbol_state is st:
+                symbol = sym
+                break
+        if symbol:
+            # show widest window ref for clarity
+            wdisp = max(windows)
+            lw, _, hw, _ = _rolling_extremes_with_ts(st, wdisp)
+            if lw is not None and hw is not None:
+                logging.info(f"BREAKOUT CHECK {symbol}: price={price:.6f} | Donchian({int(wdisp/3600)}h)_low={lw:.6f} | _high={hw:.6f}")
+        bos["last_debug_log_ts"] = now
+
+    if fired:
+        bos["last_breakout_ts"] = now
+        if fired == "LONG":
+            logging.info(f"BREAKOUT LONG: Price {price:.6f} broke above Donchian high")
+        else:
+            logging.info(f"BREAKOUT SHORT: Price {price:.6f} broke below Donchian low")
+        return fired
+
+    return None
+
+# ========================= COMBINED SIGNAL LOGIC (OPTION B PRIORITY) ===============
 def get_target_signal(st: dict) -> Tuple[Optional[str], str]:
-    b = bounce_signal(st)
-    if b in ("LONG","SHORT"): return b, "BOUNCE"
+    # Priority 1: Breakout signals
+    breakout = breakout_signal(st)
+    if breakout in ("LONG", "SHORT"):
+        return breakout, "BREAKOUT"
+    # Priority 2: Bounce signals
+    bounce = true_bounce_signal(st)
+    if bounce in ("LONG", "SHORT"):
+        return bounce, "BOUNCE"
     return None, "NONE"
 
-# ========================= EXCHANGE TRAILING STOP (NEW) ==================
-async def place_exchange_trailing_stop(cli: AsyncClient, symbol: str, side_pos: str, qty: float, activation_price: float) -> Optional[int]:
-    """
-    side_pos: 'LONG' or 'SHORT' (positionSide).
-    For LONG positions we place a SELL trailing stop; for SHORT positions we place a BUY trailing stop.
-    """
-    if not EXCHANGE_TRAIL_ENABLED:
+# ========================= EXCHANGE TRAILING STOP (FIXED -2021) =========
+async def place_exchange_trailing_stop(cli: AsyncClient, symbol: str, side_pos: str, qty: float, last_price: float) -> Optional[int]:
+    if not EXCHANGE_TRAIL_ENABLED or qty <= 0 or last_price <= 0:
         return None
-    if qty <= 0 or activation_price <= 0:
-        return None
-
     working_type = "MARK_PRICE" if PRICE_SOURCE == "mark" else "CONTRACT_PRICE"
     side = "SELL" if side_pos == "LONG" else "BUY"
-
-    params = {
+    base_params = {
         "symbol": symbol,
         "side": side,
         "type": "TRAILING_STOP_MARKET",
         "quantity": quantize_qty(symbol, qty),
-        "activationPrice": quantize_price(symbol, activation_price),
-        "callbackRate": EXCHANGE_TRAIL_CALLBACK_RATE,  # 0.5 => 0.5%
+        "callbackRate": EXCHANGE_TRAIL_CALLBACK_RATE,
         "workingType": working_type,
         "reduceOnly": True,
     }
     if DUAL_SIDE:
-        params["positionSide"] = side_pos
-
-    # strip Nones
-    params = {k: v for k, v in params.items() if v is not None}
-
+        base_params["positionSide"] = side_pos
+    params = dict(base_params)
     try:
         res = await call_binance(cli.futures_create_order, **params)
     except Exception as e:
         msg = str(e)
-        # Retry without reduceOnly if the exchange rejects it for trailing stops
         if "-1106" in msg and "reduceonly" in msg.lower() and ("reduceOnly" in params):
             params_wo = {k: v for k, v in params.items() if k != "reduceOnly"}
             logging.warning(f"{symbol} TRAIL {side_pos}: retrying without reduceOnly")
@@ -421,11 +792,10 @@ async def place_exchange_trailing_stop(cli: AsyncClient, symbol: str, side_pos: 
         else:
             logging.warning(f"{symbol} TRAIL {side_pos}: create failed: {e}")
             return None
-
     oid = res.get("orderId")
     if oid is not None:
         trailing_orders[symbol][side_pos] = int(oid)
-        logging.info(f"{symbol} TRAIL {side_pos}: set 0.5% (orderId={oid}) at act={activation_price:.6f}")
+        logging.info(f"{symbol} TRAIL {side_pos}: set {EXCHANGE_TRAIL_CALLBACK_RATE:.3f}% (orderId={oid}) act=immediate")
     return trailing_orders[symbol][side_pos]
 
 # ========================= IMPROVED POSITION MGMT =======================
@@ -446,13 +816,11 @@ async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str)
 
             ok_all = True
 
-            # Close unwanted positions first
             if short_size > tolerance and target_signal != "SHORT":
                 ok_all &= await safe_order_execution(cli, exit_short(symbol, short_size), symbol, "CLOSE SHORT")
             if long_size > tolerance and target_signal != "LONG":
                 ok_all &= await safe_order_execution(cli, exit_long(symbol, long_size), symbol, "CLOSE LONG")
 
-            # Open new positions
             if target_signal == "LONG" and long_size < target_long - tolerance:
                 delta = target_long - long_size
                 ok = await safe_order_execution(cli, open_long(symbol, delta), symbol, "OPEN LONG")
@@ -460,7 +828,6 @@ async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str)
                     st["last_position_entry_ts"] = time.time()
                     st["trail_peak"] = st.get("last_price")
                     st["trail_trough"] = None
-                    # NEW: place exchange trailing stop @ 0.5%
                     actual_long = await get_position_size_fresh(cli, symbol, "LONG")
                     await place_exchange_trailing_stop(cli, symbol, "LONG", actual_long, st.get("last_price") or 0.0)
                 ok_all &= ok
@@ -471,7 +838,6 @@ async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str)
                     st["last_position_entry_ts"] = time.time()
                     st["trail_trough"] = st.get("last_price")
                     st["trail_peak"] = None
-                    # NEW: place exchange trailing stop @ 0.5%
                     actual_short = await get_position_size_fresh(cli, symbol, "SHORT")
                     await place_exchange_trailing_stop(cli, symbol, "SHORT", actual_short, st.get("last_price") or 0.0)
                 ok_all &= ok
@@ -479,7 +845,6 @@ async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str)
                 st["trail_peak"] = None
                 st["trail_trough"] = None
 
-            # Verify final positions match expectations
             if ok_all:
                 position_verified = await verify_position_after_trade(cli, symbol, target_long, target_short)
                 if not position_verified:
@@ -495,13 +860,7 @@ async def set_target_position(cli: AsyncClient, symbol: str, target_signal: str)
 
 # ========================= MAIN LOOP ===========================
 def _callback_retrace_hit(st: dict, price: float, side: str) -> bool:
-    if CALLBACK_RATE_PCT <= 0.0: return True
-    if side == "LONG":
-        peak = st.get("trail_peak") or price
-        return ((peak - price) / peak) >= CALLBACK_RATE_PCT
-    if side == "SHORT":
-        trough = st.get("trail_trough") or price
-        return ((price - trough) / trough) >= CALLBACK_RATE_PCT
+    # OPTION A: DISABLED - Always return True (no internal callback logic)
     return True
 
 async def simplified_trading_loop(cli: AsyncClient):
@@ -518,16 +877,10 @@ async def simplified_trading_loop(cli: AsyncClient):
                 if now < st["circuit_breaker_until"]: continue
                 st["consecutive_failures"] = 0; logging.info(f"{sym} Circuit breaker reset")
 
-            # Activation: allow bounce signal to start the bot (bounce-only mode)
-            if not st["bot_active"] and not st["manual_override"]:
-                b = bounce_signal(st)
-                if b in ("LONG","SHORT"):
-                    st["bot_active"] = True
-                    logging.info(f"{sym} BOT ACTIVATED")
-                else:
-                    continue
+            if st["manual_override"]:
+                continue
 
-            # Update trailing extremes while holding (for callback exits)
+            # Maintain trailing markers for info only
             if st["current_signal"] == "LONG":
                 st["trail_peak"] = price if st["trail_peak"] is None else max(st["trail_peak"], price); st["trail_trough"] = None
             elif st["current_signal"] == "SHORT":
@@ -535,30 +888,37 @@ async def simplified_trading_loop(cli: AsyncClient):
             else:
                 st["trail_peak"] = None; st["trail_trough"] = None
 
-            # Decide target (bounce-only)
-            target, source = get_target_signal(st)
-            if target is None: continue
-            current = st["current_signal"]
+            # LATCH fresh signal
+            fresh_signal, signal_source = get_target_signal(st)
+            if fresh_signal in ("LONG","SHORT"):
+                st["pending_signal"] = fresh_signal
+                st["pending_signal_source"] = signal_source
 
-            # Anti-churn: only allow exit/flip after hold + callback retrace
-            if target != current and current in ("LONG","SHORT") and st.get("last_position_entry_ts",0) > 0:
+            pending = st.get("pending_signal")
+            if pending is None:
+                continue
+
+            target = pending
+            current = st["current_signal"]
+            source = st.get("pending_signal_source", "UNKNOWN")
+
+            if target != current and current in ("LONG","SHORT") and st.get("last_position_entry_ts", 0) > 0:
                 if now - st["last_position_entry_ts"] < MIN_HOLD_SEC:
                     continue
                 if not _callback_retrace_hit(st, price, current):
                     continue
 
-            # Apply signal change / confirmation / cooldown
-            if target != current:
+            if st["signal_since"] is None or target != current:
                 st["current_signal"] = target
                 st["signal_since"] = now
                 st["active_signal_source"] = source
                 logging.info(f"{sym} Signal change: {current} -> {target} (source={source})")
 
-            if st["signal_since"] is None: continue
-            if (now - st["signal_since"]) < SIGNAL_CONFIRM_SEC: continue
-            if now - st["last_trade_ts"] < TRADE_COOLDOWN_SEC: continue
+            if (now - st["signal_since"]) < SIGNAL_CONFIRM_SEC:
+                continue
+            if now - st["last_trade_ts"] < TRADE_COOLDOWN_SEC:
+                continue
 
-            # --- Staggered Execution ---
             symbol_delay = (hash(sym) % len(SYMBOLS)) * 0.5  # 0-2.5s stagger
             await asyncio.sleep(symbol_delay)
 
@@ -566,12 +926,13 @@ async def simplified_trading_loop(cli: AsyncClient):
                 success = await set_target_position(cli, sym, target)
                 if success:
                     st["last_trade_ts"] = now
-                    if target in ("LONG","SHORT"):
-                        st["last_position_entry_ts"] = now
-                        if target == "LONG": st["trail_peak"] = price; st["trail_trough"] = None
-                        else: st["trail_trough"] = price; st["trail_peak"] = None
+                    st["last_position_entry_ts"] = now
+                    if target == "LONG":
+                        st["trail_peak"] = price; st["trail_trough"] = None
                     else:
-                        st["trail_peak"] = None; st["trail_trough"] = None
+                        st["trail_trough"] = price; st["trail_peak"] = None
+                    st["pending_signal"] = None
+                    st["pending_signal_source"] = None
             except Exception as e:
                 logging.error(f"{sym} Position update failed: {e}")
                 st["consecutive_failures"] += 1
@@ -603,6 +964,86 @@ async def pnl_summary_loop(cli: AsyncClient):
         logging.info(f"[SUMMARY] TOTAL uPnL: {total_upnl:.2f} USDT")
         await asyncio.sleep(PNL_SUMMARY_SEC)
 
+# >>> Diagnostics (entrypoint snapshot + 30-minute reasons-why-no-order)
+def _compute_threshold_preview(st: dict) -> Tuple[Optional[float], Optional[float]]:
+    """Preview thresholds from strict Donchian over the widest bounce window (no side effects)."""
+    wsec = max(BOUNCE_WINDOWS_SEC) if BOUNCE_WINDOWS_SEC else 20*3600
+    low_w, _, high_w, _ = _rolling_extremes_with_ts(st, wsec)
+    low_thr  = (float(low_w)  * (1.0 + BOUNCE_THRESHOLD_PCT)) if low_w  is not None else None
+    high_thr = (float(high_w) * (1.0 - BOUNCE_THRESHOLD_PCT)) if high_w is not None else None
+    return low_thr, high_thr
+
+def _fmt(o):
+    if o is None: return "n/a"
+    try:
+        return f"{float(o):.6f}"
+    except Exception:
+        return str(o)
+
+async def entrypoint_diagnostic_once():
+    await asyncio.sleep(3.0)
+    for sym in SYMBOLS:
+        st = state[sym]
+        price = st.get("last_price")
+        low_thr, high_thr = _compute_threshold_preview(st)
+        bs = st["bounce_state"]
+        bos = st["breakout_state"]
+        cool_left = max(0.0, (st.get("last_bounce_ts", 0.0) + BOUNCE_COOLDOWN_SEC) - time.time())
+        breakout_cool_left = max(0.0, (bos["last_breakout_ts"] + BREAKOUT_COOLDOWN_SEC) - time.time())
+        logging.info(
+            f"[DIAG-ENTRY] {sym} price={_fmt(price)} | bounce_thr_low={_fmt(low_thr)} bounce_thr_high={_fmt(high_thr)} | "
+            f"breakout_last_20h_low={_fmt(bos['last_20h_low'])} breakout_last_20h_high={_fmt(bos['last_20h_high'])} | "
+            f"bounce_breached_low={bs['breached_low']} bounce_breached_high={bs['breached_high']} | "
+            f"bounce_cooldown={cool_left:.1f}s breakout_cooldown={breakout_cool_left:.1f}s"
+        )
+
+async def diagnostic_summary_loop():
+    while True:
+        await asyncio.sleep(DIAG_SUMMARY_SEC)
+        for sym in SYMBOLS:
+            st = state[sym]
+            bs = st["bounce_state"]
+            bos = st["breakout_state"]
+            price = st.get("last_price")
+            low_thr, high_thr = _compute_threshold_preview(st)
+
+            # For display, use the widest breakout window
+            wsec = max(BREAKOUT_WINDOWS_SEC) if BREAKOUT_WINDOWS_SEC else 20*3600
+            low_20h, _, high_20h, _ = _rolling_extremes_with_ts(st, wsec)
+            
+            bounce_cool_left = max(0.0, (st.get("last_bounce_ts", 0.0) + BOUNCE_COOLDOWN_SEC) - time.time())
+            breakout_cool_left = max(0.0, (bos["last_breakout_ts"] + BREAKOUT_COOLDOWN_SEC) - time.time())
+            
+            reason = []
+            if bounce_cool_left > 0:
+                reason.append(f"bounce_cooldown {bounce_cool_left:.0f}s")
+            if breakout_cool_left > 0:
+                reason.append(f"breakout_cooldown {breakout_cool_left:.0f}s")
+            if price is None:
+                reason.append("no price yet")
+            else:
+                if high_20h is not None and price <= high_20h:
+                    reason.append(f"price {price:.6f} ≤ Donchian({int(wsec/3600)}h)_high {high_20h:.6f} (no breakout up)")
+                if low_20h is not None and price >= low_20h:
+                    reason.append(f"price {price:.6f} ≥ Donchian({int(wsec/3600)}h)_low {low_20h:.6f} (no breakout down)")
+                if low_thr is not None and price < low_thr and not bs["breached_low"]:
+                    reason.append("await breach below bounce_low_thr")
+                if high_thr is not None and price > high_thr and not bs["breached_high"]:
+                    reason.append("await breach above bounce_high_thr")
+                if bs["breached_low"] and (low_thr is not None) and price < low_thr:
+                    depth = (Decimal(str(low_thr)) - Decimal(str(bs["low_breach_price"] or low_thr))) / Decimal(str(low_thr)) if low_thr else Decimal("0")
+                    reason.append(f"bounce_breached_low depth={depth*100:.2f}% waiting cross↑")
+                if bs["breached_high"] and (high_thr is not None) and price > high_thr:
+                    depth = (Decimal(str(bs["high_breach_price"] or high_thr)) - Decimal(str(high_thr))) / Decimal(str(high_thr)) if high_thr else Decimal("0")
+                    reason.append(f"bounce_breached_high depth={depth*100:.2f}% waiting cross↓")
+            reason_str = "; ".join(reason) if reason else "ready→pending confirm/cooldown"
+            logging.info(
+                f"[DIAG] {sym} price={_fmt(price)} | BREAKOUT Donchian({int(wsec/3600)}h)_low={_fmt(low_20h)} _high={_fmt(high_20h)} | "
+                f"BOUNCE thr_low={_fmt(low_thr)} thr_high={_fmt(high_thr)} | "
+                f"bounce_breached_low={bs['breached_low']} bounce_breached_high={bs['breached_high']} | "
+                f"why_not_order= {reason_str}"
+            )
+
 # ========================= MAIN ================================
 async def main():
     threading.Thread(target=start_ping, daemon=True).start()
@@ -624,7 +1065,11 @@ async def main():
         health_task = asyncio.create_task(websocket_health_monitor())
         trading_task = asyncio.create_task(simplified_trading_loop(cli))
         summary_task = asyncio.create_task(pnl_summary_loop(cli))
-        await asyncio.gather(feed_task, trading_task, summary_task, health_task)
+
+        entry_diag = asyncio.create_task(entrypoint_diagnostic_once())
+        diag_task  = asyncio.create_task(diagnostic_summary_loop())
+
+        await asyncio.gather(feed_task, trading_task, summary_task, health_task, entry_diag, diag_task)
     finally:
         try: await cli.close_connection()
         except Exception: pass
@@ -636,13 +1081,32 @@ if __name__ == "__main__":
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
             if "[SUMMARY]" in msg: return True
+            if "[DIAG" in msg: return True
             if record.levelno >= logging.WARNING: return True
-            if any(x in msg for x in ["executed - OrderID", "Signal change", "BOT ACTIVATED", "Circuit breaker", "FILLED", "Bounce conflict resolved", "TRAIL"]): return True
+            if any(x in msg for x in [
+                "submitted - OrderID",
+                "executed - OrderID",
+                "Signal change",
+                "BOT ACTIVATED",
+                "Circuit breaker",
+                "FILLED",
+                "Bounce conflict resolved",
+                "TRAIL",
+                "BOUNCE:",
+                "BOUNCE LONG:",
+                "BOUNCE SHORT:",
+                "BREAKOUT LONG:",
+                "BREAKOUT SHORT:",
+                "BREAKOUT CHECK"
+            ]): return True
             return False
     logging.getLogger().addFilter(CleanLogFilter())
-    logging.info("=== IMPROVED TRADING BOT (Bounce-Only Mode + Order Validation + Exchange Trailing 0.5%) ===")
-    logging.info(f"Position Size: {POSITION_SIZE_ADA} ADA | Leverage: {LEVERAGE}x")
-    logging.info(f"Bounce: distance-based priority, threshold={BOUNCE_THRESHOLD_PCT*100:.1f}% | Exit protection: callback={CALLBACK_RATE_PCT*100:.2f}%, min_hold={MIN_HOLD_SEC}s")
-    logging.info(f"Exchange trailing: {EXCHANGE_TRAIL_CALLBACK_RATE:.3f}% after each entry (TRAILING_STOP_MARKET)")
+
+    logging.info("=== DUAL STRATEGY TRADING BOT (Breakout + Bounce with Priority System | STRICT Donchian Hi/Lo + Adaptive Windows) ===")
+    logging.info(f"Symbols & target sizes: {SYMBOLS}")
+    logging.info(f"Leverage: {LEVERAGE}x | Bounce threshold={BOUNCE_THRESHOLD_PCT*100:.6f}% | Min hold={MIN_HOLD_SEC}s")
+    logging.info(f"STRATEGY PRIORITY: 1st=BREAKOUT (strict Donchian), 2nd=BOUNCE (strict Donchian thresholds)")
+    logging.info(f"Exchange trailing: {EXCHANGE_TRAIL_CALLBACK_RATE:.3f}% (internal callback disabled)")
+    logging.info(f"Bounce windows (h): {BOUNCE_WINDOWS_HOURS} | Breakout windows (h): {BREAKOUT_WINDOWS_HOURS}")
     logging.info(f"Order validation: timeout={ORDER_FILL_TIMEOUT_SEC}s, attempts={MAX_FILL_CHECK_ATTEMPTS}")
     asyncio.run(main())
