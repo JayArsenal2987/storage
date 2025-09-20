@@ -606,7 +606,7 @@ def true_bounce_signal(st: dict) -> Optional[str]:
             bs["high_breach_price"] = max(bs["high_breach_price"] or price, price)
 
     # Step 2: cross-back confirmation
-    min_depth_ratio = BOUNCE_THRESHOLD_PCT * 0.1
+    min_depth_ratio = BOUNCE_THRESHOLD_PCT * 0.01
 
     if (bs["breached_low"] and low_threshold is not None and 
         bs["low_breach_price"] is not None and price >= low_threshold):
