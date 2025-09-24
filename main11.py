@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import os, json, asyncio, threading, logging, websockets, time, random
-import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from binance import AsyncClient
 from collections import deque
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 getcontext().prec = 28
 
@@ -17,10 +16,7 @@ API_KEY    = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
 
-# ---- SIMPLE STRATEGY (EXIT) ----
-CALLBACK_PERCENT = 0.5   # ONLY exit mechanism (exchange trailing stop)
-
-# ---- SYMBOLS ----
+# ---- SYMBOLS & TARGET SIZE ----
 SYMBOLS = {
     "BTCUSDT": 0.001,
     "ETHUSDT": 0.01,
@@ -32,45 +28,38 @@ SYMBOLS = {
     "TRXUSDT": 20.0,
 }
 
-# ---- BOLLINGER (kept for diagnostics; not used for entries) ----
-WMA_PERIOD = 1200
-STD_MULTIPLIER = 0.5
-PRICE_HISTORY_SIZE = WMA_PERIOD + 400
+# ---- DONCHIAN (Donchian-only, zero Bollinger) ----
+DONCHIAN_HOURS       = 20         # 20h window of 1m candles
+BOUNCE_THRESHOLD_PCT = 0.005      # 0.5% of channel width for bounce confirm
+SIGNAL_PRIORITY      = ("BREAKOUT", "BOUNCE")  # or ("BOUNCE","BREAKOUT")
+REFLIP_GUARD_SEC     = 1.0        # anti-chop: minimum secs between flips
+EPS                  = 1e-8
 
-# ---- DONCHIAN ENTRY CONFIG ----
-DONCHIAN_HOURS = 20                    # 20h rolling window from 1m candles
-BOUNCE_THRESHOLD_PCT = 0.005           # 0.5% inside the channel for bounce confirm
-SIGNAL_PRIORITY = ("BREAKOUT", "BOUNCE")  # or ("BOUNCE","BREAKOUT")
-REFLIP_GUARD_SEC = 3.0                 # prevent micro flip-flops at edges
-EPS = 1e-8
+# ---- STARTUP WITHOUT SEEDING (warmup) ----
+MIN_VALID_MINUTES = 15  # trade after this many completed minutes if seeding was blocked
 
-# ---- POSITION SIZE CACHE (NEW) ----
-POSITION_SIZE_TTL = 2.0  # seconds to cache long/short sizes to cut REST calls
+# ---- POSITION SIZE CACHE ----
+POSITION_SIZE_TTL = 2.0  # seconds
 
 # ---- PRICE SOURCE ----
-def _ws_host() -> str:
-    return "fstream.binance.com"
-def _stream_name(sym: str) -> str:
-    return f"{sym.lower()}@markPrice@1s"
+def _ws_host() -> str: return "fstream.binance.com"
+def _stream_name(sym: str) -> str: return f"{sym.lower()}@markPrice@1s"
 
 # ---- RISK MANAGEMENT ----
 MAX_CONSECUTIVE_FAILURES = 3
 CIRCUIT_BREAKER_BASE_SEC = 300
-PRICE_STALENESS_SEC = 5.0
-RATE_LIMIT_BASE_SLEEP = 2.0
-RATE_LIMIT_MAX_SLEEP = 60.0
+PRICE_STALENESS_SEC      = 5.0
+RATE_LIMIT_BASE_SLEEP    = 2.0
+RATE_LIMIT_MAX_SLEEP     = 60.0
 
 # ---- REST 403 BLOCKING ----
-class RestBlockedError(Exception):
-    pass
-
+class RestBlockedError(Exception): pass
 REST_BLOCKED_UNTIL = 0.0
-_last_rest_warn = 0.0
+_last_rest_warn    = 0.0
 
 def rest_blocked() -> bool:
     return time.time() < REST_BLOCKED_UNTIL
 
-# alias for older references
 def _is_rest_blocked() -> bool:
     return rest_blocked()
 
@@ -79,15 +68,14 @@ def _note_rest_block():
     if remaining > 0:
         logging.warning(f"REST temporarily blocked (HTTP 403). Backing off ~{remaining}s.")
 
-# ---- LOG THROTTLING ----
+# ---- LOG THROTTLING (for spammy infos) ----
 LOG_SUPPRESS_SECS = int(os.getenv("LOG_SUPPRESS_SECS", "300"))
-_LAST_LOG_TS: Dict[Tuple[str, str], float] = {}
+_LAST_LOG_TS: Dict[tuple, float] = {}
 
 def _log_every(symbol: str, key: str, message: str, level: int = logging.INFO):
     now = time.time()
     k = (symbol, key)
-    last = _LAST_LOG_TS.get(k, 0.0)
-    if now - last >= LOG_SUPPRESS_SECS:
+    if now - _LAST_LOG_TS.get(k, 0.0) >= LOG_SUPPRESS_SECS:
         logging.log(level, message)
         _LAST_LOG_TS[k] = now
 
@@ -114,9 +102,9 @@ _last_rest_ts = 0.0
 async def call_binance(fn, *args, **kwargs):
     """
     Centralized REST caller:
-    - pacing (0.2s min gap)
-    - 403 timed block -> raises RestBlockedError
-    - 429/-1003 exponential backoff
+    - pacing (0.2s gap)
+    - 403 -> set timed block & raise
+    - 429/-1003 -> exponential backoff
     """
     global _last_rest_ts, REST_BLOCKED_UNTIL, _last_rest_warn
     now = time.time()
@@ -124,7 +112,6 @@ async def call_binance(fn, *args, **kwargs):
     if now < REST_BLOCKED_UNTIL:
         raise RestBlockedError("REST blocked")
 
-    # Pace calls
     if now - _last_rest_ts < 0.2:
         await asyncio.sleep(0.2 - (now - _last_rest_ts))
     _last_rest_ts = time.time()
@@ -150,8 +137,7 @@ async def call_binance(fn, *args, **kwargs):
 
 # ========================= POSITION STATE SYNC =========================
 async def sync_position_state(cli: AsyncClient):
-    if rest_blocked():
-        return
+    if rest_blocked(): return
     logging.info("=== SYNCING POSITION STATE ===")
     for symbol in SYMBOLS:
         st = state[symbol]
@@ -167,8 +153,7 @@ async def sync_position_state(cli: AsyncClient):
                 st["current_signal"] = None
                 logging.info(f"{symbol}: No existing position - Starting fresh")
         except RestBlockedError:
-            _note_rest_block()
-            return
+            _note_rest_block(); return
         except Exception as e:
             logging.error(f"{symbol}: Failed to sync position state: {e}")
 
@@ -179,8 +164,7 @@ async def get_dual_side(cli: AsyncClient) -> bool:
         res = await call_binance(cli.futures_get_position_mode)
         return bool(res.get("dualSidePosition", False))
     except RestBlockedError:
-        _note_rest_block()
-        return False
+        _note_rest_block(); return False
     except Exception:
         return False
 
@@ -191,10 +175,8 @@ async def get_position_sizes(cli: AsyncClient, symbol: str) -> Tuple[float, floa
         for pos in positions:
             side = pos.get("positionSide")
             size = abs(float(pos.get("positionAmt", 0.0)))
-            if side == "LONG":
-                long_size = size
-            elif side == "SHORT":
-                short_size = size
+            if side == "LONG": long_size = size
+            elif side == "SHORT": short_size = size
         return long_size, short_size
     except RestBlockedError:
         raise
@@ -205,10 +187,9 @@ async def get_position_sizes(cli: AsyncClient, symbol: str) -> Tuple[float, floa
 # ========================= STATE ===============================
 state: Dict[str, Dict[str, Any]] = {
     s: {
-        # Price data
+        # Price data (tick)
         "last_price": None,
         "price_timestamp": None,
-        "price_history": deque(maxlen=PRICE_HISTORY_SIZE),
 
         # 1-min OHLC for Donchian
         "klines": deque(maxlen=DONCHIAN_HOURS * 60),
@@ -223,17 +204,7 @@ state: Dict[str, Dict[str, Any]] = {
         "order_lock": asyncio.Lock(),
         "position_state": "IDLE",
 
-        # Optional Bollinger snapshot (not used for entry)
-        "last_bollinger_bands": None,
-
-        # Diagnostics
-        "entry_price": None,
-
-        # Exit history
-        "long_exit_history": deque(maxlen=5),
-        "short_exit_history": deque(maxlen=5),
-
-        # Bounce breach tracking (Donchian)
+        # Donchian bounce tracking
         "bounce_breach_state": "NONE",   # NONE | BREACHED_LOW | BREACHED_HIGH
         "bounce_breach_ts": 0.0,
         "bounce_reverse_confirmed": False,
@@ -241,7 +212,7 @@ state: Dict[str, Dict[str, Any]] = {
         # Anti-chop flip timestamp
         "last_flip_ts": 0.0,
 
-        # Position size cache (NEW)
+        # Position size cache
         "pos_cache": {"ts": 0.0, "long": 0.0, "short": 0.0},
     } for s in SYMBOLS
 }
@@ -249,100 +220,68 @@ state: Dict[str, Dict[str, Any]] = {
 def symbol_target_qty(sym: str) -> float:
     return float(SYMBOLS[sym])
 
-# ========================= BOLLINGER (optional diagnostics) =========================
-def weighted_moving_average(prices: List[float], period: int) -> Optional[float]:
-    if len(prices) < period:
-        return None
-    recent_prices = prices[-period:]
-    weights = np.arange(1, period + 1)
-    try:
-        wma = np.average(recent_prices, weights=weights)
-        return float(wma)
-    except Exception as e:
-        logging.warning(f"WMA calculation error: {e}")
-        return None
-
-def calculate_bollinger_bands(symbol: str) -> Optional[Dict[str, float]]:
-    st = state[symbol]
-    price_history = list(st["price_history"])
-    if len(price_history) < WMA_PERIOD:
-        return None
-    wma = weighted_moving_average(price_history, WMA_PERIOD)
-    if wma is None:
-        return None
-    recent_prices = price_history[-WMA_PERIOD:]
-    try:
-        std_dev = np.std(recent_prices)
-        upper_band = wma + (std_dev * STD_MULTIPLIER)
-        lower_band = wma - (std_dev * STD_MULTIPLIER)
-        bands = {'wma': wma, 'upper_band': upper_band, 'lower_band': lower_band, 'std_dev': std_dev}
-        st["last_bollinger_bands"] = bands
-        return bands
-    except Exception as e:
-        logging.warning(f"{symbol}: Bollinger calculation error: {e}")
-        return None
-
 # ========================= DONCHIAN HELPERS =========================
-def _minute_bucket(ts: float) -> int: 
+def _minute_bucket(ts: float) -> int:
     return int(ts // 60)
 
 def get_donchian_levels(symbol: str) -> Tuple[Optional[float], Optional[float]]:
     st = state[symbol]
     klines = st["klines"]
-    if len(klines) < 50:
-        return None, None
+    if not klines: return None, None
+
     now = time.time()
-    cutoff = now - DONCHIAN_HOURS * 3600
+    cutoff     = now - DONCHIAN_HOURS * 3600
     cur_minute = _minute_bucket(now)
+
+    # Use only completed minutes inside the window
     valid = [k for k in klines if k["time"] >= cutoff and k["minute"] < cur_minute]
-    if len(valid) < 30:
+    if len(valid) < MIN_VALID_MINUTES:
         return None, None
+
     highs = [k["high"] for k in valid]
     lows  = [k["low"]  for k in valid]
     return (min(lows), max(highs))
 
 def get_bounce_levels(d_low: float, d_high: float) -> Tuple[float, float]:
-    ch = d_high - d_low
+    ch  = d_high - d_low
     off = ch * BOUNCE_THRESHOLD_PCT
-    return d_low + off, d_high - off  # (bounce_low, bounce_high)
+    return d_low + off, d_high - off
 
-# ========================= BREAKOUT & BOUNCE DETECTORS =========================
+# ========================= SIGNAL DETECTION (Donchian-only) =========================
 def detect_breakout_signal(symbol: str) -> Optional[str]:
     st = state[symbol]
     price = st.get("last_price")
-    if price is None: 
-        return None
+    if price is None: return None
     d_low, d_high = get_donchian_levels(symbol)
-    if d_low is None or d_high is None: 
-        return None
+    if d_low is None or d_high is None: return None
+
     if price >= d_high - EPS:
-        logging.info(f"{symbol}: BREAKOUT LONG | price={price:.8f} ≥ H={d_high:.8f}")
+        logging.info(f"{symbol}: BREAKOUT LONG | px={price:.8f} ≥ H={d_high:.8f}")
         return "LONG"
     if price <= d_low + EPS:
-        logging.info(f"{symbol}: BREAKOUT SHORT | price={price:.8f} ≤ L={d_low:.8f}")
+        logging.info(f"{symbol}: BREAKOUT SHORT | px={price:.8f} ≤ L={d_low:.8f}")
         return "SHORT"
     return None
 
 def detect_bounce_signal(symbol: str) -> Optional[str]:
     st = state[symbol]
     price = st.get("last_price")
-    if price is None: 
-        return None
+    if price is None: return None
     d_low, d_high = get_donchian_levels(symbol)
-    if d_low is None or d_high is None: 
-        return None
+    if d_low is None or d_high is None: return None
 
     b_low, b_high = get_bounce_levels(d_low, d_high)
     breach = st.get("bounce_breach_state", "NONE")
     now = time.time()
 
-    # Phase 1: breach extremes
+    # Phase 1: mark breach of extreme
     if price <= d_low and breach != "BREACHED_LOW":
         st["bounce_breach_state"] = "BREACHED_LOW"
         st["bounce_breach_ts"] = now
         st["bounce_reverse_confirmed"] = False
         logging.info(f"{symbol}: BOUNCE breach LOW at {price:.8f} (L={d_low:.8f})")
         return None
+
     if price >= d_high and breach != "BREACHED_HIGH":
         st["bounce_breach_state"] = "BREACHED_HIGH"
         st["bounce_breach_ts"] = now
@@ -350,38 +289,34 @@ def detect_bounce_signal(symbol: str) -> Optional[str]:
         logging.info(f"{symbol}: BOUNCE breach HIGH at {price:.8f} (H={d_high:.8f})")
         return None
 
-    # Phase 2: confirm reversals
+    # Phase 2: confirm reversal toward channel
     if breach == "BREACHED_LOW" and not st.get("bounce_reverse_confirmed", False):
         if price >= b_low:
             st["bounce_reverse_confirmed"] = True
-            logging.info(f"{symbol}: BOUNCE LONG confirm | price={price:.8f} ≥ {b_low:.8f}")
+            logging.info(f"{symbol}: BOUNCE LONG confirm | px={price:.8f} ≥ {b_low:.8f}")
             return "LONG"
+
     if breach == "BREACHED_HIGH" and not st.get("bounce_reverse_confirmed", False):
         if price <= b_high:
             st["bounce_reverse_confirmed"] = True
-            logging.info(f"{symbol}: BOUNCE SHORT confirm | price={price:.8f} ≤ {b_high:.8f}")
+            logging.info(f"{symbol}: BOUNCE SHORT confirm | px={price:.8f} ≤ {b_high:.8f}")
             return "SHORT"
+
     return None
 
-def _pick_with_priority(symbol: str) -> Tuple[Optional[str], Optional[str]]:
+def _pick_with_priority(symbol: str):
     br = detect_breakout_signal(symbol)
     bn = detect_bounce_signal(symbol)
-    if not br and not bn: 
-        return None, None
+    if not br and not bn: return None, None
     if br and bn:
-        if br == bn:
-            return br, SIGNAL_PRIORITY[0]
+        if br == bn: return br, SIGNAL_PRIORITY[0]
         return (br, "BREAKOUT") if SIGNAL_PRIORITY[0] == "BREAKOUT" else (bn, "BOUNCE")
     return (br, "BREAKOUT") if br else (bn, "BOUNCE")
 
-# ========================= SIMPLE SIGNAL (Donchian-based) =========================
 def detect_signals(symbol: str) -> Optional[str]:
-    """
-    Return 'LONG'/'SHORT'/None.
-    Exits are handled by exchange trailing stop orders.
-    """
+    """Return 'LONG'/'SHORT'/None. Exits are by flip only."""
     st = state[symbol]
-    current = st.get("current_signal")  # None | LONG | SHORT
+    current = st.get("current_signal")
     picked, src = _pick_with_priority(symbol)
     if not picked:
         return None
@@ -398,14 +333,12 @@ def detect_signals(symbol: str) -> Optional[str]:
         logging.info(f"{symbol}: FLIP {current}→{picked} ({src})")
         return picked
 
-    return None  # reinforcement only
+    return None
 
 # ========================= ORDER EXECUTION =========================
 def _maybe_pos_side(params: dict, side: str) -> dict:
-    if DUAL_SIDE:
-        params["positionSide"] = side
-    else:
-        params.pop("positionSide", None)
+    if DUAL_SIDE: params["positionSide"] = side
+    else: params.pop("positionSide", None)
     return params
 
 def open_long(sym: str, qty: float):
@@ -416,14 +349,12 @@ def open_short(sym: str, qty: float):
 
 def exit_long(sym: str, qty: float):
     p = dict(symbol=sym, side="SELL", type="MARKET", quantity=quantize_qty(sym, qty))
-    if not DUAL_SIDE:
-        p["reduceOnly"] = True
+    if not DUAL_SIDE: p["reduceOnly"] = True
     return _maybe_pos_side(p, "LONG")
 
 def exit_short(sym: str, qty: float):
     p = dict(symbol=sym, side="BUY", type="MARKET", quantity=quantize_qty(sym, qty))
-    if not DUAL_SIDE:
-        p["reduceOnly"] = True
+    if not DUAL_SIDE: p["reduceOnly"] = True
     return _maybe_pos_side(p, "SHORT")
 
 async def execute_order(cli: AsyncClient, order_params: dict, symbol: str, action: str) -> bool:
@@ -433,8 +364,7 @@ async def execute_order(cli: AsyncClient, order_params: dict, symbol: str, actio
         logging.info(f"{symbol} {action} EXECUTED - OrderID: {oid}")
         return True
     except RestBlockedError:
-        _note_rest_block()
-        return False
+        _note_rest_block(); return False
     except Exception as e:
         msg = str(e)
         if "-1106" in msg and "reduceonly" in msg.lower() and "reduceOnly" in order_params:
@@ -445,15 +375,14 @@ async def execute_order(cli: AsyncClient, order_params: dict, symbol: str, actio
                 logging.info(f"{symbol} {action} EXECUTED (no reduceOnly) - OrderID: {oid}")
                 return True
             except RestBlockedError:
-                _note_rest_block()
-                return False
+                _note_rest_block(); return False
             except Exception as e2:
                 logging.error(f"{symbol} {action} RETRY FAILED: {e2}")
         else:
             logging.error(f"{symbol} {action} FAILED: {e}")
         return False
 
-# ========================= POSITION SIZE CACHE (NEW) =========================
+# ========================= POSITION SIZE CACHE =========================
 async def get_position_sizes_cached(cli: AsyncClient, symbol: str, st: Dict[str, Any]) -> Tuple[float, float]:
     now = time.time()
     c = st.get("pos_cache") or {"ts": 0.0}
@@ -466,95 +395,64 @@ async def get_position_sizes_cached(cli: AsyncClient, symbol: str, st: Dict[str,
 async def set_position(cli: AsyncClient, symbol: str, target_signal: Optional[str]):
     st = state[symbol]
     async with st["order_lock"]:
-        if st["position_state"] != "IDLE":
-            return False
+        if st["position_state"] != "IDLE": return False
         st["position_state"] = "PROCESSING"
-
         try:
-            if _is_rest_blocked():
-                _note_rest_block()
-                return False
+            if _is_rest_blocked(): _note_rest_block(); return False
 
             long_size, short_size = await get_position_sizes_cached(cli, symbol, st)
             target_qty = symbol_target_qty(symbol)
-            current_price = st.get("last_price")
 
             success = True
-
             if target_signal in ("LONG", "SHORT"):
                 if target_signal == "LONG":
                     if short_size > 0.1:
-                        success &= await execute_order(cli, exit_short(symbol, short_size), symbol, "CLOSE SHORT")
+                        ok = await execute_order(cli, exit_short(symbol, short_size), symbol, "CLOSE SHORT")
+                        success &= ok
+                        if ok:
+                            logging.info(f"{symbol} ▶ EXITED SHORT (size={short_size})")
                     if success and long_size < target_qty * 0.9:
                         delta = max(0.0, target_qty - long_size)
                         if delta > 0:
-                            if await execute_order(cli, open_long(symbol, delta), symbol, "OPEN LONG"):
-                                trailing_params = {
-                                    "symbol": symbol,
-                                    "side": "SELL",
-                                    "type": "TRAILING_STOP_MARKET",
-                                    "quantity": quantize_qty(symbol, delta),
-                                    "callbackRate": str(CALLBACK_PERCENT),
-                                    "timeInForce": "GTC"
-                                }
-                                if DUAL_SIDE:
-                                    trailing_params["positionSide"] = "LONG"
-                                else:
-                                    trailing_params["reduceOnly"] = True
-                                if await execute_order(cli, trailing_params, symbol, "TRAILING STOP LONG"):
-                                    if current_price:
-                                        st["entry_price"] = current_price
-                                        logging.info(f"{symbol} LONG position opened with {CALLBACK_PERCENT}% trailing stop")
-                                else:
-                                    success = False
-                        else:
-                            logging.info(f"{symbol} LONG already at/above target; no top-up")
+                            ok = await execute_order(cli, open_long(symbol, delta), symbol, "OPEN LONG")
+                            success &= ok
+                            if ok:
+                                logging.info(f"{symbol} ▶ ENTERED LONG (added={delta}, target={target_qty})")
 
                 elif target_signal == "SHORT":
                     if long_size > 0.1:
-                        success &= await execute_order(cli, exit_long(symbol, long_size), symbol, "CLOSE LONG")
+                        ok = await execute_order(cli, exit_long(symbol, long_size), symbol, "CLOSE LONG")
+                        success &= ok
+                        if ok:
+                            logging.info(f"{symbol} ▶ EXITED LONG (size={long_size})")
                     if success and short_size < target_qty * 0.9:
                         delta = max(0.0, target_qty - short_size)
                         if delta > 0:
-                            if await execute_order(cli, open_short(symbol, delta), symbol, "OPEN SHORT"):
-                                trailing_params = {
-                                    "symbol": symbol,
-                                    "side": "BUY",
-                                    "type": "TRAILING_STOP_MARKET",
-                                    "quantity": quantize_qty(symbol, delta),
-                                    "callbackRate": str(CALLBACK_PERCENT),
-                                    "timeInForce": "GTC"
-                                }
-                                if DUAL_SIDE:
-                                    trailing_params["positionSide"] = "SHORT"
-                                else:
-                                    trailing_params["reduceOnly"] = True
-                                if await execute_order(cli, trailing_params, symbol, "TRAILING STOP SHORT"):
-                                    if current_price:
-                                        st["entry_price"] = current_price
-                                        logging.info(f"{symbol} SHORT position opened with {CALLBACK_PERCENT}% trailing stop")
-                                else:
-                                    success = False
-                        else:
-                            logging.info(f"{symbol} SHORT already at/above target; no top-up")
+                            ok = await execute_order(cli, open_short(symbol, delta), symbol, "OPEN SHORT")
+                            success &= ok
+                            if ok:
+                                logging.info(f"{symbol} ▶ ENTERED SHORT (added={delta}, target={target_qty})")
 
             if success:
                 st["consecutive_failures"] = 0
-                action = f"SET TO {target_signal}" if target_signal else "NO-OP"
-                logging.info(f"{symbol} POSITION {action}")
+                prev = st.get("current_signal")
+                if prev is None:
+                    logging.info(f"{symbol} ✅ POSITION OPENED → {target_signal}")
+                elif prev != target_signal:
+                    logging.info(f"{symbol} 🔁 POSITION FLIPPED {prev} → {target_signal}")
+                else:
+                    logging.info(f"{symbol} ✅ POSITION REINFORCED → {target_signal}")
             else:
                 st["consecutive_failures"] += 1
                 st["circuit_breaker_until"] = time.time() + (CIRCUIT_BREAKER_BASE_SEC * st["consecutive_failures"])
-
             return success
         finally:
             st["position_state"] = "IDLE"
 
-# ========================= PRICE FEED =========================
+# ========================= PRICE FEED (build 1m candles) =========================
 async def price_feed_loop(cli: AsyncClient):
     streams = [_stream_name(s) for s in SYMBOLS]
     url = f"wss://{_ws_host()}/stream?streams={'/'.join(streams)}"
-
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
@@ -562,28 +460,19 @@ async def price_feed_loop(cli: AsyncClient):
                 async for raw in ws:
                     try:
                         now = time.time()
-                        m = json.loads(raw)
-                        d = m.get("data", {})
-                        if not d:
-                            continue
-
+                        m = json.loads(raw); d = m.get("data", {})
+                        if not d: continue
                         sym = d.get("s")
-                        if not sym or sym not in state:
-                            continue
-
+                        if not sym or sym not in state: continue
                         p_str = d.get("p") or d.get("c") or d.get("ap") or d.get("a")
-                        if not p_str:
-                            continue
-
-                        price = float(p_str)
-                        st = state[sym]
+                        if not p_str: continue
+                        price = float(p_str); st = state[sym]
 
                         st["last_price"] = price
                         st["price_timestamp"] = now
-                        st["price_history"].append(price)
                         st["ws_last_heartbeat"] = now
 
-                        # maintain 1-min OHLC for Donchian
+                        # 1m OHLC
                         current_minute = _minute_bucket(now)
                         kl = st["klines"]
                         if not kl or kl[-1]["minute"] != current_minute:
@@ -596,85 +485,81 @@ async def price_feed_loop(cli: AsyncClient):
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
                         continue
-
         except Exception as e:
             logging.warning(f"WebSocket error: {e}. Reconnecting in 5s...")
             await asyncio.sleep(5)
 
-# ========================= POSITION WATCHER =========================
-async def position_watch_loop(cli: AsyncClient):
-    while True:
-        await asyncio.sleep(1.5)
-        if _is_rest_blocked():
-            continue
-        for sym in SYMBOLS:
-            try:
-                long_size, short_size = await get_position_sizes_cached(cli, sym, state[sym])
-                st = state[sym]
-                prev = st.get("current_signal")
-
-                # Exchange trailing stop closed LONG?
-                if prev == "LONG" and long_size < 0.1:
-                    st["current_signal"] = None
-                    px = st.get("last_price")
-                    if px:
-                        st["long_exit_history"].append(px)
-                    st["entry_price"] = None
-                    logging.info(f"{sym} POSITION EXITED on exchange (LONG -> None)")
-
-                # Exchange trailing stop closed SHORT?
-                if prev == "SHORT" and short_size < 0.1:
-                    st["current_signal"] = None
-                    px = st.get("last_price")
-                    if px:
-                        st["short_exit_history"].append(px)
-                    st["entry_price"] = None
-                    logging.info(f"{sym} POSITION EXITED on exchange (SHORT -> None)")
-
-            except RestBlockedError:
-                _note_rest_block()
-                break
-            except Exception as e:
-                logging.warning(f"{sym} watcher error: {e}")
-                continue
-
-# ========================= GROUPED GATES (ALL/ANY-style) =========================
+# ========================= GROUPED GATES =========================
 def gates_ok(st: Dict[str, Any]) -> Tuple[bool, str]:
     now = time.time()
     if st["last_price"] is None or now - st.get("price_timestamp", 0.0) > PRICE_STALENESS_SEC:
         return False, "stale price"
     if st["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES and now < st["circuit_breaker_until"]:
         return False, "circuit breaker"
-    if len(st["klines"]) < 50:
-        return False, "insufficient klines"
+    # require MIN_VALID_MINUTES completed 1m candles (even if seed failed)
+    kl = st["klines"]
+    if not kl: return False, "no klines"
+    cur_min = int(now // 60)
+    valid = [k for k in kl if k["minute"] < cur_min]
+    if len(valid) < MIN_VALID_MINUTES:
+        return False, f"insufficient klines ({len(valid)}/{MIN_VALID_MINUTES})"
     return True, "ok"
+
+# ========================= CONDITION SNAPSHOT & REPORTER =========================
+def condition_snapshot(symbol: str) -> str:
+    """One-line snapshot of current Donchian conditions."""
+    st = state[symbol]
+    price = st.get("last_price")
+    d_low, d_high = get_donchian_levels(symbol)
+    if price is None or d_low is None or d_high is None:
+        return f"{symbol}: waiting (insufficient data)"
+    # Breakout flags
+    brk_long  = price >= d_high - EPS
+    brk_short = price <= d_low  + EPS
+    # Bounce context
+    b_low, b_high = get_bounce_levels(d_low, d_high)
+    breach = st.get("bounce_breach_state", "NONE")
+    bnc_long  = (breach == "BREACHED_LOW"  and price >= b_low)
+    bnc_short = (breach == "BREACHED_HIGH" and price <= b_high)
+    return (f"{symbol}: px={price:.6f} | D[L,H]=[{d_low:.6f},{d_high:.6f}] "
+            f"| breakout(L/S)={(1 if brk_long else 0)}/{(1 if brk_short else 0)} "
+            f"| bounce(breach={breach}; conf L/S)={(1 if bnc_long else 0)}/{(1 if bnc_short else 0)}")
+
+async def condition_report_loop():
+    """Every 5 minutes, log a concise condition report per symbol."""
+    while True:
+        try:
+            logging.info("=== CONDITION REPORT (Donchian breakout/bounce) ===")
+            for sym in SYMBOLS:
+                try:
+                    logging.info(condition_snapshot(sym))
+                except Exception as e:
+                    logging.warning(f"{sym} condition snapshot error: {e}")
+        except Exception as e:
+            logging.warning(f"Condition reporter error: {e}")
+        await asyncio.sleep(300)  # 5 minutes
 
 # ========================= MAIN TRADING LOOP =========================
 async def trading_loop(cli: AsyncClient):
     while True:
         await asyncio.sleep(0.1)
-
         if _is_rest_blocked():
             continue
-
         now = time.time()
         for sym in SYMBOLS:
             st = state[sym]
+            ok, _ = gates_ok(st)
+            if not ok: continue
 
-            ok, reason = gates_ok(st)
-            if not ok:
-                # logging.debug(f"{sym} skip: {reason}")
-                continue
-
-            # reset circuit after timeout
+            # reset circuit breaker when elapsed
             if st["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES and now >= st["circuit_breaker_until"]:
                 st["consecutive_failures"] = 0
 
             new_signal = detect_signals(sym)
-            current = st["current_signal"]
+            current    = st["current_signal"]
 
-            # Open or flip
-            if (current is None and new_signal in ("LONG", "SHORT")) or (current in ("LONG", "SHORT") and new_signal in ("LONG", "SHORT") and new_signal != current):
+            if (current is None and new_signal in ("LONG", "SHORT")) or \
+               (current in ("LONG", "SHORT") and new_signal in ("LONG", "SHORT") and new_signal != current):
                 logging.info(f"{sym} SIGNAL: {current} -> {new_signal}")
                 try:
                     success = await set_position(cli, sym, new_signal)
@@ -696,8 +581,7 @@ async def init_filters(cli: AsyncClient):
         info = await call_binance(cli.futures_exchange_info)
         for s in info.get("symbols", []):
             sym = s["symbol"]
-            if sym not in SYMBOLS:
-                continue
+            if sym not in SYMBOLS: continue
             for f in s.get("filters", []):
                 if f.get("filterType") == "LOT_SIZE":
                     step = f.get("stepSize")
@@ -708,11 +592,12 @@ async def init_filters(cli: AsyncClient):
     except Exception as e:
         logging.warning(f"Filter initialization failed: {e}")
 
-async def seed_price_history(cli: AsyncClient):
+async def seed_klines(cli: AsyncClient):
+    """Seed last ~20h of 1m candles (OHLC) for all symbols."""
     for sym in SYMBOLS:
         try:
-            # Seed with (WMA_PERIOD + 100) 1m candles
-            klines = await call_binance(cli.futures_klines, symbol=sym, interval="1m", limit=WMA_PERIOD + 100)
+            # 20h * 60 = 1200; add a little buffer
+            klines = await call_binance(cli.futures_klines, symbol=sym, interval="1m", limit=DONCHIAN_HOURS*60)
             st = state[sym]
             for k in klines:
                 ts_open = float(k[0]) / 1000.0
@@ -720,14 +605,27 @@ async def seed_price_history(cli: AsyncClient):
                 high    = float(k[2])
                 low     = float(k[3])
                 close   = float(k[4])
-                st["price_history"].append(close)
                 st["klines"].append({"minute": minute, "time": ts_open, "high": high, "low": low, "close": close})
-            logging.info(f"{sym} seeded with {len(st['price_history'])} price points & {len(st['klines'])} candles")
+            logging.info(f"{sym} seeded with {len(st['klines'])} candles")
         except RestBlockedError:
-            _note_rest_block()
-            return
+            _note_rest_block(); return
         except Exception as e:
-            logging.warning(f"{sym} price history seeding failed: {e}")
+            logging.warning(f"{sym} kline seeding failed: {e}")
+
+async def try_seed_after_block(cli: AsyncClient):
+    """Retry seeding & sync when REST unblocks, so no manual restart needed."""
+    while True:
+        await asyncio.sleep(5)
+        if not rest_blocked():
+            try:
+                await seed_klines(cli)
+                await sync_position_state(cli)
+                logging.info("Post-block seed & sync completed.")
+                return
+            except RestBlockedError:
+                _note_rest_block()
+            except Exception as e:
+                logging.warning(f"Post-block seed/sync error: {e}")
 
 # ========================= MAIN =========================
 async def main():
@@ -743,34 +641,31 @@ async def main():
         try:
             DUAL_SIDE = await get_dual_side(cli)
         except RestBlockedError:
-            _note_rest_block()
-            DUAL_SIDE = False
+            _note_rest_block(); DUAL_SIDE = False
         logging.info(f"Hedge Mode: {'Enabled' if DUAL_SIDE else 'Disabled'}")
 
         for s in SYMBOLS:
             try:
                 await call_binance(cli.futures_change_leverage, symbol=s, leverage=LEVERAGE)
             except RestBlockedError:
-                _note_rest_block()
-                break
+                _note_rest_block(); break
             except Exception as e:
                 logging.warning(f"{s} leverage setting failed: {e}")
 
         await init_filters(cli)
-        await seed_price_history(cli)
-        await sync_position_state(cli)
+        await seed_klines(cli)          # may be blocked at startup
+        await sync_position_state(cli)  # may be blocked at startup
+        asyncio.create_task(try_seed_after_block(cli))  # keep trying in background
 
         feed_task    = asyncio.create_task(price_feed_loop(cli))
         trading_task = asyncio.create_task(trading_loop(cli))
-        watch_task   = asyncio.create_task(position_watch_loop(cli))
+        report_task  = asyncio.create_task(condition_report_loop())  # 5-min condition reports
 
-        await asyncio.gather(feed_task, trading_task, watch_task)
+        await asyncio.gather(feed_task, trading_task, report_task)
 
     finally:
-        try:
-            await cli.close_connection()
-        except Exception:
-            pass
+        try: await cli.close_connection()
+        except Exception: pass
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -779,11 +674,11 @@ if __name__ == "__main__":
         datefmt="%b %d %H:%M:%S"
     )
 
-    logging.info("=== DONCHIAN BREAKOUT + BOUNCE BOT (exchange trailing exits) ===")
+    logging.info("=== DONCHIAN-ONLY BOT (breakout + bounce, flip-only exits) ===")
     logging.info(f"ENTRY: Donchian {DONCHIAN_HOURS}h breakout or bounce (priority={SIGNAL_PRIORITY})")
-    logging.info(f"EXIT: ONLY {CALLBACK_PERCENT}% trailing callback (on-exchange)")
-    logging.info(f"Gates: grouped (stale price / circuit breaker / min klines) | Flip guard: {REFLIP_GUARD_SEC}s")
-    logging.info(f"REST backoff 403/429 | Log throttle {LOG_SUPPRESS_SECS}s | Size cache {POSITION_SIZE_TTL}s")
+    logging.info(f"EXIT: by FLIP only (no trailing/stop orders)")
+    logging.info(f"Gates: stale price / circuit breaker / >= {MIN_VALID_MINUTES} completed 1m candles")
+    logging.info(f"Flip guard: {REFLIP_GUARD_SEC}s | REST backoff 403/429 | Size cache {POSITION_SIZE_TTL}s")
     logging.info(f"Symbols: {list(SYMBOLS.keys())}")
 
     asyncio.run(main())
