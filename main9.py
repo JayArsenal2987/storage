@@ -273,11 +273,11 @@ def update_trading_signals(symbol: str) -> dict:
     - SHORT: price <= Donchian LOW  AND price < WMA10 AND ADX >= 25
     
     Phase 2 - PULLBACK FLIPPING with 1% BUFFER (once in position, need only 2 conditions):
-    - LONG → SHORT: price < WMA10 * 0.99 AND ADX >= 25 (1% below WMA10)
-    - SHORT → LONG: price > WMA10 * 1.01 AND ADX >= 25 (1% above WMA10)
+    - LONG → SHORT: price < WMA10 * 0.995 AND ADX >= 25 (0.5% below WMA10)
+    - SHORT → LONG: price > WMA10 * 1.005 AND ADX >= 25 (0.5% above WMA10)
     
     Never go FLAT again after initial entry - always LONG or SHORT!
-    1% buffer prevents whipsaw around WMA10 level.
+    0.5% buffer prevents whipsaw around WMA10 level.
     """
     st = state[symbol]
     price = st["price"]
