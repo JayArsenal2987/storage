@@ -32,10 +32,10 @@ PRECISIONS = {
 
 # Indicator settings
 DONCHIAN_PERIODS = 1200   # 20 hours (1200 minutes) for Donchian
-WMA20_PERIODS     = 1200  # 20 hours (1200 minutes) for 20h Weighted Moving Average (closes)
-ADX_PERIODS       = 1200  # ADX calculation window (20h)
-ADX_THRESHOLD     = 25    # Minimum ADX to allow trading
-KLINE_LIMIT       = 1300  # Keep last 1300 1m candles
+WMA10_PERIODS    = 600    # 10 hours (600 minutes) for 10h Weighted Moving Average (closes)
+ADX_PERIODS      = 1200   # ADX calculation window (20h)
+ADX_THRESHOLD    = 25     # Minimum ADX to allow trading
+KLINE_LIMIT      = 1300   # Keep last 1300 1m candles
 
 # ========================= STATE =========================
 state = {
@@ -45,10 +45,10 @@ state = {
         "current_signal": None,  # None, "LONG", "SHORT"
         "last_signal_change": 0,
         "current_position": 0.0,  # Current position size
-        "wma20": None,            # 20h Weighted MA (closes)
+        "wma10": None,            # 10h Weighted MA (closes)
         "adx": None,              # ADX value
         "adx_ready": False,       # ADX availability flag
-        "ready": False,           # True when Donchian+WMA20+ADX are available (ADX≥25)
+        "ready": False,           # True when Donchian+WMA10+ADX are available (ADX≥25)
         "last_exec_ts": 0.0,
         "last_target": None,
     }
@@ -190,9 +190,9 @@ def calculate_wma_close(symbol: str, period: int) -> Optional[float]:
     num     = sum(c * w for c, w in zip(closes, weights))
     wma_val = num / denom
 
-    # cache if it's the 20h WMA
-    if period == WMA20_PERIODS:
-        state[symbol]["wma20"] = wma_val
+    # cache if it's the 10h WMA
+    if period == WMA10_PERIODS:
+        state[symbol]["wma10"] = wma_val
 
     return wma_val
 
@@ -266,10 +266,18 @@ def calculate_adx(symbol: str) -> Optional[float]:
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
     """
-    Entry/Flip rules (no forced FLAT):
-    - LONG  when (price > Donchian LOW)  AND (price > WMA20) AND (ADX >= ADX_THRESHOLD)
-    - SHORT when (price < Donchian HIGH) AND (price < WMA20) AND (ADX >= ADX_THRESHOLD)
-    - Else: WAIT (keep current signal/position unchanged)
+    BREAKOUT ENTRY → PULLBACK FLIPPING Strategy with 1% Buffer
+    
+    Phase 1 - INITIAL ENTRY (from FLAT, need ALL 3 conditions):
+    - LONG:  price >= Donchian HIGH AND price > WMA10 AND ADX >= 25
+    - SHORT: price <= Donchian LOW  AND price < WMA10 AND ADX >= 25
+    
+    Phase 2 - PULLBACK FLIPPING with 1% BUFFER (once in position, need only 2 conditions):
+    - LONG → SHORT: price < WMA10 * 0.99 AND ADX >= 25 (1% below WMA10)
+    - SHORT → LONG: price > WMA10 * 1.01 AND ADX >= 25 (1% above WMA10)
+    
+    Never go FLAT again after initial entry - always LONG or SHORT!
+    1% buffer prevents whipsaw around WMA10 level.
     """
     st = state[symbol]
     price = st["price"]
@@ -279,32 +287,65 @@ def update_trading_signals(symbol: str) -> dict:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
     d_low, d_high = get_donchian_levels(symbol)
-    wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+    wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
     adx   = calculate_adx(symbol)
 
-    if d_low is None or d_high is None or wma20 is None or adx is None:
+    if d_low is None or d_high is None or wma10 is None or adx is None:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    adx_ok   = (adx >= ADX_THRESHOLD)
-    long_ok  = adx_ok and (price > d_low)  and (price > wma20)
-    short_ok = adx_ok and (price < d_high) and (price < wma20)
+    # Phase 1: BREAKOUT entry conditions (ALL 3 must be true)
+    adx_ok         = (adx >= ADX_THRESHOLD)
+    breakout_long  = adx_ok and (price >= d_high) and (price > wma10)   # 3 conditions for entry
+    breakout_short = adx_ok and (price <= d_low)  and (price < wma10)   # 3 conditions for entry
+    
+    # Phase 2: PULLBACK flipping conditions with 1% BUFFER (only 2 must be true)
+    pullback_to_short = (price < wma10 * 0.99) and adx_ok   # 1% below WMA10 + ADX
+    pullback_to_long  = (price > wma10 * 1.01) and adx_ok   # 1% above WMA10 + ADX
 
     new_signal = current_signal
-    if long_ok and current_signal != "LONG":
-        new_signal = "LONG"
-    elif short_ok and current_signal != "SHORT":
-        new_signal = "SHORT"
-    # else: WAIT (no change)
+    action_type = "NONE"
 
+    # PHASE 1: Initial entry from FLAT (need strong breakout signal)
+    if current_signal is None:
+        if breakout_long:
+            new_signal = "LONG"
+            action_type = "ENTRY"
+            logging.info(
+                f"🚀 {symbol} BREAKOUT ENTRY LONG "
+                f"(price {price:.6f} >= DonchianHIGH {d_high:.6f} & > WMA10 {wma10:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
+            )
+        elif breakout_short:
+            new_signal = "SHORT"
+            action_type = "ENTRY"
+            logging.info(
+                f"🚀 {symbol} BREAKOUT ENTRY SHORT "
+                f"(price {price:.6f} <= DonchianLOW {d_low:.6f} & < WMA10 {wma10:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
+            )
+    
+    # PHASE 2: Pullback flipping with 1% buffer (faster signals, only 2 conditions)
+    elif current_signal == "LONG" and pullback_to_short:
+        new_signal = "SHORT"
+        action_type = "PULLBACK_FLIP"
+        logging.info(
+            f"🔄 {symbol} PULLBACK FLIP LONG→SHORT "
+            f"(price {price:.6f} < WMA10*0.99 {wma10*0.99:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
+        )
+    elif current_signal == "SHORT" and pullback_to_long:
+        new_signal = "LONG"
+        action_type = "PULLBACK_FLIP"
+        logging.info(
+            f"🔄 {symbol} PULLBACK FLIP SHORT→LONG "
+            f"(price {price:.6f} > WMA10*1.01 {wma10*1.01:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
+        )
+    
+    # HOLD: All other cases (conditions not met, or price in 1% buffer zone)
+    # No action - new_signal stays as current_signal
+
+    # Update state if signal changed
     if new_signal != current_signal:
-        action = "FLIP" if current_signal in ("LONG", "SHORT") else "ENTRY"
         st["current_signal"] = new_signal
         st["last_signal_change"] = time.time()
-        logging.info(
-            f"🎯 {symbol} {action} {new_signal} "
-            f"(price {price:.6f} | Donchian {d_low:.6f}-{d_high:.6f} | WMA20 {wma20:.6f} | ADX {adx:.1f}≥{ADX_THRESHOLD})"
-        )
-        return {"changed": True, "action": action, "signal": new_signal}
+        return {"changed": True, "action": action_type, "signal": new_signal}
 
     return {"changed": False, "action": "NONE", "signal": current_signal}
 
@@ -349,16 +390,16 @@ async def price_feed_loop(client: AsyncClient):
                                 klines[-1]["low"]   = min(klines[-1]["low"],   price)
                                 klines[-1]["close"] = price
 
-                            # Readiness: require Donchian(20h) + WMA20 + ADX ≥ threshold
+                            # Readiness: require Donchian(20h) + WMA10 + ADX ≥ threshold
                             if len(klines) >= DONCHIAN_PERIODS and not state[symbol]["ready"]:
                                 dlow, dhigh = get_donchian_levels(symbol)
-                                wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+                                wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
                                 adx   = calculate_adx(symbol)
-                                if (dlow is not None) and (dhigh is not None) and (wma20 is not None) and (adx is not None and adx >= ADX_THRESHOLD):
+                                if (dlow is not None) and (dhigh is not None) and (wma10 is not None) and (adx is not None and adx >= ADX_THRESHOLD):
                                     state[symbol]["ready"] = True
                                     logging.info(
                                         f"✅ {symbol} ready for trading "
-                                        f"({len(klines)} candles, WMA20 {wma20:.6f}, ADX {adx:.1f}≥{ADX_THRESHOLD})"
+                                        f"({len(klines)} candles, WMA10 {wma10:.6f}, ADX {adx:.1f}≥{ADX_THRESHOLD})"
                                     )
                                 else:
                                     # ensure ADX keeps updating for display even if not ready yet
@@ -375,7 +416,7 @@ async def price_feed_loop(client: AsyncClient):
             await asyncio.sleep(5)
 
 async def status_logger():
-    """5-minute status with WMA20 + Donchian + ADX gating shown"""
+    """5-minute status showing Phase 1 (breakout entry) vs Phase 2 (pullback flipping) conditions"""
     while True:
         await asyncio.sleep(300)  # 5 minutes = 300 seconds
 
@@ -393,27 +434,55 @@ async def status_logger():
 
             price = st["price"]
             d_low, d_high = get_donchian_levels(symbol)
-            wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+            wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
             adx = st.get("adx")
 
-            if d_low and d_high and price and wma20:
+            if d_low and d_high and price and wma10:
                 current_sig = st["current_signal"] or "WAIT"
 
-                logging.info(f"{symbol}: Price={price:.6f} | WMA20={wma20:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'}")
+                logging.info(f"{symbol}: Price={price:.6f} | WMA10={wma10:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'}")
                 logging.info(f"  Donchian: LOW={d_low:.6f} HIGH={d_high:.6f}")
                 logging.info(f"  Signal: {current_sig}")
 
-                # Gate status
-                adx_ok   = (adx is not None and adx >= ADX_THRESHOLD)
-                long_ok  = adx_ok and (price > d_low)  and (price > wma20)
-                short_ok = adx_ok and (price < d_high) and (price < wma20)
-                logging.info(f"  LONG gates: price>DonchianLOW={price > d_low} | price>WMA20={price > wma20} | ADX≥{ADX_THRESHOLD}={adx_ok}")
-                logging.info(f"  SHORT gates: price<DonchianHIGH={price < d_high} | price<WMA20={price < wma20} | ADX≥{ADX_THRESHOLD}={adx_ok}")
+                # Show different conditions based on current phase
+                adx_ok         = (adx is not None and adx >= ADX_THRESHOLD)
+                breakout_long  = adx_ok and (price >= d_high) and (price > wma10)  # 3 conditions
+                breakout_short = adx_ok and (price <= d_low)  and (price < wma10)  # 3 conditions
+                pullback_short = (price < wma10 * 0.99) and adx_ok  # 2 conditions with 1% buffer
+                pullback_long  = (price > wma10 * 1.01) and adx_ok  # 2 conditions with 1% buffer
+                
+                if current_sig is None:  # FLAT - waiting for breakout entry
+                    logging.info(f"  📍 PHASE 1: Waiting for BREAKOUT ENTRY (need ALL 3 conditions):")
+                    logging.info(f"    LONG: price≥DonchianHIGH={price >= d_high} & price>WMA10={price > wma10} & ADX≥{ADX_THRESHOLD}={adx_ok} → {breakout_long}")
+                    logging.info(f"    SHORT: price≤DonchianLOW={price <= d_low} & price<WMA10={price < wma10} & ADX≥{ADX_THRESHOLD}={adx_ok} → {breakout_short}")
+                    
+                    if breakout_long:
+                        logging.info(f"    ⚡ BREAKOUT LONG signal ready!")
+                    elif breakout_short:
+                        logging.info(f"    ⚡ BREAKOUT SHORT signal ready!")
+                    else:
+                        logging.info(f"    ⏸️ WAITING: Breakout conditions not fully met")
+                        
+                else:  # IN POSITION - pullback flipping mode with 1% buffer
+                    flip_short_trigger = wma10 * 0.99
+                    flip_long_trigger = wma10 * 1.01
+                    
+                    logging.info(f"  📍 PHASE 2: In position, watching for PULLBACK FLIPS with 1% BUFFER:")
+                    logging.info(f"    FLIP to SHORT: price<{flip_short_trigger:.6f} (WMA10*0.99) & ADX≥{ADX_THRESHOLD}={adx_ok} → {pullback_short}")
+                    logging.info(f"    FLIP to LONG:  price>{flip_long_trigger:.6f} (WMA10*1.01) & ADX≥{ADX_THRESHOLD}={adx_ok} → {pullback_long}")
+                    
+                    if current_sig == "LONG" and pullback_short:
+                        logging.info(f"    ⚡ PULLBACK FLIP signal: LONG→SHORT ready!")
+                    elif current_sig == "SHORT" and pullback_long:
+                        logging.info(f"    ⚡ PULLBACK FLIP signal: SHORT→LONG ready!")
+                    else:
+                        buffer_zone = f"${flip_short_trigger:.2f} - ${flip_long_trigger:.2f}"
+                        logging.info(f"    ⏸️ HOLDING {current_sig}: Price in buffer zone ({buffer_zone}) or ADX too low")
 
         logging.info("📊 === END STATUS REPORT ===")
 
 async def trading_loop(client: AsyncClient):
-    """Main trading logic with instant execution (no forced FLAT)."""
+    """Main trading logic: breakout entry from FLAT, then pullback flipping forever."""
     while True:
         await asyncio.sleep(0.1)  # 10 FPS
 
@@ -433,8 +502,11 @@ async def trading_loop(client: AsyncClient):
                 final_position = target_size
             elif current_signal == "SHORT":
                 final_position = -target_size
+            elif current_signal is None:
+                # FLAT: Only at startup, waiting for first breakout entry
+                final_position = 0.0
             else:
-                # WAIT: keep current position unchanged (no flattening)
+                # Fallback: keep current position
                 final_position = st["current_position"]
 
             # Execute position change only when signal changed AND target differs
@@ -538,16 +610,16 @@ async def init_bot(client: AsyncClient):
     symbols_needing_data = []
     for symbol in SYMBOLS:
         klines = state[symbol]["klines"]
-        # Readiness requires Donchian+WMA20+ADX (ADX≥25)
+        # Readiness requires Donchian+WMA10+ADX (ADX≥25)
         d_ready  = len(klines) >= DONCHIAN_PERIODS and get_donchian_levels(symbol)[0] is not None
-        w_ready  = len(klines) >= WMA20_PERIODS and calculate_wma_close(symbol, WMA20_PERIODS) is not None
+        w_ready  = len(klines) >= WMA10_PERIODS and calculate_wma_close(symbol, WMA10_PERIODS) is not None
         a_value  = calculate_adx(symbol)  # compute ADX if possible
         a_ready  = (a_value is not None and a_value >= ADX_THRESHOLD)
 
         if d_ready and w_ready and a_ready:
             state[symbol]["ready"] = True
-            wma_val = state[symbol]["wma20"]
-            logging.info(f"✅ {symbol} ready for trading ({len(klines)} candles, WMA20: {wma_val:.6f}, ADX {a_value:.1f}≥{ADX_THRESHOLD}) from loaded data")
+            wma_val = state[symbol]["wma10"]
+            logging.info(f"✅ {symbol} ready for trading ({len(klines)} candles, WMA10: {wma_val:.6f}, ADX {a_value:.1f}≥{ADX_THRESHOLD}) from loaded data")
         else:
             symbols_needing_data.append(symbol)
             logging.info(f"📥 {symbol} needs historical data ({len(klines)}/{DONCHIAN_PERIODS} candles)")
@@ -567,7 +639,7 @@ async def init_bot(client: AsyncClient):
                     client.futures_mark_price_klines,
                     symbol=symbol,
                     interval="1m",
-                    limit=max(DONCHIAN_PERIODS, WMA20_PERIODS) + 50
+                    limit=max(DONCHIAN_PERIODS, WMA10_PERIODS) + 50
                 )
 
                 # Process the data
@@ -585,13 +657,13 @@ async def init_bot(client: AsyncClient):
 
                 # Mark as ready if key indicators are available (with ADX ≥ threshold)
                 d_ok  = get_donchian_levels(symbol)[0] is not None
-                w_ok  = calculate_wma_close(symbol, WMA20_PERIODS) is not None
+                w_ok  = calculate_wma_close(symbol, WMA10_PERIODS) is not None
                 a_val = calculate_adx(symbol)
                 a_ok  = (a_val is not None and a_val >= ADX_THRESHOLD)
 
                 if d_ok and w_ok and a_ok:
                     st["ready"] = True
-                    logging.info(f"✅ {symbol} ready for trading ({len(st['klines'])} candles, WMA20: {st['wma20']:.6f}, ADX {a_val:.1f}≥{ADX_THRESHOLD}) from API")
+                    logging.info(f"✅ {symbol} ready for trading ({len(st['klines'])} candles, WMA10: {st['wma10']:.6f}, ADX {a_val:.1f}≥{ADX_THRESHOLD}) from API")
                     successful_fetches += 1
                 else:
                     logging.warning(f"⚠️ {symbol} insufficient data received ({len(st['klines'])} candles)")
@@ -660,14 +732,23 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S"
     )
 
-    print("=" * 70)
-    print("🤖 DONCHIAN(20h) + 20h WMA + ADX BOT (No FLAT — Wait if no signal)")
-    print("=" * 70)
-    print("📈 LONG:  price > 20h Donchian LOW  AND price > 20h WMA  AND ADX ≥ 25")
-    print("📉 SHORT: price < 20h Donchian HIGH AND price < 20h WMA  AND ADX ≥ 25")
-    print("⏱️ Live checks via markPrice@1s; 1m candles drive Donchian/WMA20/ADX")
+    print("=" * 80)
+    print("🤖 BREAKOUT ENTRY → PULLBACK FLIPPING BOT (with 1% Buffer)")
+    print("=" * 80)
+    print("📍 PHASE 1 - BREAKOUT ENTRY (from FLAT, need ALL 3 conditions):")
+    print("   🚀 LONG:  price ≥ 20h Donchian HIGH  AND price > 10h WMA  AND ADX ≥ 25")
+    print("   🚀 SHORT: price ≤ 20h Donchian LOW   AND price < 10h WMA  AND ADX ≥ 25")
+    print("")
+    print("📍 PHASE 2 - PULLBACK FLIPPING with 1% BUFFER (need only 2 conditions):")
+    print("   🔄 LONG → SHORT: price < 10h WMA * 0.99  AND  ADX ≥ 25")
+    print("   🔄 SHORT → LONG: price > 10h WMA * 1.01  AND  ADX ≥ 25")
+    print("")
+    print("🛡️ 0.5% BUFFER prevents whipsaw - creates 'dead zone' around WMA10")
+    print("💡 STRATEGY: Strong breakout to enter, buffered pullback signals to flip")
+    print("❌ NEVER go FLAT again after first entry - always LONG or SHORT!")
+    print("⏱️ Live checks via markPrice@1s; 1m candles drive indicators")
     print("📊 Data persistence enabled - faster restarts after first run")
     print(f"📊 Symbols: {list(SYMBOLS.keys())}")
-    print("=" * 70)
+    print("=" * 80)
 
     asyncio.run(main())
