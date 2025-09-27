@@ -1,730 +1,673 @@
 #!/usr/bin/env python3
-import os, json, asyncio, threading, logging, random, websockets
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
+import os, json, asyncio, logging, websockets, time
+import atexit  # Added for auto-save
 from binance import AsyncClient
 from collections import deque
-import time
+from typing import Optional, Tuple
+from dotenv import load_dotenv
 
-# ────────────── CONFIG ──────────────
+# ========================= CONFIG =========================
 load_dotenv()
-API_KEY    = os.getenv("BINANCE_API_KEY")
+API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
+# Trading symbols and sizes
 SYMBOLS = {
-    "ADAUSDT": 10
+    "BTCUSDT": 0.001,
+    "ETHUSDT": 0.01,
+    "BNBUSDT": 0.03,
+    "XRPUSDT": 10.0,
+    "SOLUSDT": 0.1,
+    "ADAUSDT": 10.0,
+    "DOGEUSDT": 40.0,
+    "TRXUSDT": 20.0,
 }
 
-# Rolling windows
-HISTORICAL_PERIOD_MINUTES = 720      # 720 × 1m candles
-TICK_ROLLING_WINDOW_SECS   = 720*60  # previous second → 720 minutes ago (true rolling)
+# Hardcoded precisions to avoid API calls
+PRECISIONS = {
+    "BTCUSDT": 3, "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1,
+    "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
+}
 
-SWING_THRESHOLD_PCT = 0.02           # 2% breakout threshold
-ANALYSIS_INTERVAL_SECONDS = 60       # (kept) timer; real-time path handles entries
+# Indicator settings
+DONCHIAN_PERIODS = 1200   # 20 hours (1200 minutes) for Donchian
+WMA20_PERIODS     = 1200  # 20 hours (1200 minutes) for 20h Weighted Moving Average (closes)
+ADX_PERIODS       = 1200  # ADX calculation window (20h)
+ADX_THRESHOLD     = 25    # Minimum ADX to allow trading
+KLINE_LIMIT       = 1300  # Keep last 1300 1m candles
 
-# Trailing stop configuration
-TRAIL_PCT = 0.02                 # 2%
-FLIP_COOLDOWN_SECS = 1.0
-
-USE_EXCHANGE_TRAILING = True
-WORKING_TYPE = "MARK_PRICE"
-CALLBACK_RATE = round(TRAIL_PCT * 100, 1)
-
-# ROE tighten-only tiers (as requested)
-DYNAMIC_TRAIL_RULES = [
-    (25.0,  2.0),
-    (50.0,  1.5),
-    (75.0,  1.0),
-    (100.0, 0.5),
-]
-DYNAMIC_TRAIL_RULES_LOSS = [
-    (-25.0,  2.0),
-    (-50.0,  1.5),
-    (-75.0,  1.0),
-    (-100.0, 0.5),
-]
-
-# Flip confirmation
-CONFIRM_FLIP = True
-CONFIRM_WINDOW_SECS = 2
-CONFIRM_LOOKBACK_MIN = 60
-CONFIRM_BREAK_PCT = 0.0
-
-ORDER_DEDUP_WINDOW_SECS = 1.5
-
-# WebSocket hardening & rate-limit avoidance
-WS_PING_INTERVAL = 15
-WS_PING_TIMEOUT  = 10
-WS_RECONNECT_MIN = 1.0
-WS_RECONNECT_MAX = 30.0
-
-POSITION_SYNC_INTERVAL_SECS = 60
-REST_SYNC_IF_STALE_SECS     = 600  # only REST-sync if no ACCOUNT_UPDATE for ≥10 min
-
-def _jitter(t): return t * (0.9 + 0.2 * random.random())
-
-# ────────────── QUIET /ping ──────────
-class Ping(BaseHTTPRequestHandler):
-    def do_GET(self, *args, **kwargs):
-        if self.path == "/ping":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"pong")
-    def log_message(self, *_) : pass
-
-def start_ping():
-    HTTPServer(("0.0.0.0", 10000), Ping).serve_forever()
-
-# ─────────── ROE helpers ───────────
-def _pnl_percent(entry_price, price, leverage, side):
-    if entry_price is None or price is None: return None
-    if side == "LONG":
-        return leverage * ((price / entry_price) - 1.0) * 100.0
-    else:
-        return leverage * (1.0 - (price / entry_price)) * 100.0
-
-def _target_callback_rate(pnl_pct):
-    if pnl_pct is None: return None
-    target = None
-    if pnl_pct >= 0.0:
-        for thr, cb in DYNAMIC_TRAIL_RULES:
-            if pnl_pct >= thr: target = cb
-            else: break
-    else:
-        for thr, cb in DYNAMIC_TRAIL_RULES_LOSS:
-            if pnl_pct <= thr: target = cb
-            else: break
-    return target
-
-# ───────────── SWING FINDER (plateau-inclusive; kept) ─────────
-def find_swing_points(candles, swing_period=5, mode="causal"):
-    """
-    Inclusive (<=/>=) so plateaus count. Causal mode lets the newest bar be a swing.
-    Candle: [open_time, open, high, low, close, volume]
-    """
-    n = len(candles)
-    if n == 0: return [], []
-    highs = [c[2] for c in candles]; lows = [c[3] for c in candles]
-    swing_highs, swing_lows = [], []
-
-    if mode == "symmetric":
-        if n < swing_period*2 + 1: return [], []
-        for i in range(swing_period, n - swing_period):
-            h, l = highs[i], lows[i]
-            if all(highs[j] <= h for j in range(i - swing_period, i + swing_period + 1) if j != i):
-                swing_highs.append((h, i))
-            if all(lows[j]  >= l for j in range(i - swing_period, i + swing_period + 1) if j != i):
-                swing_lows.append((l, i))
-    else:  # causal (look-back k bars only)
-        if n < swing_period + 1: return [], []
-        for i in range(swing_period, n):
-            h, l = highs[i], lows[i]
-            if all(x <= h for x in highs[i - swing_period:i]): swing_highs.append((h, i))
-            if all(x >= l for x in lows [i - swing_period:i]): swing_lows.append((l, i))
-    return swing_highs, swing_lows
-
-def analyze_rolling_swings(candles, current_price, symbol):
-    # Kept for reference and confirmation logic; not used for tick-level entry
-    highs, lows = find_swing_points(candles, swing_period=5, mode="causal")
-    if not highs and not lows:
-        logging.warning(f"{symbol} No swing points found (1m causal)."); return None
-    recent_high = max(highs, key=lambda x: x[1])[0] if highs else None
-    recent_low  = max(lows , key=lambda x: x[1])[0] if lows  else None
-    state[symbol]["current_swing_high"] = recent_high
-    state[symbol]["current_swing_low"]  = recent_low
-    if recent_high and current_price >= recent_high * (1 + SWING_THRESHOLD_PCT): return "LONG"
-    if recent_low  and current_price <= recent_low  * (1 - SWING_THRESHOLD_PCT): return "SHORT"
-    return None
-
-# ───────────── ORDERS ─────────
-def open_long(sym):  return dict(symbol=sym, side="BUY",  type="MARKET", quantity=SYMBOLS[sym], positionSide="LONG")
-def close_long(sym): return dict(symbol=sym, side="SELL", type="MARKET", quantity=SYMBOLS[sym], positionSide="LONG",  reduceOnly=True)
-def open_short(sym): return dict(symbol=sym, side="SELL", type="MARKET", quantity=SYMBOLS[sym], positionSide="SHORT")
-def close_short(sym):return dict(symbol=sym, side="BUY",  type="MARKET", quantity=SYMBOLS[sym], positionSide="SHORT", reduceOnly=True)
-
-async def cancel_trailing_stop(cli: AsyncClient, symbol: str, side: str):
-    try:
-        orders = await cli.futures_get_open_orders(symbol=symbol)
-        for o in orders:
-            if o.get("origType") == "TRAILING_STOP_MARKET" and o.get("positionSide") == side:
-                await cli.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                logging.info(f"{symbol} {side} canceled trailing stop {o['orderId']}")
-    except Exception as e:
-        logging.error(f"{symbol} {side} cancel trailing stop failed: {e}")
-
-async def place_trailing_stop(cli: AsyncClient, symbol: str, side: str, callback_rate: float = None):
-    try:
-        qty = await get_position_size(cli, symbol, side)
-        if qty <= 0: return False
-        await cancel_trailing_stop(cli, symbol, side)
-        order_side = "SELL" if side == "LONG" else "BUY"
-        cb = CALLBACK_RATE if callback_rate is None else float(callback_rate)
-        cb = round(cb, 1)
-        res = await cli.futures_create_order(
-            symbol=symbol, side=order_side, positionSide=side, type="TRAILING_STOP_MARKET",
-            quantity=qty, callbackRate=cb, workingType=WORKING_TYPE, newOrderRespType="RESULT"
-        )
-        st = state[symbol]
-        st["server_trailing_active"] = True
-        st["server_trailing_order_id"] = res.get("orderId")
-        st["server_trailing_cb_rate"] = cb
-        logging.info(f"{symbol} {side} trailing stop placed @ {cb}% (order {res.get('orderId')})")
-        return True
-    except Exception as e:
-        logging.error(f"{symbol} {side} place trailing stop failed: {e}")
-        return False
-
-# ───────────── STATE ─────────
+# ========================= STATE =========================
 state = {
-    s: {
-        "in_long": False, "long_pending": False,
-        "in_short": False, "short_pending": False,
-        "long_entry_price": None, "short_entry_price": None,
-        "current_swing_high": None, "current_swing_low": None,
-        "last_analysis_time": 0, "current_signal": None,
-        "initial_position_taken": False,
-        "trail_extremum": None, "trail_side": None,
-        "cooldown_until": 0.0,
-        "last_price": None, "order_lock": asyncio.Lock(),
-        "last_order_id": None,
-        # server trailing
-        "server_trailing_active": False,
-        "server_trailing_order_id": None,
-        "server_trailing_cb_rate": None,
-        # local trailing (decimal)
-        "local_trail_pct": None,
-        # flip confirm
-        "confirm_active": False, "confirm_until": 0.0,
-        "confirm_side": None, "confirm_swing_level": None,
-        # de-dup
-        "last_action_ts": {}, "last_ts_filled_id": None,
-        # 1m candles (for context & confirmation)
-        "candles": deque(maxlen=HISTORICAL_PERIOD_MINUTES), "history_loaded": False,
-        # tick-level rolling extremes (second resolution)
-        "tick_prices": deque(),     # (ts_sec, price)
-        "tick_maxdq": deque(),      # monotonic decreasing (ts, price)
-        "tick_mindq": deque(),      # monotonic increasing (ts, price)
-        "rolling_high": None, "rolling_low": None,
-        # ws-first position sync
-        "last_account_update_ts": 0.0,
+    symbol: {
+        "price": None,
+        "klines": deque(maxlen=KLINE_LIMIT),
+        "current_signal": None,  # None, "LONG", "SHORT"
+        "last_signal_change": 0,
+        "current_position": 0.0,  # Current position size
+        "wma20": None,            # 20h Weighted MA (closes)
+        "adx": None,              # ADX value
+        "adx_ready": False,       # ADX availability flag
+        "ready": False,           # True when Donchian+WMA20+ADX are available (ADX≥25)
+        "last_exec_ts": 0.0,
+        "last_target": None,
     }
-    for s in SYMBOLS
+    for symbol in SYMBOLS
 }
 
-# ───────────── POSITION HELPERS ─────────
-async def get_position_size(cli: AsyncClient, symbol: str, side: str) -> float:
+# Rate limiting
+api_calls_count = 0
+api_calls_reset_time = time.time()
+
+# ========================= PERSISTENCE FUNCTIONS =========================
+def save_klines():
+    """Save klines to JSON on shutdown"""
+    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}  # Convert deque to list for JSON
+    with open('klines.json', 'w') as f:
+        json.dump(save_data, f)
+    logging.info("📥 Saved klines to klines.json")
+
+def load_klines():
+    """Load klines from JSON on startup"""
     try:
-        positions = await cli.futures_position_information(symbol=symbol)
-        for pos in positions:
-            if pos['positionSide'] == side:
-                return abs(float(pos['positionAmt']))
+        with open('klines.json', 'r') as f:
+            load_data = json.load(f)
+        for sym in SYMBOLS:
+            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)  # Restore as deque
+        logging.info("📤 Loaded klines from klines.json")
+    except FileNotFoundError:
+        logging.info("No klines.json found - starting fresh")
     except Exception as e:
-        logging.error(f"Failed to get position for {symbol} {side}: {e}")
-    return 0.0
+        logging.error(f"Failed to load klines: {e} - starting fresh")
 
-async def get_position_sizes(cli: AsyncClient, symbol: str):
-    long_sz = short_sz = 0.0
+# ========================= HELPERS =========================
+def round_size(size: float, symbol: str) -> float:
+    """Round position size to appropriate precision"""
+    prec = PRECISIONS.get(symbol, 3)
+    return round(size, prec)
+
+async def safe_api_call(func, *args, **kwargs):
+    """Make API call with exponential backoff for rate limiting"""
+    global api_calls_count, api_calls_reset_time
+
+    # Reset counter every minute
+    now = time.time()
+    if now - api_calls_reset_time > 60:
+        api_calls_count = 0
+        api_calls_reset_time = now
+
+    # Limit API calls to 10 per minute (very conservative)
+    if api_calls_count >= 10:
+        wait_time = 60 - (now - api_calls_reset_time)
+        if wait_time > 0:
+            logging.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+            await asyncio.sleep(wait_time)
+            api_calls_count = 0
+            api_calls_reset_time = time.time()
+
+    # Exponential backoff retry logic
+    for attempt in range(3):
+        try:
+            api_calls_count += 1
+            result = await func(*args, **kwargs)
+            return result
+        except Exception as e:
+            if "-1003" in str(e) or "Way too many requests" in str(e):
+                wait_time = (2 ** attempt) * 60  # 1min, 2min, 4min
+                logging.warning(f"Rate limited, attempt {attempt+1}/3, waiting {wait_time}s")
+                await asyncio.sleep(wait_time)
+            else:
+                raise e
+
+    raise Exception("Max API retry attempts reached")
+
+async def place_order(client: AsyncClient, symbol: str, side: str, quantity: float, action: str):
+    """Place market order with rate limiting"""
     try:
-        positions = await cli.futures_position_information(symbol=symbol)
-        for pos in positions:
-            ps = pos.get('positionSide'); amt = abs(float(pos.get('positionAmt', 0)))
-            if ps == "LONG":  long_sz  = amt
-            if ps == "SHORT": short_sz = amt
-    except Exception as e:
-        logging.error(f"Failed to get positions for {symbol}: {e}")
-    return long_sz, short_sz
+        quantity = round_size(abs(quantity), symbol)
+        if quantity == 0:
+            return True
 
-def _dedup_key(symbol: str, action: str, order_params: dict) -> str:
-    return f"{symbol}|{action}|{order_params.get('side')}|{order_params.get('type')}|{order_params.get('positionSide')}|{order_params.get('reduceOnly', False)}"
+        # Determine positionSide based on action
+        if "LONG" in action:
+            position_side = "LONG"
+        elif "SHORT" in action:
+            position_side = "SHORT"
+        else:
+            logging.error(f"Unknown action type: {action}")
+            return False
 
-def _new_coid(symbol: str, action: str) -> str:
-    return f"{symbol}-{action}-{int(time.time()*1000)}"
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": quantity,
+            "positionSide": position_side
+        }
 
-async def safe_order_execution(cli: AsyncClient, order_params: dict, symbol: str, action: str) -> bool:
-    try:
-        now = time.time()
-        st = state[symbol]
-        key = _dedup_key(symbol, action, order_params)
-        if now - st["last_action_ts"].get(key, 0.0) < ORDER_DEDUP_WINDOW_SECS:
-            logging.warning(f"{symbol} {action}: skipped duplicate within {ORDER_DEDUP_WINDOW_SECS}s"); return False
-        st["last_action_ts"][key] = now
-
-        if action.startswith("CLOSE") or "EXIT" in action:
-            side = "LONG" if "LONG" in action else "SHORT"
-            current_pos = await get_position_size(cli, symbol, side)
-            if current_pos < order_params['quantity'] * 0.99:
-                logging.warning(f"{symbol} {action}: insufficient position size"); return False
-
-        p = dict(order_params); p.setdefault("newClientOrderId", _new_coid(symbol, action))
-        result = await cli.futures_create_order(**p)
-        st["last_order_id"] = result.get('orderId')
-        logging.info(f"{symbol} {action} executed - OrderID: {st['last_order_id']}")
+        result = await safe_api_call(client.futures_create_order, **params)
+        logging.info(f"🚀 {symbol} {action} EXECUTED - {side} {quantity} - OrderID: {result.get('orderId')}")
         return True
+
     except Exception as e:
-        logging.error(f"{symbol} {action} failed: {e}")
+        logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
 
-# ───────────── ROLLING (1m) ANALYSIS ─────────
-async def perform_rolling_analysis(cli: AsyncClient, symbol: str, current_price: float):
-    try:
-        buf = state[symbol]["candles"]
-        candles = list(buf) if buf and len(buf) >= 6 else [
-            [int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
-            for k in await cli.get_klines(symbol=symbol, interval="1m", limit=HISTORICAL_PERIOD_MINUTES)
-        ]
-        signal = analyze_rolling_swings(candles, current_price, symbol)
-        st = state[symbol]; st["current_signal"] = signal; st["last_analysis_time"] = time.time()
-        return signal
-    except Exception as e:
-        logging.error(f"{symbol} Rolling analysis failed: {e}")
-        return None
+# ========================= INDICATOR CALCULATIONS =========================
+def get_donchian_levels(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """Get Donchian channel high/low from last N (completed) 1m periods"""
+    klines = state[symbol]["klines"]
 
-# ───────────── ENTRY/EXIT HELPERS ─────────
-async def enter_long(cli: AsyncClient, sym: str, price: float, reason: str = ""):
-    st = state[sym]
-    async with st["order_lock"]:
-        if st["in_long"] or st["long_pending"] or st["in_short"] or st["short_pending"]: return False
-        st["long_pending"] = True
-    try:
-        if await safe_order_execution(cli, open_long(sym), sym, f"LONG ENTRY {reason}"):
-            st["in_long"] = True; st["long_entry_price"] = price
-            st["trail_side"] = "LONG"; st["trail_extremum"] = price; st["local_trail_pct"] = TRAIL_PCT
-            if USE_EXCHANGE_TRAILING: await place_trailing_stop(cli, sym, "LONG", CALLBACK_RATE)
-            logging.info(f"{sym} LONG OPEN @ ${price:.4f} | trailing {CALLBACK_RATE}%"); return True
-    finally:
-        st["long_pending"] = False
-    return False
-
-async def enter_short(cli: AsyncClient, sym: str, price: float, reason: str = ""):
-    st = state[sym]
-    async with st["order_lock"]:
-        if st["in_short"] or st["short_pending"] or st["in_long"] or st["long_pending"]: return False
-        st["short_pending"] = True
-    try:
-        if await safe_order_execution(cli, open_short(sym), sym, f"SHORT ENTRY {reason}"):
-            st["in_short"] = True; st["short_entry_price"] = price
-            st["trail_side"] = "SHORT"; st["trail_extremum"] = price; st["local_trail_pct"] = TRAIL_PCT
-            if USE_EXCHANGE_TRAILING: await place_trailing_stop(cli, sym, "SHORT", CALLBACK_RATE)
-            logging.info(f"{sym} SHORT OPEN @ ${price:.4f} | trailing {CALLBACK_RATE}%"); return True
-    finally:
-        st["short_pending"] = False
-    return False
-
-async def manage_initial_position(cli: AsyncClient, sym: str, price: float, signal: str):
-    st = state[sym]
-    if st["initial_position_taken"]: return
-    if signal == "LONG" and not st["in_long"] and not st["in_short"]:
-        if await enter_long(cli, sym, price, "(SIGNAL)"):
-            st["initial_position_taken"] = True; logging.info(f"{sym} INITIAL LONG")
-    elif signal == "SHORT" and not st["in_short"] and not st["in_long"]:
-        if await enter_short(cli, sym, price, "(SIGNAL)"):
-            st["initial_position_taken"] = True; logging.info(f"{sym} INITIAL SHORT")
-
-# ───────────── LOCAL TRAILING (fallback) ─────────
-async def handle_trailing_stops(cli: AsyncClient, sym: str, price: float):
-    st = state[sym]
-    if USE_EXCHANGE_TRAILING and st.get("server_trailing_active"): return
-    side = st["trail_side"]
-    if side not in ("LONG","SHORT") or not st["initial_position_taken"]: return
-
-    entry = st["long_entry_price"] if side == "LONG" else st["short_entry_price"]
-    pnl = _pnl_percent(entry, price, LEVERAGE, side)
-    target_cb = _target_callback_rate(pnl)
-    if st["local_trail_pct"] is None: st["local_trail_pct"] = TRAIL_PCT
-    if target_cb is not None:
-        target_dec = target_cb / 100.0
-        if target_dec < st["local_trail_pct"]:
-            prev = st["local_trail_pct"]; st["local_trail_pct"] = target_dec
-            logging.info(f"{sym} {side} local trailing tightened: {prev*100:.1f}% → {st['local_trail_pct']*100:.1f}% (ROE {pnl:.2f}%)")
-
-    now = time.time()
-    if st["cooldown_until"] and now < st["cooldown_until"]:
-        if side == "LONG":
-            if st["trail_extremum"] is None or price > st["trail_extremum"]: st["trail_extremum"] = price
-        else:
-            if st["trail_extremum"] is None or price < st["trail_extremum"]: st["trail_extremum"] = price
-        return
-
-    dist = st["local_trail_pct"]
-    if side == "LONG":
-        if st["trail_extremum"] is None or price > st["trail_extremum"]: st["trail_extremum"] = price
-        trigger_price = st["trail_extremum"] * (1 - dist)
-        if price <= trigger_price:
-            async with st["order_lock"]:
-                if st["long_pending"] or st["short_pending"]: return
-                st["long_pending"] = True
-            try:
-                if await safe_order_execution(cli, close_long(sym), sym, "LONG EXIT (TRAIL)"):
-                    st["in_long"] = False; st["long_entry_price"] = None
-                    st["trail_side"] = None; st["trail_extremum"] = None; st["local_trail_pct"] = None
-            finally:
-                st["long_pending"] = False
-    else:
-        if st["trail_extremum"] is None or price < st["trail_extremum"]: st["trail_extremum"] = price
-        trigger_price = st["trail_extremum"] * (1 + dist)
-        if price >= trigger_price:
-            async with st["order_lock"]:
-                if st["short_pending"] or st["long_pending"]: return
-                st["short_pending"] = True
-            try:
-                if await safe_order_execution(cli, close_short(sym), sym, "SHORT EXIT (TRAIL)"):
-                    st["in_short"] = False; st["short_entry_price"] = None
-                    st["trail_side"] = None; st["trail_extremum"] = None; st["local_trail_pct"] = None
-            finally:
-                st["short_pending"] = False
-
-# ───────────── Exchange trailing tightener ─────────
-async def dynamic_trailing_scheduler(cli: AsyncClient):
-    while True:
-        try:
-            if not USE_EXCHANGE_TRAILING: await asyncio.sleep(1.0); continue
-            for symbol in SYMBOLS:
-                st = state[symbol]
-                if not st.get("server_trailing_active"): continue
-                if st.get("in_long"):  side, entry = "LONG",  st.get("long_entry_price")
-                elif st.get("in_short"): side, entry = "SHORT", st.get("short_entry_price")
-                else: continue
-                price = st.get("last_price")
-                pnl = _pnl_percent(entry, price, LEVERAGE, side)
-                target_cb = _target_callback_rate(pnl)
-                if target_cb is None: continue
-                current_cb = st.get("server_trailing_cb_rate") or CALLBACK_RATE
-                if target_cb < current_cb:
-                    ok = await place_trailing_stop(cli, symbol, side, callback_rate=target_cb)
-                    if ok: logging.info(f"{symbol} {side} tightened trailing: {current_cb:.1f}% → {target_cb:.1f}% (ROE {pnl:.2f}%)")
-        except Exception as e:
-            logging.error(f"dynamic_trailing_scheduler error: {e}")
-        await asyncio.sleep(1.0)
-
-# ───────────── 60s timer (kept) ─────────
-async def rolling_analysis_scheduler(cli: AsyncClient):
-    while True:
-        try:
-            for symbol in SYMBOLS:
-                st = state[symbol]; current_price = st["last_price"]
-                if st["initial_position_taken"] or current_price is None: continue
-                now = time.time()
-                if now - st["last_analysis_time"] >= ANALYSIS_INTERVAL_SECONDS:
-                    logging.info(f"{symbol} Running timer-based initial direction check")
-                    signal = await perform_rolling_analysis(cli, symbol, current_price)
-                    if signal: await manage_initial_position(cli, symbol, current_price, signal)
-            await asyncio.sleep(10)
-        except Exception as e:
-            logging.error(f"Rolling analysis scheduler error: {e}")
-            await asyncio.sleep(30)
-
-# ───────────── WS-first position sync; REST fallback ─────────
-async def position_sync_scheduler(cli: AsyncClient):
-    while True:
-        try:
-            now = time.time()
-            for symbol in SYMBOLS:
-                st = state[symbol]
-                if now - st.get("last_account_update_ts", 0) < REST_SYNC_IF_STALE_SECS:
-                    continue
-                long_sz, short_sz = await get_position_sizes(cli, symbol)
-                if long_sz <= 0 and st["in_long"]:
-                    st["in_long"] = False; st["trail_side"] = None; st["trail_extremum"] = None
-                    st["server_trailing_active"] = False; st["server_trailing_order_id"] = None
-                    st["server_trailing_cb_rate"] = None; st["local_trail_pct"] = None
-                    st["initial_position_taken"] = False
-                    logging.info(f"{symbol} LONG flat (rest-sync).")
-                if short_sz <= 0 and st["in_short"]:
-                    st["in_short"] = False; st["trail_side"] = None; st["trail_extremum"] = None
-                    st["server_trailing_active"] = False; st["server_trailing_order_id"] = None
-                    st["server_trailing_cb_rate"] = None; st["local_trail_pct"] = None
-                    st["initial_position_taken"] = False
-                    logging.info(f"{symbol} SHORT flat (rest-sync).")
-        except Exception as e:
-            logging.error(f"position sync error: {e}")
-        await asyncio.sleep(POSITION_SYNC_INTERVAL_SECS)
-
-# ───────────── TICK-LEVEL ROLLING EXTREMA (new) ─────────
-def _tick_extrema_push(st, ts_sec: int, price: float):
-    """Push a price into the second-level rolling window and prune old entries."""
-    dq = st["tick_prices"]; maxdq = st["tick_maxdq"]; mindq = st["tick_mindq"]
-    dq.append((ts_sec, price))
-    while maxdq and maxdq[-1][1] < price: maxdq.pop()
-    maxdq.append((ts_sec, price))
-    while mindq and mindq[-1][1] > price: mindq.pop()
-    mindq.append((ts_sec, price))
-    cutoff = ts_sec - TICK_ROLLING_WINDOW_SECS
-    while dq and dq[0][0] < cutoff:
-        ots, op = dq.popleft()
-        if maxdq and maxdq[0][0] == ots and maxdq[0][1] == op: maxdq.popleft()
-        if mindq and mindq[0][0] == ots and mindq[0][1] == op: mindq.popleft()
-    st["rolling_high"] = maxdq[0][1] if maxdq else None
-    st["rolling_low"]  = mindq[0][1] if mindq else None
-
-def _preseed_tick_extrema_from_candles(symbol: str):
-    """Seed second-level rolling window using the last 720×1m candles (use their time + highs/lows)."""
-    st = state[symbol]
-    st["tick_prices"].clear(); st["tick_maxdq"].clear(); st["tick_mindq"].clear()
-    buf = st["candles"]
-    for c in buf:
-        ts_sec = int(c[0] // 1000)  # candle open time (approx is fine here)
-        _tick_extrema_push(st, ts_sec, c[2])  # high
-        _tick_extrema_push(st, ts_sec, c[3])  # low
-
-# ───────────── preload 720×1m and seed ticks ─────────
-async def preload_candles(cli: AsyncClient):
-    for symbol in SYMBOLS:
-        try:
-            klines = await cli.get_klines(symbol=symbol, interval="1m", limit=HISTORICAL_PERIOD_MINUTES)
-            buf = state[symbol]["candles"]; buf.clear()
-            for k in klines:
-                buf.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
-            state[symbol]["history_loaded"] = True
-            _preseed_tick_extrema_from_candles(symbol)
-            logging.info(f"{symbol} preloaded {len(buf)} × 1m candles and seeded tick-rolling extrema.")
-        except Exception as e:
-            logging.error(f"{symbol} preload_candles error: {e}")
-
-# ───────────── recent swing levels for flip confirm (kept) ─────────
-async def get_recent_swing_levels(cli: AsyncClient, symbol: str):
-    try:
-        buf = state[symbol]["candles"]
-        if buf and len(buf) >= 6:
-            recent = list(buf)[-max(30, min(1000, CONFIRM_LOOKBACK_MIN)):]
-            highs, lows = find_swing_points(recent, swing_period=5, mode="causal")
-            recent_high = max(highs, key=lambda x: x[1])[0] if highs else None
-            recent_low  = max(lows , key=lambda x: x[1])[0] if lows  else None
-            return recent_high, recent_low
-        kl = await cli.get_klines(symbol=symbol, interval="1m", limit=max(30, min(1000, CONFIRM_LOOKBACK_MIN)))
-        candles = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in kl]
-        highs, lows = find_swing_points(candles, swing_period=5, mode="causal")
-        return (max(highs, key=lambda x: x[1])[0] if highs else None,
-                max(lows , key=lambda x: x[1])[0] if lows  else None)
-    except Exception as e:
-        logging.error(f"{symbol} get_recent_swing_levels failed: {e}")
+    if len(klines) < DONCHIAN_PERIODS:
         return None, None
 
-# ───────────── Flip confirmation ─────────
-async def confirm_flip_if_needed(cli: AsyncClient, symbol: str, price: float):
+    # Use last N complete periods (exclude current forming candle)
+    recent = list(klines)[:-1][-DONCHIAN_PERIODS:]
+
+    if not recent:
+        return None, None
+
+    highs = [k["high"] for k in recent]
+    lows  = [k["low"]  for k in recent]
+
+    return min(lows), max(highs)
+
+def calculate_wma_close(symbol: str, period: int) -> Optional[float]:
+    """Weighted Moving Average of closes over 'period' completed 1m candles (exclude forming)."""
+    klines = state[symbol]["klines"]
+
+    # Need at least 'period' completed candles (+1 forming)
+    if len(klines) < period + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < period:
+        return None
+
+    closes  = [k["close"] for k in completed[-period:]]
+    weights = list(range(1, period + 1))
+    denom   = sum(weights)
+    num     = sum(c * w for c, w in zip(closes, weights))
+    wma_val = num / denom
+
+    # cache if it's the 20h WMA
+    if period == WMA20_PERIODS:
+        state[symbol]["wma20"] = wma_val
+
+    return wma_val
+
+# ---------- ADX ----------
+def calculate_true_range(high1: float, low1: float, close0: float) -> float:
+    tr1 = high1 - low1
+    tr2 = abs(high1 - close0)
+    tr3 = abs(low1 - close0)
+    return max(tr1, tr2, tr3)
+
+def calculate_directional_movement(high1: float, high0: float, low1: float, low0: float) -> tuple:
+    up_move = high1 - high0
+    down_move = low0 - low1
+    plus_dm  = up_move if (up_move > down_move and up_move > 0) else 0
+    minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
+    return plus_dm, minus_dm
+
+def calculate_adx(symbol: str) -> Optional[float]:
+    """Calculate ADX (Average Directional Index) for trend strength"""
+    klines = state[symbol]["klines"]
+    if len(klines) < ADX_PERIODS + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < ADX_PERIODS + 1:
+        return None
+
+    recent = completed[-(ADX_PERIODS + 1):]
+
+    tr_values, plus_dm_values, minus_dm_values = [], [], []
+    for i in range(1, len(recent)):
+        cur = recent[i]
+        prev = recent[i - 1]
+        tr_values.append(calculate_true_range(cur["high"], cur["low"], prev["close"]))
+        plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    alpha = 1.0 / ADX_PERIODS
+
+    # Smooth TR
+    sm_tr = tr_values[0]
+    for tr in tr_values[1:]:
+        sm_tr = alpha * tr + (1 - alpha) * sm_tr
+
+    # Smooth +DM / -DM
+    sm_pdm = plus_dm_values[0]
+    for pdm in plus_dm_values[1:]:
+        sm_pdm = alpha * pdm + (1 - alpha) * sm_pdm
+
+    sm_mdm = minus_dm_values[0]
+    for mdm in minus_dm_values[1:]:
+        sm_mdm = alpha * mdm + (1 - alpha) * sm_mdm
+
+    if sm_tr == 0:
+        return None
+
+    plus_di  = (sm_pdm / sm_tr) * 100
+    minus_di = (sm_mdm / sm_tr) * 100
+    if (plus_di + minus_di) == 0:
+        return None
+
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
+    prev_adx = state[symbol].get("adx")
+    adx = dx if prev_adx is None else (alpha * dx + (1 - alpha) * prev_adx)
+
+    state[symbol]["adx"] = adx
+    state[symbol]["adx_ready"] = True
+    return adx
+
+# ========================= TRADING LOGIC =========================
+def update_trading_signals(symbol: str) -> dict:
+    """
+    Entry/Flip rules (no forced FLAT):
+    - LONG  when (price > Donchian LOW)  AND (price > WMA20) AND (ADX >= ADX_THRESHOLD)
+    - SHORT when (price < Donchian HIGH) AND (price < WMA20) AND (ADX >= ADX_THRESHOLD)
+    - Else: WAIT (keep current signal/position unchanged)
+    """
     st = state[symbol]
-    if not CONFIRM_FLIP or not st["confirm_active"]: return
-    now = time.time(); side = st["confirm_side"]; level = st["confirm_swing_level"]
-    if side is None or level is None:
-        st["confirm_active"] = False; st["confirm_side"] = None; st["confirm_swing_level"] = None; return
-    if side == "LONG":
-        if price >= level * (1 + CONFIRM_BREAK_PCT):
-            st["confirm_active"] = False; st["confirm_side"] = None; st["confirm_swing_level"] = None
-            logging.info(f"{symbol} LONG flip confirmed."); return
-    elif side == "SHORT":
-        if price <= level * (1 - CONFIRM_BREAK_PCT):
-            st["confirm_active"] = False; st["confirm_side"] = None; st["confirm_swing_level"] = None
-            logging.info(f"{symbol} SHORT flip confirmed."); return
-    if now < st["confirm_until"]: return
-    # unconfirmed within 2s → flatten
-    async with st["order_lock"]:
+    price = st["price"]
+    current_signal = st["current_signal"]
+
+    if price is None or not st["ready"]:
+        return {"changed": False, "action": "NONE", "signal": current_signal}
+
+    d_low, d_high = get_donchian_levels(symbol)
+    wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+    adx   = calculate_adx(symbol)
+
+    if d_low is None or d_high is None or wma20 is None or adx is None:
+        return {"changed": False, "action": "NONE", "signal": current_signal}
+
+    adx_ok   = (adx >= ADX_THRESHOLD)
+    long_ok  = adx_ok and (price > d_low)  and (price > wma20)
+    short_ok = adx_ok and (price < d_high) and (price < wma20)
+
+    new_signal = current_signal
+    if long_ok and current_signal != "LONG":
+        new_signal = "LONG"
+    elif short_ok and current_signal != "SHORT":
+        new_signal = "SHORT"
+    # else: WAIT (no change)
+
+    if new_signal != current_signal:
+        action = "FLIP" if current_signal in ("LONG", "SHORT") else "ENTRY"
+        st["current_signal"] = new_signal
+        st["last_signal_change"] = time.time()
+        logging.info(
+            f"🎯 {symbol} {action} {new_signal} "
+            f"(price {price:.6f} | Donchian {d_low:.6f}-{d_high:.6f} | WMA20 {wma20:.6f} | ADX {adx:.1f}≥{ADX_THRESHOLD})"
+        )
+        return {"changed": True, "action": action, "signal": new_signal}
+
+    return {"changed": False, "action": "NONE", "signal": current_signal}
+
+# ========================= MAIN LOOPS =========================
+async def price_feed_loop(client: AsyncClient):
+    """WebSocket price feed; builds 1m candles from markPrice@1s and sets readiness."""
+    streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
+    url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+
+    while True:
         try:
-            if side == "LONG" and st["in_long"]:
-                await cancel_trailing_stop(cli, symbol, "LONG")
-                if await safe_order_execution(cli, close_long(symbol), symbol, "LONG EXIT (UNCONFIRMED FLIP)"):
-                    st["in_long"] = False; st["long_entry_price"] = None
-                    st["server_trailing_active"] = False; st["server_trailing_order_id"] = None
-                    st["server_trailing_cb_rate"] = None; st["local_trail_pct"] = None; st["initial_position_taken"] = False
-            elif side == "SHORT" and st["in_short"]:
-                await cancel_trailing_stop(cli, symbol, "SHORT")
-                if await safe_order_execution(cli, close_short(symbol), symbol, "SHORT EXIT (UNCONFIRMED FLIP)"):
-                    st["in_short"] = False; st["short_entry_price"] = None
-                    st["server_trailing_active"] = False; st["server_trailing_order_id"] = None
-                    st["server_trailing_cb_rate"] = None; st["local_trail_pct"] = None; st["initial_position_taken"] = False
+            async with websockets.connect(url, ping_interval=20) as ws:
+                logging.info("📡 WebSocket connected")
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message).get("data", {})
+                        symbol = data.get("s")
+                        price_str = data.get("p")
+                        event_time = data.get("E")
+
+                        if symbol in SYMBOLS and price_str and event_time:
+                            price = float(price_str)
+                            state[symbol]["price"] = price
+
+                            # Update 1-minute candles using event time
+                            event_time /= 1000
+                            minute = int(event_time // 60)
+                            klines = state[symbol]["klines"]
+
+                            if not klines or klines[-1]["minute"] != minute:
+                                # New minute candle
+                                klines.append({
+                                    "minute": minute,
+                                    "high": price,
+                                    "low": price,
+                                    "close": price
+                                })
+                            else:
+                                # Update current candle
+                                klines[-1]["high"]  = max(klines[-1]["high"],  price)
+                                klines[-1]["low"]   = min(klines[-1]["low"],   price)
+                                klines[-1]["close"] = price
+
+                            # Readiness: require Donchian(20h) + WMA20 + ADX ≥ threshold
+                            if len(klines) >= DONCHIAN_PERIODS and not state[symbol]["ready"]:
+                                dlow, dhigh = get_donchian_levels(symbol)
+                                wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+                                adx   = calculate_adx(symbol)
+                                if (dlow is not None) and (dhigh is not None) and (wma20 is not None) and (adx is not None and adx >= ADX_THRESHOLD):
+                                    state[symbol]["ready"] = True
+                                    logging.info(
+                                        f"✅ {symbol} ready for trading "
+                                        f"({len(klines)} candles, WMA20 {wma20:.6f}, ADX {adx:.1f}≥{ADX_THRESHOLD})"
+                                    )
+                                else:
+                                    # ensure ADX keeps updating for display even if not ready yet
+                                    calculate_adx(symbol)
+                            else:
+                                # keep ADX up-to-date (doesn't block trading once ready)
+                                calculate_adx(symbol)
+
+                    except Exception as e:
+                        logging.warning(f"Price processing error: {e}")
+
         except Exception as e:
-            logging.error(f"{symbol} confirm_flip flatten error: {e}")
-        finally:
-            st["confirm_active"] = False; st["confirm_side"] = None; st["confirm_swing_level"] = None
+            logging.warning(f"WebSocket error: {e}. Reconnecting...")
+            await asyncio.sleep(5)
 
-# ───────────── Flip on trailing stop fill ─────────
-async def on_trailing_stop_filled(cli: AsyncClient, symbol: str, exited_side: str):
+async def status_logger():
+    """5-minute status with WMA20 + Donchian + ADX gating shown"""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes = 300 seconds
+
+        current_time = time.strftime("%H:%M", time.localtime())
+        logging.info(f"📊 === STATUS REPORT {current_time} ===")
+
+        for symbol in SYMBOLS:
+            st = state[symbol]
+
+            if not st["ready"]:
+                candle_count = len(st["klines"])
+                remaining = max(0, DONCHIAN_PERIODS - candle_count)
+                logging.info(f"{symbol}: Not ready - {candle_count}/{DONCHIAN_PERIODS} candles ({remaining} more needed)")
+                continue
+
+            price = st["price"]
+            d_low, d_high = get_donchian_levels(symbol)
+            wma20 = calculate_wma_close(symbol, WMA20_PERIODS)
+            adx = st.get("adx")
+
+            if d_low and d_high and price and wma20:
+                current_sig = st["current_signal"] or "WAIT"
+
+                logging.info(f"{symbol}: Price={price:.6f} | WMA20={wma20:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'}")
+                logging.info(f"  Donchian: LOW={d_low:.6f} HIGH={d_high:.6f}")
+                logging.info(f"  Signal: {current_sig}")
+
+                # Gate status
+                adx_ok   = (adx is not None and adx >= ADX_THRESHOLD)
+                long_ok  = adx_ok and (price > d_low)  and (price > wma20)
+                short_ok = adx_ok and (price < d_high) and (price < wma20)
+                logging.info(f"  LONG gates: price>DonchianLOW={price > d_low} | price>WMA20={price > wma20} | ADX≥{ADX_THRESHOLD}={adx_ok}")
+                logging.info(f"  SHORT gates: price<DonchianHIGH={price < d_high} | price<WMA20={price < wma20} | ADX≥{ADX_THRESHOLD}={adx_ok}")
+
+        logging.info("📊 === END STATUS REPORT ===")
+
+async def trading_loop(client: AsyncClient):
+    """Main trading logic with instant execution (no forced FLAT)."""
+    while True:
+        await asyncio.sleep(0.1)  # 10 FPS
+
+        for symbol in SYMBOLS:
+            st = state[symbol]
+            if not st["ready"]:
+                continue
+
+            # Update trading signals (no-FLAT; only change on explicit long/short)
+            signal_result = update_trading_signals(symbol)
+
+            # Calculate target position based on current signal
+            target_size = SYMBOLS[symbol]
+            current_signal = st["current_signal"]
+
+            if current_signal == "LONG":
+                final_position = target_size
+            elif current_signal == "SHORT":
+                final_position = -target_size
+            else:
+                # WAIT: keep current position unchanged (no flattening)
+                final_position = st["current_position"]
+
+            # Execute position change only when signal changed AND target differs
+            if signal_result["changed"]:
+                current_pos = st["current_position"]
+                if abs(final_position - current_pos) > 1e-12:
+                    await execute_position_change(client, symbol, final_position, current_pos)
+
+async def execute_position_change(client: AsyncClient, symbol: str, target: float, current: float):
+    """Execute position changes with minimal API calls"""
     st = state[symbol]
-    async with st["order_lock"]:
-        if exited_side == "LONG": st["in_long"] = False; st["long_entry_price"] = None
-        else: st["in_short"] = False; st["short_entry_price"] = None
-        st["server_trailing_active"] = False; st["server_trailing_order_id"] = None
-        st["server_trailing_cb_rate"] = None; st["trail_extremum"] = None; st["trail_side"] = None
-        st["cooldown_until"] = 0.0; st["local_trail_pct"] = None
-        price = st.get("last_price") or 0.0
-        if exited_side == "LONG":
-            if await safe_order_execution(cli, open_short(symbol), symbol, "SHORT ENTRY (FLIP on TS fill)"):
-                st["in_short"] = True; st["short_entry_price"] = price
-                st["trail_side"]="SHORT"; st["trail_extremum"]=price; st["local_trail_pct"]=TRAIL_PCT
-                await place_trailing_stop(cli, symbol, "SHORT", CALLBACK_RATE)
-                logging.info(f"{symbol} FLIP: LONG→SHORT @ ~${price:.4f}")
-                if CONFIRM_FLIP:
-                    recent_high, recent_low = await get_recent_swing_levels(cli, symbol)
-                    st["confirm_active"]=True; st["confirm_until"]=time.time()+CONFIRM_WINDOW_SECS
-                    st["confirm_side"]="SHORT"; st["confirm_swing_level"]=recent_low
-        else:
-            if await safe_order_execution(cli, open_long(symbol), symbol, "LONG ENTRY (FLIP on TS fill)"):
-                st["in_long"]=True; st["long_entry_price"]=price
-                st["trail_side"]="LONG"; st["trail_extremum"]=price; st["local_trail_pct"]=TRAIL_PCT
-                await place_trailing_stop(cli, symbol, "LONG", CALLBACK_RATE)
-                logging.info(f"{symbol} FLIP: SHORT→LONG @ ~${price:.4f}")
-                if CONFIRM_FLIP:
-                    recent_high, recent_low = await get_recent_swing_levels(cli, symbol)
-                    st["confirm_active"]=True; st["confirm_until"]=time.time()+CONFIRM_WINDOW_SECS
-                    st["confirm_side"]="LONG"; st["confirm_swing_level"]=recent_high
-        st["initial_position_taken"] = True
 
-# ───────────── User stream (order + account updates) ─────────
-async def user_stream_listener(cli: AsyncClient):
-    async def _get_futures_listen_key(cli: AsyncClient) -> str:
-        resp = await cli.futures_stream_get_listen_key()
-        if isinstance(resp, dict):
-            lk = resp.get("listenKey") or resp.get("listen_key") or next(iter(resp.values()), None)
-            return lk
-        elif isinstance(resp, (list, tuple)) and resp:
-            first = resp[0]
-            return first.get("listenKey") or first.get("listen_key") if isinstance(first, dict) else str(first)
-        return str(resp)
-
-    try:
-        listen_key = await _get_futures_listen_key(cli)
-        if not listen_key: raise RuntimeError("Empty futures listen key")
-        logging.info("Got futures listen key")
-    except Exception as e:
-        logging.error(f"Get futures listen key failed: {e}")
+    # Dedup guard
+    now = time.time()
+    last_target = st.get("last_target", None)
+    last_when = st.get("last_exec_ts", 0.0)
+    if last_target is not None and abs(target - last_target) < 1e-12 and (now - last_when) < 2.0:
+        logging.info(f"🛡️ {symbol} dedup: skipping duplicate execution to target {target} within 2s window")
         return
 
-    async def keepalive():
-        while True:
-            try:
-                await cli.futures_stream_keepalive(listenKey=listen_key)
-                logging.debug("Futures keepalive ok")
-            except Exception as e:
-                logging.warning(f"Keepalive failed: {e}")
-            await asyncio.sleep(30*60)
+    if abs(target - current) < 1e-12:
+        return  # nothing to do
 
-    asyncio.create_task(keepalive())
-    url = f"wss://fstream.binance.com/ws/{listen_key}"
-
-    backoff = WS_RECONNECT_MIN
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT, max_size=None, close_timeout=5) as ws:
-                logging.info("User stream WS connected"); backoff = WS_RECONNECT_MIN
-                async for raw in ws:
-                    evt = json.loads(raw); etype = evt.get("e")
-                    if etype == "ORDER_TRADE_UPDATE":
-                        o = evt.get("o", {})
-                        if o.get("ot") == "TRAILING_STOP_MARKET" and o.get("X") == "FILLED":
-                            symbol = o.get("s"); st = state.get(symbol); 
-                            if not st: continue
-                            this_id = o.get("i")
-                            if st.get("last_ts_filled_id") == this_id:
-                                logging.warning(f"{symbol} duplicate TS FILLED ignored ({this_id})"); continue
-                            st["last_ts_filled_id"] = this_id
-                            await on_trailing_stop_filled(cli, symbol, o.get("ps"))  # 'LONG' or 'SHORT'
-                    elif etype == "ACCOUNT_UPDATE":
-                        a = evt.get("a", {}); positions = a.get("P", []) or []
-                        now = time.time()
-                        for p in positions:
-                            symbol = p.get("s"); ps = p.get("ps")
-                            if symbol not in state: continue
-                            st = state[symbol]; st["last_account_update_ts"] = now
-                            try:
-                                amt = float(p.get("pa", 0.0)); ep = float(p.get("ep", 0.0)) if p.get("ep") is not None else None
-                            except Exception:
-                                amt, ep = 0.0, None
-                            size = abs(amt)
-                            if ps == "LONG":
-                                was = st["in_long"]; st["in_long"] = size > 0
-                                if st["in_long"]: st["long_entry_price"] = ep
-                                elif was:
-                                    st["trail_side"]=None; st["trail_extremum"]=None; st["server_trailing_active"]=False
-                                    st["server_trailing_order_id"]=None; st["server_trailing_cb_rate"]=None
-                                    st["local_trail_pct"]=None; st["initial_position_taken"]=False
-                            elif ps == "SHORT":
-                                was = st["in_short"]; st["in_short"] = size > 0
-                                if st["in_short"]: st["short_entry_price"] = ep
-                                elif was:
-                                    st["trail_side"]=None; st["trail_extremum"]=None; st["server_trailing_active"]=False
-                                    st["server_trailing_order_id"]=None; st["server_trailing_cb_rate"]=None
-                                    st["local_trail_pct"]=None; st["initial_position_taken"]=False
-        except Exception as e:
-            wait = _jitter(min(backoff, WS_RECONNECT_MAX))
-            logging.error(f"user_stream_listener error: {e} | reconnecting in {wait:.2f}s")
-            await asyncio.sleep(wait); backoff = min(backoff*2, WS_RECONNECT_MAX)
-
-# ───────────── Main market stream (trade + kline_1m) ─────────
-async def run(cli: AsyncClient):
-    for s in SYMBOLS: await cli.futures_change_leverage(symbol=s, leverage=LEVERAGE)
     try:
-        await cli.futures_change_position_mode(dualSidePosition="true")
+        # FLATTEN to zero (only if target is exactly 0.0 — won't happen from WAIT because we keep position)
+        if target == 0.0:
+            if current > 0:
+                ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
+                if not ok:
+                    logging.warning(f"{symbol} flatten LONG failed; aborting")
+                    return
+            elif current < 0:
+                ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
+                if not ok:
+                    logging.warning(f"{symbol} flatten SHORT failed; aborting")
+                    return
+
+        # TARGET LONG (>0)
+        elif target > 0:
+            if current < 0:
+                ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
+                if not ok:
+                    logging.warning(f"{symbol} SHORT close failed; aborting LONG open")
+                    return
+                ok = await place_order(client, symbol, "BUY", target, "LONG ENTRY")
+                if not ok:
+                    logging.warning(f"{symbol} LONG open failed after closing SHORT")
+                    return
+            else:
+                if target > current:
+                    ok = await place_order(client, symbol, "BUY", target - current, "LONG ENTRY")
+                    if not ok:
+                        return
+                else:
+                    ok = await place_order(client, symbol, "SELL", current - target, "LONG CLOSE")
+                    if not ok:
+                        return
+
+        # TARGET SHORT (<0)
+        else:  # target < 0
+            if current > 0:
+                ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
+                if not ok:
+                    logging.warning(f"{symbol} LONG close failed; aborting SHORT open")
+                    return
+                ok = await place_order(client, symbol, "SELL", abs(target), "SHORT ENTRY")
+                if not ok:
+                    logging.warning(f"{symbol} SHORT open failed after closing LONG")
+                    return
+            else:
+                cur_abs = abs(current)
+                tgt_abs = abs(target)
+                if tgt_abs > cur_abs:
+                    ok = await place_order(client, symbol, "SELL", tgt_abs - cur_abs, "SHORT ENTRY")
+                    if not ok:
+                        return
+                else:
+                    ok = await place_order(client, symbol, "BUY", cur_abs - tgt_abs, "SHORT CLOSE")
+                    if not ok:
+                        return
+
+        # update state only after successful path
+        st["current_position"] = target
+        st["last_target"] = target
+        st["last_exec_ts"] = now
+
     except Exception as e:
-        logging.warning(f"dualSidePosition already set? {e}")
+        logging.error(f"❌ {symbol} position change failed: {e}")
 
-    await preload_candles(cli)
+# ========================= INITIALIZATION =========================
+async def init_bot(client: AsyncClient):
+    """Initialize bot with historical data fetching"""
+    logging.info("🔧 Initializing bot with safe historical data fetching...")
+    logging.info("📊 Using hardcoded precisions to avoid API calls")
+    logging.info("⚙️ Leverage must be set manually via Binance web interface")
 
-    asyncio.create_task(rolling_analysis_scheduler(cli))
-    asyncio.create_task(position_sync_scheduler(cli))
-    asyncio.create_task(user_stream_listener(cli))
-    asyncio.create_task(dynamic_trailing_scheduler(cli))
+    # First, try to load existing data
+    load_klines()
 
-    streams = []
-    for s in SYMBOLS:
-        streams.append(f"{s.lower()}@trade")
-        streams.append(f"{s.lower()}@kline_1m")
-    url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+    # Check which symbols need historical data
+    symbols_needing_data = []
+    for symbol in SYMBOLS:
+        klines = state[symbol]["klines"]
+        # Readiness requires Donchian+WMA20+ADX (ADX≥25)
+        d_ready  = len(klines) >= DONCHIAN_PERIODS and get_donchian_levels(symbol)[0] is not None
+        w_ready  = len(klines) >= WMA20_PERIODS and calculate_wma_close(symbol, WMA20_PERIODS) is not None
+        a_value  = calculate_adx(symbol)  # compute ADX if possible
+        a_ready  = (a_value is not None and a_value >= ADX_THRESHOLD)
 
-    backoff = WS_RECONNECT_MIN
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT, max_size=None, close_timeout=5) as ws:
-                logging.info("Market WS (trade+kline_1m) connected"); backoff = WS_RECONNECT_MIN
-                async for raw in ws:
-                    m = json.loads(raw); stype = m.get("stream",""); d = m.get("data",{})
-                    # Trade ticks: second-level rolling entries and trailing
-                    if stype.endswith("@trade"):
-                        sym = d["s"]; price = float(d["p"])
-                        ts_ms = d.get("T")  # trade time (ms)
-                        ts_sec = int(ts_ms/1000) if ts_ms is not None else int(time.time())
-                        st = state[sym]
+        if d_ready and w_ready and a_ready:
+            state[symbol]["ready"] = True
+            wma_val = state[symbol]["wma20"]
+            logging.info(f"✅ {symbol} ready for trading ({len(klines)} candles, WMA20: {wma_val:.6f}, ADX {a_value:.1f}≥{ADX_THRESHOLD}) from loaded data")
+        else:
+            symbols_needing_data.append(symbol)
+            logging.info(f"📥 {symbol} needs historical data ({len(klines)}/{DONCHIAN_PERIODS} candles)")
 
-                        # Use PRE-update extrema as "previous second → 720 minutes" window
-                        prev_high = st.get("rolling_high"); prev_low = st.get("rolling_low")
+    # Fetch historical data for symbols that need it
+    if symbols_needing_data:
+        logging.info(f"🔄 Fetching historical data for {len(symbols_needing_data)} symbols...")
+        logging.info("⚠️ Using ultra-conservative rate limiting (2-minute delays between symbols)")
 
-                        # Update window with the current tick (so next tick sees it)
-                        _tick_extrema_push(st, ts_sec, price)
+        successful_fetches = 0
 
-                        st["last_price"] = price
+        for i, symbol in enumerate(symbols_needing_data):
+            try:
+                logging.info(f"📈 Fetching historical data for {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
-                        # Initial entry from second-level rolling breakouts (only if not in a position yet)
-                        if not st["initial_position_taken"] and prev_high is not None and prev_low is not None:
-                            if price >= prev_high * (1 + SWING_THRESHOLD_PCT):
-                                await manage_initial_position(cli, sym, price, "LONG")
-                            elif price <= prev_low * (1 - SWING_THRESHOLD_PCT):
-                                await manage_initial_position(cli, sym, price, "SHORT")
+                klines_data = await safe_api_call(
+                    client.futures_mark_price_klines,
+                    symbol=symbol,
+                    interval="1m",
+                    limit=max(DONCHIAN_PERIODS, WMA20_PERIODS) + 50
+                )
 
-                        await confirm_flip_if_needed(cli, sym, price)
-                        await handle_trailing_stops(cli, sym, price)
-                        continue
+                # Process the data
+                st = state[symbol]
+                st["klines"].clear()
 
-                    # 1m kline updates: maintain 720×1m buffer (kept for context/confirm)
-                    if stype.endswith("@kline_1m"):
-                        k = d.get("k", {}); sym = d.get("s") or k.get("s")
-                        if not sym or sym not in state: continue
-                        st = state[sym]; buf = st["candles"]
-                        t = int(k["t"]); o=float(k["o"]); h=float(k["h"]); l=float(k["l"]); c=float(k["c"]); v=float(k["v"])
-                        if not buf or buf[-1][0] != t: buf.append([t,o,h,l,c,v])
-                        else: buf[-1] = [t,o,h,l,c,v]
-                        continue
+                for kline in klines_data:
+                    minute = int(float(kline[0]) / 1000 // 60)
+                    st["klines"].append({
+                        "minute": minute,
+                        "high": float(kline[2]),
+                        "low":  float(kline[3]),
+                        "close": float(kline[4])
+                    })
 
-        except Exception as e:
-            wait = _jitter(min(backoff, WS_RECONNECT_MAX))
-            logging.error(f"market WS error: {e} | reconnecting in {wait:.2f}s")
-            await asyncio.sleep(wait); backoff = min(backoff*2, WS_RECONNECT_MAX)
+                # Mark as ready if key indicators are available (with ADX ≥ threshold)
+                d_ok  = get_donchian_levels(symbol)[0] is not None
+                w_ok  = calculate_wma_close(symbol, WMA20_PERIODS) is not None
+                a_val = calculate_adx(symbol)
+                a_ok  = (a_val is not None and a_val >= ADX_THRESHOLD)
 
-# ───────────── MAIN ─────────
+                if d_ok and w_ok and a_ok:
+                    st["ready"] = True
+                    logging.info(f"✅ {symbol} ready for trading ({len(st['klines'])} candles, WMA20: {st['wma20']:.6f}, ADX {a_val:.1f}≥{ADX_THRESHOLD}) from API")
+                    successful_fetches += 1
+                else:
+                    logging.warning(f"⚠️ {symbol} insufficient data received ({len(st['klines'])} candles)")
+
+                # Ultra-conservative delay between symbols
+                if i < len(symbols_needing_data) - 1:
+                    logging.info(f"⏳ Waiting 120 seconds before next symbol to avoid rate limits...")
+                    await asyncio.sleep(120)
+
+            except Exception as e:
+                logging.error(f"❌ {symbol} historical data fetch failed: {e}")
+                logging.info(f"📡 {symbol} will build data from WebSocket feed instead")
+
+                if i < len(symbols_needing_data) - 1:
+                    await asyncio.sleep(120)
+
+        logging.info(f"📊 Historical data fetch complete: {successful_fetches}/{len(symbols_needing_data)} successful")
+
+        # Show final status
+        ready_count = sum(1 for symbol in SYMBOLS if state[symbol]["ready"])
+        pending_count = len(SYMBOLS) - ready_count
+
+        if ready_count > 0:
+            logging.info(f"🚀 {ready_count} symbols ready to trade immediately")
+
+        if pending_count > 0:
+            logging.info(f"⏳ {pending_count} symbols will build data from live WebSocket feed")
+
+    else:
+        logging.info("🎯 All symbols ready from loaded data - no API calls needed!")
+
+    # Save the data we have
+    save_klines()
+
+    await asyncio.sleep(2)
+    logging.info("🚀 Initialization complete - Starting WebSocket feeds")
+
+# ========================= MAIN =========================
 async def main():
-    threading.Thread(target=start_ping, daemon=True).start()
-    if not (API_KEY and API_SECRET): raise RuntimeError("Missing Binance API creds")
-    cli = await AsyncClient.create(API_KEY, API_SECRET)
+    if not API_KEY or not API_SECRET:
+        raise ValueError("Missing Binance API credentials in .env")
+
+    client = await AsyncClient.create(API_KEY, API_SECRET)
+
+    atexit.register(save_klines)
+
     try:
-        await run(cli)
+        await init_bot(client)
+
+        # Start three concurrent tasks
+        price_task  = asyncio.create_task(price_feed_loop(client))
+        trade_task  = asyncio.create_task(trading_loop(client))
+        status_task = asyncio.create_task(status_logger())
+
+        logging.info("🚀 Bot started - Price feed, Trading logic, and Status reporting active")
+
+        await asyncio.gather(price_task, trade_task, status_task)
+
     finally:
-        await cli.close_connection()
+        await client.close_connection()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s", datefmt="%b %d %H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
+    print("=" * 70)
+    print("🤖 DONCHIAN(20h) + 20h WMA + ADX BOT (No FLAT — Wait if no signal)")
+    print("=" * 70)
+    print("📈 LONG:  price > 20h Donchian LOW  AND price > 20h WMA  AND ADX ≥ 25")
+    print("📉 SHORT: price < 20h Donchian HIGH AND price < 20h WMA  AND ADX ≥ 25")
+    print("⏱️ Live checks via markPrice@1s; 1m candles drive Donchian/WMA20/ADX")
+    print("📊 Data persistence enabled - faster restarts after first run")
+    print(f"📊 Symbols: {list(SYMBOLS.keys())}")
+    print("=" * 70)
+
     asyncio.run(main())
