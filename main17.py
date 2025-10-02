@@ -35,9 +35,29 @@ RSI_SHORT_THRESHOLD = 49  # SHORT entry when RSI < 49
 RSI_LONG_THRESHOLD = 51   # LONG entry when RSI > 51
 KLINE_LIMIT      = 1300
 
+# ========================= ADJUSTABLE BUFFERS =========================
+# Entry buffer: Distance from channel edge where entries are allowed
+# Format: percentage (0.0 to 1.0), e.g., 0.30 = 30% from edge
+ENTRY_BUFFER_PERCENT = float(os.getenv("ENTRY_BUFFER_PERCENT", "0.30"))  # 30% default
+
+# Exit buffer: Distance from channel edge where exits trigger
+# Should be larger than ENTRY_BUFFER to create safety margin
+EXIT_BUFFER_PERCENT = float(os.getenv("EXIT_BUFFER_PERCENT", "0.40"))  # 40% default
+
+# Validate buffers
+if EXIT_BUFFER_PERCENT <= ENTRY_BUFFER_PERCENT:
+    raise ValueError(f"EXIT_BUFFER_PERCENT ({EXIT_BUFFER_PERCENT}) must be greater than ENTRY_BUFFER_PERCENT ({ENTRY_BUFFER_PERCENT})")
+if ENTRY_BUFFER_PERCENT < 0 or ENTRY_BUFFER_PERCENT > 1:
+    raise ValueError(f"ENTRY_BUFFER_PERCENT must be between 0 and 1, got {ENTRY_BUFFER_PERCENT}")
+if EXIT_BUFFER_PERCENT < 0 or EXIT_BUFFER_PERCENT > 1:
+    raise ValueError(f"EXIT_BUFFER_PERCENT must be between 0 and 1, got {EXIT_BUFFER_PERCENT}")
+
+# Safety margin is automatically calculated as the difference
+SAFETY_MARGIN_PERCENT = EXIT_BUFFER_PERCENT - ENTRY_BUFFER_PERCENT
+
 # Daily PNL limits
-DAILY_PROFIT_TARGET = 200.0
-DAILY_LOSS_LIMIT = -100.0
+DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "200.0"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-100.0"))
 
 # ========================= STATE =========================
 state = {
@@ -315,14 +335,14 @@ def update_trading_signals(symbol: str) -> dict:
     rsi_long_ok = (rsi > RSI_LONG_THRESHOLD)
     
     channel_height = d_high - d_low
-    buffer_30 = channel_height * 0.30
-    buffer_40 = channel_height * 0.40
+    buffer_entry = channel_height * ENTRY_BUFFER_PERCENT
+    buffer_exit = channel_height * EXIT_BUFFER_PERCENT
     
-    short_entry_upper = d_low + buffer_30
-    long_entry_lower = d_high - buffer_30
+    short_entry_upper = d_low + buffer_entry
+    long_entry_lower = d_high - buffer_entry
     
-    short_exit_upper = d_low + buffer_40
-    long_exit_lower = d_high - buffer_40
+    short_exit_upper = d_low + buffer_exit
+    long_exit_lower = d_high - buffer_exit
     
     in_short_entry_zone = price <= short_entry_upper
     in_long_entry_zone = price >= long_entry_lower
@@ -464,12 +484,14 @@ async def status_logger():
                     else:
                         logging.info(f"  STATUS: LOSS LIMIT HIT - Trading paused until next day")
                 else:
+                    entry_pct = int(ENTRY_BUFFER_PERCENT * 100)
+                    exit_pct = int(EXIT_BUFFER_PERCENT * 100)
                     logging.info(f"  Zones:")
-                    logging.info(f"    SHORT entry: <={zone_info['short_entry_upper']:.6f} (LOW to LOW+30%)")
-                    logging.info(f"    SHORT exit: >{zone_info['short_exit_upper']:.6f} (LOW+40%)")
+                    logging.info(f"    SHORT entry: <={zone_info['short_entry_upper']:.6f} (LOW to LOW+{entry_pct}%)")
+                    logging.info(f"    SHORT exit: >{zone_info['short_exit_upper']:.6f} (LOW+{exit_pct}%)")
                     logging.info(f"    BLOCKING GAP: {zone_info['short_exit_upper']:.6f} to {zone_info['long_exit_lower']:.6f}")
-                    logging.info(f"    LONG exit: <{zone_info['long_exit_lower']:.6f} (HIGH-40%)")
-                    logging.info(f"    LONG entry: >={zone_info['long_entry_lower']:.6f} (HIGH-30% to HIGH)")
+                    logging.info(f"    LONG exit: <{zone_info['long_exit_lower']:.6f} (HIGH-{exit_pct}%)")
+                    logging.info(f"    LONG entry: >={zone_info['long_entry_lower']:.6f} (HIGH-{entry_pct}% to HIGH)")
                     logging.info(f"  RSI Filters: SHORT<{RSI_SHORT_THRESHOLD} | LONG>{RSI_LONG_THRESHOLD}")
                     logging.info(f"  Current location:")
                     logging.info(f"    In SHORT entry zone: {zone_info['in_short_entry_zone']}")
@@ -686,49 +708,59 @@ async def main():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
     print("=" * 80)
-    print("DONCHIAN + ADX + RSI BOT - Entry/Exit Zone Strategy with Daily Limits")
+    print("DONCHIAN + ADX + RSI BOT - Adjustable Entry/Exit Buffers with Daily Limits")
     print("=" * 80)
-    print("STRATEGY: Counter-Trend with Buffer Zones + RSI Filter + Daily PNL Management")
+    print("STRATEGY: Counter-Trend with Adjustable Buffer Zones + RSI Filter + Daily PNL")
+    print("")
+    print("BUFFER CONFIGURATION:")
+    print(f"  Entry Buffer: {ENTRY_BUFFER_PERCENT*100:.0f}% from channel edge")
+    print(f"  Exit Buffer: {EXIT_BUFFER_PERCENT*100:.0f}% from channel edge")
+    print(f"  Safety Margin: {SAFETY_MARGIN_PERCENT*100:.0f}% (prevents oscillation)")
     print("")
     print("ENTRY/EXIT ZONES:")
     print("  SHORT zone:")
-    print("    Entry: Price <= LOW+30% (e.g., 100-103)")
-    print("    Hold: While price <= LOW+40% (100-104)")
-    print("    Exit: When price > LOW+40% (>104)")
+    print(f"    Entry: Price <= LOW+{ENTRY_BUFFER_PERCENT*100:.0f}%")
+    print(f"    Hold: While price <= LOW+{EXIT_BUFFER_PERCENT*100:.0f}%")
+    print(f"    Exit: When price > LOW+{EXIT_BUFFER_PERCENT*100:.0f}%")
     print("    RSI Filter: RSI < 49")
     print("")
-    print("  BLOCKING GAP: Between LOW+40% and HIGH-40% (104-106)")
+    print(f"  BLOCKING GAP: Between LOW+{EXIT_BUFFER_PERCENT*100:.0f}% and HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
     print("    → Stay FLAT, wait for entry zone")
     print("")
     print("  LONG zone:")
-    print("    Entry: Price >= HIGH-30% (e.g., 107-110)")
-    print("    Hold: While price >= HIGH-40% (106-110)")
-    print("    Exit: When price < HIGH-40% (<106)")
+    print(f"    Entry: Price >= HIGH-{ENTRY_BUFFER_PERCENT*100:.0f}%")
+    print(f"    Hold: While price >= HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
+    print(f"    Exit: When price < HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
     print("    RSI Filter: RSI > 51")
     print("")
     print("FILTERS:")
     print(f"  - ADX >= {ADX_THRESHOLD} (volatility confirmation)")
-    print(f"  - RSI < {RSI_SHORT_THRESHOLD} for SHORT entries (price at low, RSI confirms)")
-    print(f"  - RSI > {RSI_LONG_THRESHOLD} for LONG entries (price at high, RSI confirms)")
+    print(f"  - RSI < {RSI_SHORT_THRESHOLD} for SHORT entries")
+    print(f"  - RSI > {RSI_LONG_THRESHOLD} for LONG entries")
     print("")
     print("DAILY PNL LIMITS (Per Symbol):")
     print(f"  Profit Target: +{DAILY_PROFIT_TARGET}% → Stop trading for the day")
     print(f"  Loss Limit: {DAILY_LOSS_LIMIT}% → Stop trading for the day")
     print("  Resets: Midnight UTC every day")
     print("")
+    print("CONFIGURATION:")
+    print("  To adjust buffers, add to your .env file:")
+    print("    ENTRY_BUFFER_PERCENT=0.30  # 30% entry buffer (default)")
+    print("    EXIT_BUFFER_PERCENT=0.40   # 40% exit buffer (default)")
+    print("    DAILY_PROFIT_TARGET=200.0  # Profit target % (default)")
+    print("    DAILY_LOSS_LIMIT=-100.0    # Loss limit % (default)")
+    print("")
     print("RULES:")
     print("  - Entry requires: Zone + ADX + RSI all confirmed")
-    print("  - 10% buffer between entry (30%) and exit (40%) prevents oscillation")
+    print(f"  - {SAFETY_MARGIN_PERCENT*100:.0f}% safety margin between entry and exit prevents oscillation")
     print("  - Breakouts override zones (price >= HIGH or <= LOW)")
     print("  - No flipping: Exit to FLAT, then re-enter if conditions met")
-    print("  - When daily limit reached: Close positions, block new entries until next day")
+    print("  - When daily limit reached: Close positions, block new entries")
     print("")
     print(f"Symbols: {list(SYMBOLS.keys())}")
     print(f"Leverage: {LEVERAGE}x")
     print(f"Donchian Period: {DONCHIAN_PERIODS} minutes ({DONCHIAN_PERIODS/60:.1f} hours)")
     print(f"ADX Period: {ADX_PERIODS} minutes ({ADX_PERIODS/60:.1f} hours)")
     print(f"RSI Period: {RSI_PERIODS} minutes")
-    print(f"ADX Threshold: {ADX_THRESHOLD}")
-    print(f"RSI Thresholds: SHORT<{RSI_SHORT_THRESHOLD} | LONG>{RSI_LONG_THRESHOLD}")
     print("=" * 80)
     asyncio.run(main())
