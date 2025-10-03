@@ -27,37 +27,33 @@ PRECISIONS = {
     "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-DONCHIAN_PERIODS = 1140
-ADX_PERIODS      = 1140
-ADX_THRESHOLD    = 25
-RSI_PERIODS      = 1140
-RSI_SHORT_THRESHOLD = 49  # SHORT entry when RSI < 49
-RSI_LONG_THRESHOLD = 51   # LONG entry when RSI > 51
-KLINE_LIMIT      = 1300
+# ========================= SUPERTREND + FILTERS CONFIG =========================
+# Adjustable ATR settings (now in hours)
+SUPERTREND_ATR_PERIODS = int(os.getenv("SUPERTREND_ATR_PERIODS", "19"))    # Default 19 hours
+SUPERTREND_MULTIPLIER = float(os.getenv("SUPERTREND_MULTIPLIER", "2.0"))   # Default 2.0
 
-# ========================= ADJUSTABLE BUFFERS =========================
-# Entry buffer: Distance from channel edge where entries are allowed
-# Format: percentage (0.0 to 1.0), e.g., 0.30 = 30% from edge
-ENTRY_BUFFER_PERCENT = float(os.getenv("ENTRY_BUFFER_PERCENT", "0.20"))  # 20% default
+# Filter settings (now in hours)
+ADX_PERIODS = int(os.getenv("ADX_PERIODS", "19"))                          # Default 19 hours
+ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", "25.0"))                  # Default 25
+RSI_PERIODS = int(os.getenv("RSI_PERIODS", "19"))                          # Default 19 hours
+RSI_SHORT_THRESHOLD = float(os.getenv("RSI_SHORT_THRESHOLD", "49.0"))      # SHORT when RSI < 49
+RSI_LONG_THRESHOLD = float(os.getenv("RSI_LONG_THRESHOLD", "51.0"))        # LONG when RSI > 51
 
-# Exit buffer: Distance from channel edge where exits trigger
-# Should be larger than ENTRY_BUFFER to create safety margin
-EXIT_BUFFER_PERCENT = float(os.getenv("EXIT_BUFFER_PERCENT", "0.30"))  # 30% default
+# Calculate required kline buffer (need extra for calculations)
+KLINE_LIMIT = max(SUPERTREND_ATR_PERIODS, ADX_PERIODS, RSI_PERIODS) + 20
 
-# Validate buffers
-if EXIT_BUFFER_PERCENT <= ENTRY_BUFFER_PERCENT:
-    raise ValueError(f"EXIT_BUFFER_PERCENT ({EXIT_BUFFER_PERCENT}) must be greater than ENTRY_BUFFER_PERCENT ({ENTRY_BUFFER_PERCENT})")
-if ENTRY_BUFFER_PERCENT < 0 or ENTRY_BUFFER_PERCENT > 1:
-    raise ValueError(f"ENTRY_BUFFER_PERCENT must be between 0 and 1, got {ENTRY_BUFFER_PERCENT}")
-if EXIT_BUFFER_PERCENT < 0 or EXIT_BUFFER_PERCENT > 1:
-    raise ValueError(f"EXIT_BUFFER_PERCENT must be between 0 and 1, got {EXIT_BUFFER_PERCENT}")
-
-# Safety margin is automatically calculated as the difference
-SAFETY_MARGIN_PERCENT = EXIT_BUFFER_PERCENT - ENTRY_BUFFER_PERCENT
+# Timeframe
+TIMEFRAME = "1h"  # Use hourly candles
 
 # Daily PNL limits
 DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "200.0"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-100.0"))
+
+# Validate config
+if SUPERTREND_ATR_PERIODS < 1:
+    raise ValueError(f"SUPERTREND_ATR_PERIODS must be >= 1, got {SUPERTREND_ATR_PERIODS}")
+if SUPERTREND_MULTIPLIER <= 0:
+    raise ValueError(f"SUPERTREND_MULTIPLIER must be > 0, got {SUPERTREND_MULTIPLIER}")
 
 # ========================= STATE =========================
 state = {
@@ -67,17 +63,21 @@ state = {
         "current_signal": None,
         "last_signal_change": 0,
         "current_position": 0.0,
-        "adx": None,
-        "rsi": None,
-        "adx_ready": False,
-        "ready": False,
+        "entry_price": None,
         "last_exec_ts": 0.0,
         "last_target": None,
-        "zone_info": None,
         "daily_pnl": 0.0,
         "daily_pnl_reset_time": time.time(),
         "daily_limit_reached": False,
-        "entry_price": None,
+        # Supertrend specific
+        "atr": None,
+        "supertrend_upper": None,
+        "supertrend_lower": None,
+        "supertrend_trend": None,
+        # Filter indicators
+        "adx": None,
+        "rsi": None,
+        "ready": False,
     }
     for symbol in SYMBOLS
 }
@@ -88,19 +88,19 @@ api_calls_reset_time = time.time()
 # ========================= PERSISTENCE =========================
 def save_klines():
     save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
-    with open('klines.json', 'w') as f:
+    with open('klines_supertrend.json', 'w') as f:
         json.dump(save_data, f)
-    logging.info("Saved klines to klines.json")
+    logging.info("Saved klines to klines_supertrend.json")
 
 def load_klines():
     try:
-        with open('klines.json', 'r') as f:
+        with open('klines_supertrend.json', 'r') as f:
             load_data = json.load(f)
         for sym in SYMBOLS:
             state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
-        logging.info("Loaded klines from klines.json")
+        logging.info("Loaded klines from klines_supertrend.json")
     except FileNotFoundError:
-        logging.info("No klines.json found - starting fresh")
+        logging.info("No klines_supertrend.json found - starting fresh")
     except Exception as e:
         logging.error(f"Failed to load klines: {e}")
 
@@ -191,29 +191,25 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         logging.error(f"{symbol} {action} FAILED: {e}")
         return False
 
-# ========================= INDICATORS =========================
-def get_donchian_levels(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    klines = state[symbol]["klines"]
-    if len(klines) < DONCHIAN_PERIODS:
-        return None, None
-    recent = list(klines)[:-1][-DONCHIAN_PERIODS:]
-    if not recent:
-        return None, None
-    highs = [k["high"] for k in recent]
-    lows  = [k["low"]  for k in recent]
-    return min(lows), max(highs)
+# ========================= SUPERTREND + FILTER INDICATORS =========================
+def calculate_true_range(high1: float, low1: float, close0: float) -> float:
+    """Calculate True Range"""
+    tr1 = high1 - low1
+    tr2 = abs(high1 - close0)
+    tr3 = abs(low1 - close0)
+    return max(tr1, tr2, tr3)
 
-def calculate_rsi(symbol: str, period: int = 14) -> Optional[float]:
+def calculate_rsi(symbol: str) -> Optional[float]:
     """Calculate RSI using completed candles"""
     klines = state[symbol]["klines"]
-    if len(klines) < period + 2:
+    if len(klines) < RSI_PERIODS + 2:
         return None
     
-    completed = list(klines)[:-1]
-    if len(completed) < period + 1:
+    completed = list(klines)[:-1]  # Exclude current incomplete candle
+    if len(completed) < RSI_PERIODS + 1:
         return None
     
-    closes = [k["close"] for k in completed[-(period + 1):]]
+    closes = [k["close"] for k in completed[-(RSI_PERIODS + 1):]]
     
     gains = []
     losses = []
@@ -226,8 +222,8 @@ def calculate_rsi(symbol: str, period: int = 14) -> Optional[float]:
             gains.append(0)
             losses.append(abs(change))
     
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    avg_gain = sum(gains) / RSI_PERIODS
+    avg_loss = sum(losses) / RSI_PERIODS
     
     if avg_loss == 0:
         return 100.0
@@ -238,13 +234,8 @@ def calculate_rsi(symbol: str, period: int = 14) -> Optional[float]:
     state[symbol]["rsi"] = rsi
     return rsi
 
-def calculate_true_range(high1: float, low1: float, close0: float) -> float:
-    tr1 = high1 - low1
-    tr2 = abs(high1 - close0)
-    tr3 = abs(low1 - close0)
-    return max(tr1, tr2, tr3)
-
 def calculate_directional_movement(high1: float, high0: float, low1: float, low0: float) -> tuple:
+    """Calculate directional movement for ADX"""
     up_move = high1 - high0
     down_move = low0 - low1
     plus_dm  = up_move if (up_move > down_move and up_move > 0) else 0
@@ -252,14 +243,18 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
     return plus_dm, minus_dm
 
 def calculate_adx(symbol: str) -> Optional[float]:
+    """Calculate ADX using completed candles"""
     klines = state[symbol]["klines"]
-    if len(klines) < ADX_PERIODS + 1:
+    if len(klines) < ADX_PERIODS + 2:
         return None
-    completed = list(klines)[:-1]
+    
+    completed = list(klines)[:-1]  # Exclude current incomplete candle
     if len(completed) < ADX_PERIODS + 1:
         return None
+    
     recent = completed[-(ADX_PERIODS + 1):]
     tr_values, plus_dm_values, minus_dm_values = [], [], []
+    
     for i in range(1, len(recent)):
         cur = recent[i]
         prev = recent[i - 1]
@@ -267,31 +262,128 @@ def calculate_adx(symbol: str) -> Optional[float]:
         plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
         plus_dm_values.append(plus_dm)
         minus_dm_values.append(minus_dm)
+    
+    # Exponential smoothing
     alpha = 1.0 / ADX_PERIODS
     sm_tr = tr_values[0]
     for tr in tr_values[1:]:
         sm_tr = alpha * tr + (1 - alpha) * sm_tr
+    
     sm_pdm = plus_dm_values[0]
     for pdm in plus_dm_values[1:]:
         sm_pdm = alpha * pdm + (1 - alpha) * sm_pdm
+    
     sm_mdm = minus_dm_values[0]
     for mdm in minus_dm_values[1:]:
         sm_mdm = alpha * mdm + (1 - alpha) * sm_mdm
+    
     if sm_tr == 0:
         return None
+    
     plus_di  = (sm_pdm / sm_tr) * 100
     minus_di = (sm_mdm / sm_tr) * 100
+    
     if (plus_di + minus_di) == 0:
         return None
+    
     dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
     prev_adx = state[symbol].get("adx")
     adx = dx if prev_adx is None else (alpha * dx + (1 - alpha) * prev_adx)
+    
     state[symbol]["adx"] = adx
-    state[symbol]["adx_ready"] = True
     return adx
 
-# ========================= TRADING LOGIC =========================
+def calculate_atr(symbol: str) -> Optional[float]:
+    """Calculate ATR using completed candles"""
+    klines = state[symbol]["klines"]
+    if len(klines) < SUPERTREND_ATR_PERIODS + 1:
+        return None
+    
+    completed = list(klines)[:-1]  # Exclude current incomplete candle
+    if len(completed) < SUPERTREND_ATR_PERIODS + 1:
+        return None
+    
+    recent = completed[-(SUPERTREND_ATR_PERIODS + 1):]
+    tr_values = []
+    
+    for i in range(1, len(recent)):
+        cur = recent[i]
+        prev = recent[i - 1]
+        tr = calculate_true_range(cur["high"], cur["low"], prev["close"])
+        tr_values.append(tr)
+    
+    if len(tr_values) < SUPERTREND_ATR_PERIODS:
+        return None
+    
+    # Simple Moving Average of True Range
+    atr = sum(tr_values[-SUPERTREND_ATR_PERIODS:]) / SUPERTREND_ATR_PERIODS
+    state[symbol]["atr"] = atr
+    return atr
+
+def calculate_supertrend(symbol: str) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    """Calculate Supertrend bands and trend direction"""
+    klines = state[symbol]["klines"]
+    if len(klines) < SUPERTREND_ATR_PERIODS + 2:
+        return None, None, None
+    
+    atr = calculate_atr(symbol)
+    if atr is None:
+        return None, None, None
+    
+    # Get current candle data
+    if len(klines) < 2:
+        return None, None, None
+    
+    current = klines[-1]
+    previous = klines[-2]
+    
+    # Calculate HL2 (actually using OHLC4: (O+H+L+C)/4 as source)
+    # For current candle, use close as open (since we don't track opens separately)
+    hl2 = (current["close"] + current["high"] + current["low"] + current["close"]) / 4
+    prev_hl2 = (previous["close"] + previous["high"] + previous["low"] + previous["close"]) / 4
+    
+    # Calculate basic upper and lower bands
+    basic_upper = hl2 + (SUPERTREND_MULTIPLIER * atr)
+    basic_lower = hl2 - (SUPERTREND_MULTIPLIER * atr)
+    
+    # Get previous values
+    prev_upper = state[symbol].get("supertrend_upper")
+    prev_lower = state[symbol].get("supertrend_lower")
+    prev_trend = state[symbol].get("supertrend_trend")
+    prev_close = previous["close"]
+    current_close = current["close"]
+    
+    # Calculate final upper and lower bands
+    if prev_upper is None or basic_upper < prev_upper or prev_close > prev_upper:
+        final_upper = basic_upper
+    else:
+        final_upper = prev_upper
+        
+    if prev_lower is None or basic_lower > prev_lower or prev_close < prev_lower:
+        final_lower = basic_lower
+    else:
+        final_lower = prev_lower
+    
+    # Determine trend
+    if prev_trend is None:
+        trend = 1  # Start with uptrend
+    elif prev_trend == -1 and current_close > final_lower:
+        trend = 1  # Change to uptrend
+    elif prev_trend == 1 and current_close < final_upper:
+        trend = -1  # Change to downtrend
+    else:
+        trend = prev_trend  # Continue current trend
+    
+    # Store values
+    state[symbol]["supertrend_upper"] = final_upper
+    state[symbol]["supertrend_lower"] = final_lower
+    state[symbol]["supertrend_trend"] = trend
+    
+    return final_upper, final_lower, trend
+
+# ========================= TRADING LOGIC WITH FILTERS =========================
 def update_trading_signals(symbol: str) -> dict:
+    """Supertrend trading logic with RSI and ADX filters"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
@@ -301,6 +393,7 @@ def update_trading_signals(symbol: str) -> dict:
     
     check_and_reset_daily_counters(symbol)
     
+    # Check daily limits
     if st["daily_limit_reached"]:
         if current_signal is not None:
             logging.info(f"{symbol} Daily limit reached, forcing exit")
@@ -308,6 +401,7 @@ def update_trading_signals(symbol: str) -> dict:
             return {"changed": True, "action": "LIMIT_EXIT", "signal": None}
         return {"changed": False, "action": "NONE", "signal": None}
     
+    # Check daily PNL limits for existing positions
     if current_signal is not None:
         current_pnl = calculate_pnl_percent(symbol, price)
         
@@ -323,80 +417,77 @@ def update_trading_signals(symbol: str) -> dict:
             st["current_signal"] = None
             return {"changed": True, "action": "LOSS_LIMIT_EXIT", "signal": None}
     
-    d_low, d_high = get_donchian_levels(symbol)
+    # Calculate all indicators
+    upper, lower, trend = calculate_supertrend(symbol)
     adx = calculate_adx(symbol)
-    rsi = calculate_rsi(symbol, RSI_PERIODS)
+    rsi = calculate_rsi(symbol)
+    prev_trend = st.get("supertrend_trend")
     
-    if d_low is None or d_high is None or adx is None or rsi is None:
+    if upper is None or lower is None or trend is None or adx is None or rsi is None:
         return {"changed": False, "action": "NONE", "signal": current_signal}
     
+    # Filter conditions
     adx_ok = (adx >= ADX_THRESHOLD)
     rsi_short_ok = (rsi < RSI_SHORT_THRESHOLD)
     rsi_long_ok = (rsi > RSI_LONG_THRESHOLD)
     
-    channel_height = d_high - d_low
-    buffer_entry = channel_height * ENTRY_BUFFER_PERCENT
-    buffer_exit = channel_height * EXIT_BUFFER_PERCENT
-    
-    short_entry_upper = d_low + buffer_entry
-    long_entry_lower = d_high - buffer_entry
-    
-    short_exit_upper = d_low + buffer_exit
-    long_exit_lower = d_high - buffer_exit
-    
-    in_short_entry_zone = price <= short_entry_upper
-    in_long_entry_zone = price >= long_entry_lower
-    in_blocking_gap = price > short_exit_upper and price < long_exit_lower
-    
-    short_should_exit = price > short_exit_upper
-    long_should_exit = price < long_exit_lower
-    
-    breakout_long = (price >= d_high) and adx_ok and rsi_long_ok
-    breakout_short = (price <= d_low) and adx_ok and rsi_short_ok
-    
-    st["zone_info"] = {
-        "in_short_entry_zone": in_short_entry_zone,
-        "in_long_entry_zone": in_long_entry_zone,
-        "in_blocking_gap": in_blocking_gap,
-        "short_entry_upper": short_entry_upper,
-        "short_exit_upper": short_exit_upper,
-        "long_entry_lower": long_entry_lower,
-        "long_exit_lower": long_exit_lower
-    }
-    
     new_signal = current_signal
     action_type = "NONE"
     
-    if current_signal is None:
-        if in_short_entry_zone and adx_ok and rsi_short_ok:
-            new_signal = "SHORT"
-            action_type = "ENTRY"
-            logging.info(f"{symbol} ENTRY SHORT (price {price:.6f} <= {short_entry_upper:.6f} & ADX {adx:.1f}>={ADX_THRESHOLD} & RSI {rsi:.1f}<{RSI_SHORT_THRESHOLD})")
-        elif in_long_entry_zone and adx_ok and rsi_long_ok:
-            new_signal = "LONG"
-            action_type = "ENTRY"
-            logging.info(f"{symbol} ENTRY LONG (price {price:.6f} >= {long_entry_lower:.6f} & ADX {adx:.1f}>={ADX_THRESHOLD} & RSI {rsi:.1f}>{RSI_LONG_THRESHOLD})")
-        elif breakout_short:
-            new_signal = "SHORT"
-            action_type = "BREAKOUT"
-            logging.info(f"{symbol} BREAKOUT SHORT (price {price:.6f} <= LOW {d_low:.6f} & ADX {adx:.1f}>={ADX_THRESHOLD} & RSI {rsi:.1f}<{RSI_SHORT_THRESHOLD})")
-        elif breakout_long:
-            new_signal = "LONG"
-            action_type = "BREAKOUT"
-            logging.info(f"{symbol} BREAKOUT LONG (price {price:.6f} >= HIGH {d_high:.6f} & ADX {adx:.1f}>={ADX_THRESHOLD} & RSI {rsi:.1f}>{RSI_LONG_THRESHOLD})")
+    # Check for trend changes with filters (main signals)
+    if prev_trend is not None and trend != prev_trend:
+        if trend == 1 and prev_trend == -1:
+            # Trend changed from down to up - BUY signal (with filters)
+            if adx_ok and rsi_long_ok:
+                new_signal = "LONG"
+                action_type = "TREND_CHANGE"
+                logging.info(f"{symbol} SUPERTREND BUY SIGNAL (trend: DOWN→UP, price {price:.6f} > {lower:.6f}, ADX {adx:.1f}>={ADX_THRESHOLD}, RSI {rsi:.1f}>{RSI_LONG_THRESHOLD})")
+            else:
+                logging.info(f"{symbol} SUPERTREND trend changed to UP but filters failed (ADX {adx:.1f}, RSI {rsi:.1f}) - staying FLAT")
+                
+        elif trend == -1 and prev_trend == 1:
+            # Trend changed from up to down - SELL signal (with filters)
+            if adx_ok and rsi_short_ok:
+                new_signal = "SHORT"
+                action_type = "TREND_CHANGE"
+                logging.info(f"{symbol} SUPERTREND SELL SIGNAL (trend: UP→DOWN, price {price:.6f} < {upper:.6f}, ADX {adx:.1f}>={ADX_THRESHOLD}, RSI {rsi:.1f}<{RSI_SHORT_THRESHOLD})")
+            else:
+                logging.info(f"{symbol} SUPERTREND trend changed to DOWN but filters failed (ADX {adx:.1f}, RSI {rsi:.1f}) - staying FLAT")
     
+    # For no position, align with current trend (with filters)
+    elif current_signal is None:
+        if trend == 1 and adx_ok and rsi_long_ok:
+            new_signal = "LONG"
+            action_type = "ENTRY"
+            logging.info(f"{symbol} SUPERTREND LONG ENTRY (uptrend + filters confirmed, price {price:.6f} > {lower:.6f}, ADX {adx:.1f}, RSI {rsi:.1f})")
+        elif trend == -1 and adx_ok and rsi_short_ok:
+            new_signal = "SHORT"
+            action_type = "ENTRY"
+            logging.info(f"{symbol} SUPERTREND SHORT ENTRY (downtrend + filters confirmed, price {price:.6f} < {upper:.6f}, ADX {adx:.1f}, RSI {rsi:.1f})")
+    
+    # Exit logic - exit when ALL conditions are met
     elif current_signal == "LONG":
-        if long_should_exit:
+        # Exit LONG when: trend DOWN + ADX low + RSI low
+        if trend == -1 and adx < ADX_THRESHOLD and rsi <= RSI_LONG_THRESHOLD:
             new_signal = None
             action_type = "EXIT"
-            logging.info(f"{symbol} EXIT LONG (price {price:.6f} < exit threshold {long_exit_lower:.6f})")
-    
+            logging.info(f"{symbol} SUPERTREND EXIT LONG (ALL conditions met: trend→DOWN, ADX {adx:.1f}<{ADX_THRESHOLD}, RSI {rsi:.1f}≤{RSI_LONG_THRESHOLD})")
+        # Also exit on trend change alone if it's a strong reversal
+        elif trend == -1:
+            # Check if this is just a trend change without filter confirmation
+            logging.info(f"{symbol} SUPERTREND trend changed to DOWN but filters not aligned (ADX {adx:.1f}, RSI {rsi:.1f}) - holding LONG position")
+            
     elif current_signal == "SHORT":
-        if short_should_exit:
+        # Exit SHORT when: trend UP + ADX low + RSI high  
+        if trend == 1 and adx < ADX_THRESHOLD and rsi >= RSI_SHORT_THRESHOLD:
             new_signal = None
             action_type = "EXIT"
-            logging.info(f"{symbol} EXIT SHORT (price {price:.6f} > exit threshold {short_exit_upper:.6f})")
+            logging.info(f"{symbol} SUPERTREND EXIT SHORT (ALL conditions met: trend→UP, ADX {adx:.1f}<{ADX_THRESHOLD}, RSI {rsi:.1f}≥{RSI_SHORT_THRESHOLD})")
+        # Also log when trend changes but filters not aligned
+        elif trend == 1:
+            logging.info(f"{symbol} SUPERTREND trend changed to UP but filters not aligned (ADX {adx:.1f}, RSI {rsi:.1f}) - holding SHORT position")
     
+    # Handle signal changes
     if new_signal != current_signal:
         st["current_signal"] = new_signal
         st["last_signal_change"] = time.time()
@@ -411,7 +502,7 @@ async def price_feed_loop(client: AsyncClient):
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                logging.info("WebSocket connected")
+                logging.info("WebSocket connected (using hourly timeframe)")
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
@@ -422,90 +513,123 @@ async def price_feed_loop(client: AsyncClient):
                             price = float(price_str)
                             state[symbol]["price"] = price
                             event_time /= 1000
-                            minute = int(event_time // 60)
+                            
+                            # Use hourly candles instead of minute candles
+                            hour = int(event_time // 3600)  # Convert to hours
                             klines = state[symbol]["klines"]
-                            if not klines or klines[-1]["minute"] != minute:
-                                klines.append({"minute": minute, "high": price, "low": price, "close": price})
+                            
+                            # Update hourly kline data
+                            if not klines or klines[-1]["hour"] != hour:
+                                klines.append({"hour": hour, "high": price, "low": price, "close": price, "open": price})
                             else:
                                 klines[-1]["high"] = max(klines[-1]["high"], price)
                                 klines[-1]["low"] = min(klines[-1]["low"], price)
                                 klines[-1]["close"] = price
-                            if len(klines) >= DONCHIAN_PERIODS and not state[symbol]["ready"]:
-                                dlow, dhigh = get_donchian_levels(symbol)
+                            
+                            # Check if ready (need all indicators)
+                            required_candles = max(SUPERTREND_ATR_PERIODS, ADX_PERIODS, RSI_PERIODS) + 1
+                            if len(klines) >= required_candles and not state[symbol]["ready"]:
+                                atr = calculate_atr(symbol)
                                 adx = calculate_adx(symbol)
-                                rsi = calculate_rsi(symbol, RSI_PERIODS)
-                                if (dlow is not None) and (dhigh is not None) and (adx is not None and adx >= ADX_THRESHOLD) and (rsi is not None):
+                                rsi = calculate_rsi(symbol)
+                                if atr is not None and adx is not None and rsi is not None:
+                                    calculate_supertrend(symbol)
                                     state[symbol]["ready"] = True
-                                    logging.info(f"{symbol} ready ({len(klines)} candles, ADX {adx:.1f}>={ADX_THRESHOLD}, RSI {rsi:.1f})")
-                                else:
-                                    calculate_adx(symbol)
-                                    calculate_rsi(symbol, RSI_PERIODS)
+                                    logging.info(f"{symbol} ready ({len(klines)} hourly candles, ATR {atr:.6f}, ADX {adx:.1f}, RSI {rsi:.1f})")
                             else:
-                                calculate_adx(symbol)
-                                calculate_rsi(symbol, RSI_PERIODS)
+                                # Always calculate indicators for ready symbols
+                                if state[symbol]["ready"]:
+                                    calculate_atr(symbol)
+                                    calculate_adx(symbol)
+                                    calculate_rsi(symbol)
+                                    calculate_supertrend(symbol)
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
         except Exception as e:
             logging.warning(f"WebSocket error: {e}. Reconnecting...")
             await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 async def status_logger():
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(300)  # Every 5 minutes
         current_time = time.strftime("%H:%M", time.localtime())
-        logging.info(f"=== STATUS REPORT {current_time} ===")
+        logging.info(f"=== SUPERTREND STATUS REPORT {current_time} ===")
         for symbol in SYMBOLS:
             st = state[symbol]
             if not st["ready"]:
                 candle_count = len(st["klines"])
-                remaining = max(0, DONCHIAN_PERIODS - candle_count)
-                logging.info(f"{symbol}: Not ready - {candle_count}/{DONCHIAN_PERIODS} candles ({remaining} more needed)")
+                required = max(SUPERTREND_ATR_PERIODS, ADX_PERIODS, RSI_PERIODS) + 1
+                remaining = max(0, required - candle_count)
+                logging.info(f"{symbol}: Not ready - {candle_count}/{required} hourly candles ({remaining} more needed)")
                 continue
+            
             price = st["price"]
-            d_low, d_high = get_donchian_levels(symbol)
+            if price is None:
+                continue
+                
+            current_sig = st["current_signal"]
+            display_sig = current_sig or "FLAT"
+            atr = st.get("atr")
             adx = st.get("adx")
             rsi = st.get("rsi")
-            zone_info = st.get("zone_info")
+            upper = st.get("supertrend_upper")
+            lower = st.get("supertrend_lower")
+            trend = st.get("supertrend_trend")
             
-            if d_low and d_high and price and zone_info:
-                current_sig = st["current_signal"]
-                display_sig = current_sig or "FLAT"
-                
-                logging.info(f"{symbol}: Price={price:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'} | RSI={f'{rsi:.1f}' if rsi is not None else 'N/A'}")
-                logging.info(f"  Donchian: LOW={d_low:.6f} HIGH={d_high:.6f}")
-                logging.info(f"  Signal: {display_sig}")
-                
-                daily_pnl_color = "+" if st["daily_pnl"] >= 0 else ""
-                logging.info(f"  Daily PNL: {daily_pnl_color}{st['daily_pnl']:.2f}% (Target: +{DAILY_PROFIT_TARGET}% / Limit: {DAILY_LOSS_LIMIT}%)")
-                
-                if st["daily_limit_reached"]:
-                    if st["daily_pnl"] >= DAILY_PROFIT_TARGET:
-                        logging.info(f"  STATUS: PROFIT TARGET REACHED - Trading paused until next day")
-                    else:
-                        logging.info(f"  STATUS: LOSS LIMIT HIT - Trading paused until next day")
+            logging.info(f"{symbol}: Price={price:.6f} | Signal: {display_sig}")
+            
+            daily_pnl_color = "+" if st["daily_pnl"] >= 0 else ""
+            logging.info(f"  Daily PNL: {daily_pnl_color}{st['daily_pnl']:.2f}% (Target: +{DAILY_PROFIT_TARGET}% / Limit: {DAILY_LOSS_LIMIT}%)")
+            
+            if st["daily_limit_reached"]:
+                if st["daily_pnl"] >= DAILY_PROFIT_TARGET:
+                    logging.info(f"  STATUS: PROFIT TARGET REACHED - Trading paused until next day")
                 else:
-                    entry_pct = int(ENTRY_BUFFER_PERCENT * 100)
-                    exit_pct = int(EXIT_BUFFER_PERCENT * 100)
-                    logging.info(f"  Zones:")
-                    logging.info(f"    SHORT entry: <={zone_info['short_entry_upper']:.6f} (LOW to LOW+{entry_pct}%)")
-                    logging.info(f"    SHORT exit: >{zone_info['short_exit_upper']:.6f} (LOW+{exit_pct}%)")
-                    logging.info(f"    BLOCKING GAP: {zone_info['short_exit_upper']:.6f} to {zone_info['long_exit_lower']:.6f}")
-                    logging.info(f"    LONG exit: <{zone_info['long_exit_lower']:.6f} (HIGH-{exit_pct}%)")
-                    logging.info(f"    LONG entry: >={zone_info['long_entry_lower']:.6f} (HIGH-{entry_pct}% to HIGH)")
-                    logging.info(f"  RSI Filters: SHORT<{RSI_SHORT_THRESHOLD} | LONG>{RSI_LONG_THRESHOLD}")
-                    logging.info(f"  Current location:")
-                    logging.info(f"    In SHORT entry zone: {zone_info['in_short_entry_zone']}")
-                    logging.info(f"    In BLOCKING GAP: {zone_info['in_blocking_gap']}")
-                    logging.info(f"    In LONG entry zone: {zone_info['in_long_entry_zone']}")
-                    
-                    if current_sig is None:
-                        logging.info(f"  FLAT - Waiting for entry zone (ADX>={ADX_THRESHOLD} & RSI conditions)")
-                    elif current_sig == "LONG":
-                        current_pnl = calculate_pnl_percent(symbol, price)
-                        logging.info(f"  LONG - Current PNL: {current_pnl:+.2f}% | Will exit if price <{zone_info['long_exit_lower']:.6f}")
-                    elif current_sig == "SHORT":
-                        current_pnl = calculate_pnl_percent(symbol, price)
-                        logging.info(f"  SHORT - Current PNL: {current_pnl:+.2f}% | Will exit if price >{zone_info['short_exit_upper']:.6f}")
+                    logging.info(f"  STATUS: LOSS LIMIT HIT - Trading paused until next day")
+                continue
+            
+            if atr and adx is not None and rsi is not None and upper and lower and trend is not None:
+                trend_text = "UP" if trend == 1 else "DOWN"
+                active_band = lower if trend == 1 else upper
+                
+                # Filter status
+                adx_status = "✓" if adx >= ADX_THRESHOLD else "✗"
+                rsi_long_status = "✓" if rsi > RSI_LONG_THRESHOLD else "✗"
+                rsi_short_status = "✓" if rsi < RSI_SHORT_THRESHOLD else "✗"
+                
+                logging.info(f"  Supertrend: ATR={atr:.6f} | Trend: {trend_text} | Multiplier: {SUPERTREND_MULTIPLIER}")
+                logging.info(f"  Upper Band: {upper:.6f} | Lower Band: {lower:.6f}")
+                logging.info(f"  Active Band: {active_band:.6f} (current trailing stop)")
+                logging.info(f"  Filters: ADX={adx:.1f}{adx_status}(≥{ADX_THRESHOLD}) | RSI={rsi:.1f} [LONG{rsi_long_status}(>{RSI_LONG_THRESHOLD}) | SHORT{rsi_short_status}(<{RSI_SHORT_THRESHOLD})]")
+                
+                if current_sig is None:
+                    if trend == 1:
+                        filter_status = "✓" if adx >= ADX_THRESHOLD and rsi > RSI_LONG_THRESHOLD else "✗"
+                        logging.info(f"  FLAT - Uptrend active, filters {filter_status} for LONG entry")
+                    else:
+                        filter_status = "✓" if adx >= ADX_THRESHOLD and rsi < RSI_SHORT_THRESHOLD else "✗"
+                        logging.info(f"  FLAT - Downtrend active, filters {filter_status} for SHORT entry")
+                elif current_sig == "LONG":
+                    current_pnl = calculate_pnl_percent(symbol, price)
+                    # Check exit conditions
+                    will_exit = trend == -1 and adx < ADX_THRESHOLD and rsi <= RSI_LONG_THRESHOLD
+                    exit_status = "✓" if will_exit else "✗"
+                    logging.info(f"  LONG - Current PNL: {current_pnl:+.2f}% | Protected by lower band {lower:.6f}")
+                    logging.info(f"    Exit conditions {exit_status}: trend DOWN({trend == -1}) + ADX<{ADX_THRESHOLD}({adx < ADX_THRESHOLD}) + RSI≤{RSI_LONG_THRESHOLD}({rsi <= RSI_LONG_THRESHOLD})")
+                elif current_sig == "SHORT":
+                    current_pnl = calculate_pnl_percent(symbol, price)
+                    # Check exit conditions  
+                    will_exit = trend == 1 and adx < ADX_THRESHOLD and rsi >= RSI_SHORT_THRESHOLD
+                    exit_status = "✓" if will_exit else "✗"
+                    logging.info(f"  SHORT - Current PNL: {current_pnl:+.2f}% | Protected by upper band {upper:.6f}")
+                    logging.info(f"    Exit conditions {exit_status}: trend UP({trend == 1}) + ADX<{ADX_THRESHOLD}({adx < ADX_THRESHOLD}) + RSI≥{RSI_SHORT_THRESHOLD}({rsi >= RSI_SHORT_THRESHOLD})") = calculate_pnl_percent(symbol, price)
+                    logging.info(f"  LONG - Current PNL: {current_pnl:+.2f}% | Protected by lower band {lower:.6f}")
+                    logging.info(f"    Will exit if trend changes to DOWN (price < {upper:.6f})")
+                elif current_sig == "SHORT":
+                    current_pnl = calculate_pnl_percent(symbol, price)
+                    logging.info(f"  SHORT - Current PNL: {current_pnl:+.2f}% | Protected by upper band {upper:.6f}")
+                    logging.info(f"    Will exit if trend changes to UP (price > {lower:.6f})")
         
         logging.info("=== END STATUS REPORT ===")
 
@@ -516,9 +640,12 @@ async def trading_loop(client: AsyncClient):
             st = state[symbol]
             if not st["ready"]:
                 continue
+            
             signal_result = update_trading_signals(symbol)
             target_size = SYMBOLS[symbol]
             current_signal = st["current_signal"]
+            
+            # Calculate target position
             if current_signal == "LONG":
                 final_position = target_size
             elif current_signal == "SHORT":
@@ -527,6 +654,8 @@ async def trading_loop(client: AsyncClient):
                 final_position = 0.0
             else:
                 final_position = st["current_position"]
+            
+            # Execute if signal changed
             if signal_result["changed"]:
                 current_pos = st["current_position"]
                 if abs(final_position - current_pos) > 1e-12:
@@ -537,6 +666,8 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
     now = time.time()
     last_target = st.get("last_target", None)
     last_when = st.get("last_exec_ts", 0.0)
+    
+    # Prevent duplicate executions
     if last_target is not None and abs(target - last_target) < 1e-12 and (now - last_when) < 2.0:
         logging.info(f"{symbol} dedup: skipping duplicate execution")
         return
@@ -544,6 +675,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
         return
     
     try:
+        # Calculate PNL when closing position
         if current != 0.0 and target == 0.0 and st["entry_price"] is not None:
             current_price = st["price"]
             closed_pnl = calculate_pnl_percent(symbol, current_price)
@@ -551,7 +683,9 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
             pnl_sign = "+" if closed_pnl >= 0 else ""
             logging.info(f"{symbol} Position closed with {pnl_sign}{closed_pnl:.2f}% PNL. Daily total: {st['daily_pnl']:+.2f}%")
         
+        # Execute order logic
         if target == 0.0:
+            # Close all positions
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
                 if not ok:
@@ -561,7 +695,9 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                 if not ok:
                     return
         elif target > 0:
+            # Go long
             if current < 0:
+                # Close short first, then open long
                 ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
                 if not ok:
                     return
@@ -569,6 +705,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                 if not ok:
                     return
             else:
+                # Adjust long position
                 if target > current:
                     ok = await place_order(client, symbol, "BUY", target - current, "LONG ENTRY")
                     if not ok:
@@ -578,7 +715,9 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     if not ok:
                         return
         else:
+            # Go short (target < 0)
             if current > 0:
+                # Close long first, then open short
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
                 if not ok:
                     return
@@ -586,6 +725,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                 if not ok:
                     return
             else:
+                # Adjust short position
                 cur_abs = abs(current)
                 tgt_abs = abs(target)
                 if tgt_abs > cur_abs:
@@ -597,12 +737,14 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     if not ok:
                         return
         
+        # Update entry price
         if target != 0.0 and current == 0.0:
             st["entry_price"] = st["price"]
             logging.info(f"{symbol} Entry price set: {st['entry_price']:.6f}")
         elif target == 0.0:
             st["entry_price"] = None
         
+        # Update state
         st["current_position"] = target
         st["last_target"] = target
         st["last_exec_ts"] = now
@@ -610,47 +752,62 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
         logging.error(f"{symbol} position change failed: {e}")
 
 async def init_bot(client: AsyncClient):
-    logging.info("Initializing bot...")
+    logging.info("Initializing Supertrend bot...")
     load_klines()
     symbols_needing_data = []
+    
     for symbol in SYMBOLS:
         klines = state[symbol]["klines"]
-        d_ready = len(klines) >= DONCHIAN_PERIODS and get_donchian_levels(symbol)[0] is not None
-        a_value = calculate_adx(symbol)
-        r_value = calculate_rsi(symbol, RSI_PERIODS)
-        a_ready = (a_value is not None and a_value >= ADX_THRESHOLD)
-        r_ready = (r_value is not None)
-        if d_ready and a_ready and r_ready:
+        required_periods = max(SUPERTREND_ATR_PERIODS, ADX_PERIODS, RSI_PERIODS)
+        atr = calculate_atr(symbol)
+        adx = calculate_adx(symbol)
+        rsi = calculate_rsi(symbol)
+        
+        if len(klines) >= required_periods + 1 and atr is not None and adx is not None and rsi is not None:
+            calculate_supertrend(symbol)
             state[symbol]["ready"] = True
-            logging.info(f"{symbol} ready ({len(klines)} candles, ADX {a_value:.1f}>={ADX_THRESHOLD}, RSI {r_value:.1f})")
+            logging.info(f"{symbol} ready ({len(klines)} hourly candles, ATR {atr:.6f}, ADX {adx:.1f}, RSI {rsi:.1f})")
         else:
             symbols_needing_data.append(symbol)
-            logging.info(f"{symbol} needs data ({len(klines)}/{DONCHIAN_PERIODS} candles)")
+            logging.info(f"{symbol} needs data ({len(klines)}/{required_periods + 1} hourly candles)")
+    
     if symbols_needing_data:
         logging.info(f"Fetching historical data for {len(symbols_needing_data)} symbols...")
         successful_fetches = 0
+        required_periods = max(SUPERTREND_ATR_PERIODS, ADX_PERIODS, RSI_PERIODS)
+        
         for i, symbol in enumerate(symbols_needing_data):
             try:
                 logging.info(f"Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
-                klines_data = await safe_api_call(client.futures_mark_price_klines, symbol=symbol, interval="1m", limit=DONCHIAN_PERIODS + 50)
+                # Fetch hourly klines instead of minute klines
+                klines_data = await safe_api_call(client.futures_klines, symbol=symbol, interval=TIMEFRAME, limit=required_periods + 20)
                 st = state[symbol]
                 st["klines"].clear()
+                
                 for kline in klines_data:
-                    minute = int(float(kline[0]) / 1000 // 60)
-                    st["klines"].append({"minute": minute, "high": float(kline[2]), "low": float(kline[3]), "close": float(kline[4])})
-                d_ok = get_donchian_levels(symbol)[0] is not None
-                a_val = calculate_adx(symbol)
-                r_val = calculate_rsi(symbol, RSI_PERIODS)
-                a_ok = (a_val is not None and a_val >= ADX_THRESHOLD)
-                r_ok = (r_val is not None)
-                if d_ok and a_ok and r_ok:
+                    hour = int(float(kline[0]) / 1000 // 3600)  # Convert to hours
+                    st["klines"].append({
+                        "hour": hour, 
+                        "open": float(kline[1]),
+                        "high": float(kline[2]), 
+                        "low": float(kline[3]), 
+                        "close": float(kline[4])
+                    })
+                
+                atr = calculate_atr(symbol)
+                adx = calculate_adx(symbol)
+                rsi = calculate_rsi(symbol)
+                
+                if atr is not None and adx is not None and rsi is not None:
+                    calculate_supertrend(symbol)
                     st["ready"] = True
-                    logging.info(f"{symbol} ready ({len(st['klines'])} candles, ADX {a_val:.1f}, RSI {r_val:.1f})")
+                    logging.info(f"{symbol} ready ({len(st['klines'])} hourly candles, ATR {atr:.6f}, ADX {adx:.1f}, RSI {rsi:.1f})")
                     successful_fetches += 1
                 else:
-                    logging.warning(f"{symbol} insufficient data ({len(st['klines'])} candles)")
+                    logging.warning(f"{symbol} insufficient data ({len(st['klines'])} hourly candles)")
+                
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(120)  # Rate limiting
             except Exception as e:
                 logging.error(f"{symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
@@ -658,6 +815,8 @@ async def init_bot(client: AsyncClient):
         logging.info(f"Fetch complete: {successful_fetches}/{len(symbols_needing_data)} successful")
     else:
         logging.info("All symbols ready from loaded data")
+    
+    # Synchronize positions
     logging.info("Synchronizing positions...")
     try:
         for symbol in SYMBOLS:
@@ -686,6 +845,7 @@ async def init_bot(client: AsyncClient):
                 state[symbol]["current_position"] = 0.0
     except Exception as e:
         logging.error(f"Position sync failed: {e}")
+    
     save_klines()
     await asyncio.sleep(2)
     logging.info("Initialization complete")
@@ -700,7 +860,7 @@ async def main():
         price_task = asyncio.create_task(price_feed_loop(client))
         trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
-        logging.info("Bot started")
+        logging.info("Supertrend bot started")
         await asyncio.gather(price_task, trade_task, status_task)
     finally:
         await client.close_connection()
@@ -708,59 +868,96 @@ async def main():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
     print("=" * 80)
-    print("DONCHIAN + ADX + RSI BOT - Adjustable Entry/Exit Buffers with Daily Limits")
+    print("SUPERTREND + FILTERS TRADING BOT - Anti-Ping-Pong Version")
     print("=" * 80)
-    print("STRATEGY: Counter-Trend with Adjustable Buffer Zones + RSI Filter + Daily PNL")
+    print("SUPERTREND + ADX + RSI STRATEGY:")
+    print("Trend-Following with volatility and momentum filters to reduce false signals")
     print("")
-    print("BUFFER CONFIGURATION:")
-    print(f"  Entry Buffer: {ENTRY_BUFFER_PERCENT*100:.0f}% from channel edge")
-    print(f"  Exit Buffer: {EXIT_BUFFER_PERCENT*100:.0f}% from channel edge")
-    print(f"  Safety Margin: {SAFETY_MARGIN_PERCENT*100:.0f}% (prevents oscillation)")
+    print("CURRENT CONFIGURATION:")
+    print(f"  Timeframe: {TIMEFRAME} (hourly candles)")
+    print(f"  ATR Period: {SUPERTREND_ATR_PERIODS} hours")
+    print(f"  ATR Multiplier: {SUPERTREND_MULTIPLIER}")
+    print(f"  ADX Period: {ADX_PERIODS} hours")
+    print(f"  ADX Threshold: {ADX_THRESHOLD} (volatility filter)")
+    print(f"  RSI Period: {RSI_PERIODS} hours")
+    print(f"  RSI Thresholds: SHORT<{RSI_SHORT_THRESHOLD} | LONG>{RSI_LONG_THRESHOLD}")
+    print(f"  Source: OHLC4 (Open + High + Low + Close) / 4")
     print("")
-    print("ENTRY/EXIT ZONES:")
-    print("  SHORT zone:")
-    print(f"    Entry: Price <= LOW+{ENTRY_BUFFER_PERCENT*100:.0f}%")
-    print(f"    Hold: While price <= LOW+{EXIT_BUFFER_PERCENT*100:.0f}%")
-    print(f"    Exit: When price > LOW+{EXIT_BUFFER_PERCENT*100:.0f}%")
-    print("    RSI Filter: RSI < 49")
+    print("HOURLY TIMEFRAME BENEFITS:")
+    print("  - Much larger ATR values for better band separation")
+    print("  - Reduced noise compared to minute-based signals")
+    print("  - More reliable trend detection over longer periods")
+    print("  - Less frequent but higher-quality signals")
+    print("  - Better suited for swing trading approach")
     print("")
-    print(f"  BLOCKING GAP: Between LOW+{EXIT_BUFFER_PERCENT*100:.0f}% and HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
-    print("    → Stay FLAT, wait for entry zone")
+    print("ENTRY SIGNALS (All conditions required):")
+    print("  LONG Entry:")
+    print("    - Supertrend changes from DOWN to UP")
+    print(f"    - ADX >= {ADX_THRESHOLD} (confirms volatility)")
+    print(f"    - RSI > {RSI_LONG_THRESHOLD} (confirms upward momentum)")
     print("")
-    print("  LONG zone:")
-    print(f"    Entry: Price >= HIGH-{ENTRY_BUFFER_PERCENT*100:.0f}%")
-    print(f"    Hold: While price >= HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
-    print(f"    Exit: When price < HIGH-{EXIT_BUFFER_PERCENT*100:.0f}%")
-    print("    RSI Filter: RSI > 51")
+    print("  SHORT Entry:")
+    print("    - Supertrend changes from UP to DOWN")
+    print(f"    - ADX >= {ADX_THRESHOLD} (confirms volatility)")
+    print(f"    - RSI < {RSI_SHORT_THRESHOLD} (confirms downward momentum)")
     print("")
-    print("FILTERS:")
-    print(f"  - ADX >= {ADX_THRESHOLD} (volatility confirmation)")
-    print(f"  - RSI < {RSI_SHORT_THRESHOLD} for SHORT entries")
-    print(f"  - RSI > {RSI_LONG_THRESHOLD} for LONG entries")
+    print("EXIT SIGNALS (All conditions required):")
+    print("  LONG Exit (ALL must be true):")
+    print("    - Supertrend changes to DOWN")
+    print(f"    - ADX falls below {ADX_THRESHOLD} (volatility decreases)")
+    print(f"    - RSI falls to {RSI_LONG_THRESHOLD} or below (momentum weakens)")
+    print("")
+    print("  SHORT Exit (ALL must be true):")
+    print("    - Supertrend changes to UP") 
+    print(f"    - ADX falls below {ADX_THRESHOLD} (volatility decreases)")
+    print(f"    - RSI rises to {RSI_SHORT_THRESHOLD} or above (momentum weakens)")
+    print("")
+    print("POSITION HOLDING:")
+    print("  - If Supertrend changes but filters don't align → HOLD position")
+    print("  - Only exits when ALL three conditions confirm the reversal")
+    print("  - Prevents premature exits during temporary pullbacks")
+    print("")
+    print("ANTI-PING-PONG BENEFITS:")
+    print("  - ADX filter prevents trading in sideways/low volatility markets")
+    print("  - RSI filter confirms momentum direction before entry")
+    print("  - Reduces false breakouts and whipsaw trades")
+    print("  - Only exits on trend change (no filter interference)")
     print("")
     print("DAILY PNL LIMITS (Per Symbol):")
     print(f"  Profit Target: +{DAILY_PROFIT_TARGET}% → Stop trading for the day")
     print(f"  Loss Limit: {DAILY_LOSS_LIMIT}% → Stop trading for the day")
     print("  Resets: Midnight UTC every day")
     print("")
-    print("CONFIGURATION:")
-    print("  To adjust buffers, add to your .env file:")
-    print("    ENTRY_BUFFER_PERCENT=0.30  # 30% entry buffer (default)")
-    print("    EXIT_BUFFER_PERCENT=0.40   # 40% exit buffer (default)")
-    print("    DAILY_PROFIT_TARGET=200.0  # Profit target % (default)")
-    print("    DAILY_LOSS_LIMIT=-100.0    # Loss limit % (default)")
+    print("ADJUSTABLE SETTINGS:")
+    print("  Add to your .env file to customize:")
+    print("    SUPERTREND_ATR_PERIODS=19      # ATR calculation period in hours")
+    print("    SUPERTREND_MULTIPLIER=2.0      # ATR multiplier for bands")
+    print("    ADX_PERIODS=19                 # ADX calculation period in hours")
+    print("    ADX_THRESHOLD=25.0             # Minimum ADX for entry")
+    print("    RSI_PERIODS=19                 # RSI calculation period in hours")
+    print("    RSI_LONG_THRESHOLD=51.0        # RSI threshold for LONG")
+    print("    RSI_SHORT_THRESHOLD=49.0       # RSI threshold for SHORT")
+    print("    DAILY_PROFIT_TARGET=200.0      # Daily profit target %")
+    print("    DAILY_LOSS_LIMIT=-100.0        # Daily loss limit %")
     print("")
-    print("RULES:")
-    print("  - Entry requires: Zone + ADX + RSI all confirmed")
-    print(f"  - {SAFETY_MARGIN_PERCENT*100:.0f}% safety margin between entry and exit prevents oscillation")
-    print("  - Breakouts override zones (price >= HIGH or <= LOW)")
-    print("  - No flipping: Exit to FLAT, then re-enter if conditions met")
-    print("  - When daily limit reached: Close positions, block new entries")
+    print("PERIOD GUIDE (in hours):")
+    print("  - Shorter periods (12-24h): More responsive to recent changes")
+    print("  - Medium periods (24-48h): Balanced approach (recommended)")
+    print("  - Longer periods (48h+): Smoother, longer-term trends")
+    print("  - Default 19h: Captures full trading day plus some overlap")
+    print("")
+    print("FILTER GUIDE:")
+    print("  ADX Threshold:")
+    print("    - Lower (15-20): More signals, some in sideways markets")
+    print("    - Medium (25-30): Balanced (recommended)")
+    print("    - Higher (35+): Only very strong trends")
+    print("")
+    print("  RSI Thresholds:")
+    print("    - Closer to 50: More signals, earlier entries")
+    print("    - Further from 50: Fewer signals, stronger confirmations")
+    print("    - Current gap (49-51): Small buffer around neutral")
     print("")
     print(f"Symbols: {list(SYMBOLS.keys())}")
     print(f"Leverage: {LEVERAGE}x")
-    print(f"Donchian Period: {DONCHIAN_PERIODS} minutes ({DONCHIAN_PERIODS/60:.1f} hours)")
-    print(f"ADX Period: {ADX_PERIODS} minutes ({ADX_PERIODS/60:.1f} hours)")
-    print(f"RSI Period: {RSI_PERIODS} minutes")
     print("=" * 80)
     asyncio.run(main())
