@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+LEVERAGE = int(os.getenv("LEVERAGE", "50"))
 
 SYMBOLS = {
     "ETHUSDT": 0.01,
@@ -27,10 +27,10 @@ PRECISIONS = {
     "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-DONCHIAN_PERIODS = 1200
-ADX_PERIODS      = 1200
+DONCHIAN_PERIODS = 1140
+ADX_PERIODS      = 1140
 ADX_THRESHOLD    = 25
-RSI_PERIODS      = 14
+RSI_PERIODS      = 1140
 RSI_SHORT_THRESHOLD = 49  # SHORT entry when RSI < 49
 RSI_LONG_THRESHOLD = 51   # LONG entry when RSI > 51
 KLINE_LIMIT      = 1300
@@ -38,11 +38,11 @@ KLINE_LIMIT      = 1300
 # ========================= ADJUSTABLE BUFFERS =========================
 # Entry buffer: Distance from channel edge where entries are allowed
 # Format: percentage (0.0 to 1.0), e.g., 0.30 = 30% from edge
-ENTRY_BUFFER_PERCENT = float(os.getenv("ENTRY_BUFFER_PERCENT", "0.30"))  # 30% default
+ENTRY_BUFFER_PERCENT = float(os.getenv("ENTRY_BUFFER_PERCENT", "0.20"))  # 20% default
 
 # Exit buffer: Distance from channel edge where exits trigger
 # Should be larger than ENTRY_BUFFER to create safety margin
-EXIT_BUFFER_PERCENT = float(os.getenv("EXIT_BUFFER_PERCENT", "0.40"))  # 40% default
+EXIT_BUFFER_PERCENT = float(os.getenv("EXIT_BUFFER_PERCENT", "0.30"))  # 30% default
 
 # Validate buffers
 if EXIT_BUFFER_PERCENT <= ENTRY_BUFFER_PERCENT:
