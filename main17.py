@@ -11,8 +11,33 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
-DI_PERIODS = int(os.getenv("DI_PERIODS", "9"))
-USE_DI = True  # Changed from os.getenv("USE_DI", "True").lower() == "true"
+DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
+USE_DI = False  # Toggle DMI indicator
+USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles (Single smoothing - matches TradingView)
+MA_TYPE = "JMA"  # Options: "DEMA", "HULL", or "JMA"
+
+# Base timeframe configuration (must be defined BEFORE JMA parameters)
+BASE_TIMEFRAME = "15m"  # or "1h" or "1m"
+
+if BASE_TIMEFRAME == "1m":
+    BASE_MINUTES = 1
+    AGGREGATION_MINUTES = 3     # Aggregate to 3 minutes
+    DEMA_PERIODS = 600          # 600 * 3m = 30 hours
+elif BASE_TIMEFRAME == "15m":
+    BASE_MINUTES = 15
+    AGGREGATION_MINUTES = 45    # Aggregate to 45 minutes
+    DEMA_PERIODS = 12           # 12 * 45m = 9 hours
+elif BASE_TIMEFRAME == "1h":
+    BASE_MINUTES = 60
+    AGGREGATION_MINUTES = 180   # Keep at 3 hours
+    DEMA_PERIODS = 3            # 3 * 180m = 9 hours
+else:
+    raise ValueError("Unsupported BASE_TIMEFRAME")
+
+# JMA specific parameters (defined AFTER DEMA_PERIODS, only used when MA_TYPE = "JMA")
+JMA_LENGTH = DEMA_PERIODS  # Matches DEMA for fair comparison
+JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot (default 50)
+JMA_POWER = 2              # Smoothness level, 1-3 (default 2)
 
 # Trading symbols and sizes
 SYMBOLS = {
@@ -30,54 +55,43 @@ PRECISIONS = {
     "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-# Base timeframe configuration
-BASE_TIMEFRAME = "1h"  # or "15m" or "1m"
-
-if BASE_TIMEFRAME == "1m":
-    BASE_MINUTES = 1
-    AGGREGATION_MINUTES = 3     # Aggregate to 3 minutes instead of 180
-    DEMA_PERIODS = 600          # 600 * 3m = 30 hours
-elif BASE_TIMEFRAME == "15m":
-    BASE_MINUTES = 15
-    AGGREGATION_MINUTES = 45    # Aggregate to 45 minutes instead of 180
-    DEMA_PERIODS = 40           # 40 * 45m = 30 hours
-elif BASE_TIMEFRAME == "1h":
-    BASE_MINUTES = 60
-    AGGREGATION_MINUTES = 180   # Keep at 3 hours
-    DEMA_PERIODS = 3           # 3 * 180m = 9 hours
-else:
-    raise ValueError("Unsupported BASE_TIMEFRAME")
+# MA_PERIODS is used for DEMA and HULL (JMA uses JMA_LENGTH)
+MA_PERIODS = DEMA_PERIODS if MA_TYPE in ["DEMA", "HULL"] else JMA_LENGTH
 
 # Compute limits
 agg_factor = AGGREGATION_MINUTES // BASE_MINUTES
-KLINE_LIMIT_BASE = max(DI_PERIODS + 100 if USE_DI else 100, DEMA_PERIODS * agg_factor + 100)
-KLINE_LIMIT_AGG = DEMA_PERIODS + 20
+KLINE_LIMIT_BASE = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS * agg_factor + 100)
+KLINE_LIMIT_AGG = MA_PERIODS + 20
 
 # ENTRY STRATEGY TOGGLE
-ENTRY_STRATEGY = "SYMMETRIC" # or "CROSSOVER"
+ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # EXIT STRATEGY TOGGLE
-EXIT_STRATEGY = "SYMMETRIC" # or "CROSSOVER"
+EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
-        "klines_base": deque(maxlen=KLINE_LIMIT_BASE),    # Base timeframe candles
-        "klines_agg": deque(maxlen=KLINE_LIMIT_AGG),  # Aggregated candles
+        "klines_base": deque(maxlen=KLINE_LIMIT_BASE),
+        "klines_agg": deque(maxlen=KLINE_LIMIT_AGG),
         "current_signal": None,
         "last_signal_change": 0,
         "current_position": 0.0,
-        "dema_close": None,
-        "dema_open": None,
-        "prev_dema_close": None,
-        "prev_dema_open": None,
+        "ma_close": None,
+        "ma_open": None,
+        "prev_ma_close": None,
+        "prev_ma_open": None,
         "plus_di": None,
         "minus_di": None,
         "di_ready": False,
         "ready": False,
         "last_exec_ts": 0.0,
         "last_target": None,
+        "ha_prev_close": None,
+        "ha_prev_open": None,
+        "ha_agg_prev_close": None,
+        "ha_agg_prev_open": None,
     }
     for symbol in SYMBOLS
 }
@@ -136,6 +150,52 @@ def load_positions():
     except Exception as e:
         logging.error(f"Failed to load positions: {e} - starting fresh")
 
+# ========================= HEIKIN ASHI TRANSFORMATION =========================
+def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> list:
+    """Convert regular candles to Heikin Ashi candles"""
+    if not candles or not USE_HEIKIN_ASHI:
+        return candles
+    
+    ha_candles = []
+    
+    if level == "base":
+        prev_ha_open = state[symbol].get("ha_prev_open")
+        prev_ha_close = state[symbol].get("ha_prev_close")
+    else:
+        prev_ha_open = state[symbol].get("ha_agg_prev_open")
+        prev_ha_close = state[symbol].get("ha_agg_prev_close")
+    
+    for i, candle in enumerate(candles):
+        ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
+        
+        if i == 0 and prev_ha_open is not None and prev_ha_close is not None:
+            ha_open = (prev_ha_open + prev_ha_close) / 2
+        elif i == 0:
+            ha_open = (candle["open"] + candle["close"]) / 2
+        else:
+            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2
+        
+        ha_high = max(candle["high"], ha_open, ha_close)
+        ha_low = min(candle["low"], ha_open, ha_close)
+        
+        ha_candles.append({
+            "open_time": candle["open_time"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close
+        })
+    
+    if ha_candles:
+        if level == "base":
+            state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
+            state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
+        else:
+            state[symbol]["ha_agg_prev_open"] = ha_candles[-1]["open"]
+            state[symbol]["ha_agg_prev_close"] = ha_candles[-1]["close"]
+    
+    return ha_candles
+
 # ========================= CANDLE AGGREGATION =========================
 def aggregate_candles(symbol: str):
     """Aggregate base candles into larger timeframe candles"""
@@ -146,31 +206,28 @@ def aggregate_candles(symbol: str):
     if len(klines_base) < agg_count:
         return
     
-    # Clear aggregated candles
     state[symbol]["klines_agg"].clear()
     
-    # Group base candles into aggregated candles
     candles_base = list(klines_base)
+    if USE_HEIKIN_ASHI:
+        candles_base = convert_to_heikin_ashi(candles_base, symbol, level="base")
     
     for i in range(0, len(candles_base), agg_count):
         chunk = candles_base[i:i + agg_count]
         
         if len(chunk) < agg_count:
-            # Incomplete chunk - this is the forming aggregated candle
             continue
         
-        # Aggregate the chunk
         agg_candle = {
-            "open_time": chunk[0]["open_time"],  # Start timestamp
-            "open": chunk[0]["open"],             # First open
+            "open_time": chunk[0]["open_time"],
+            "open": chunk[0]["open"],
             "high": max(c["high"] for c in chunk),
             "low": min(c["low"] for c in chunk),
-            "close": chunk[-1]["close"]           # Last close
+            "close": chunk[-1]["close"]
         }
         
         state[symbol]["klines_agg"].append(agg_candle)
     
-    # Add forming aggregated candle (incomplete)
     remaining = len(candles_base) % agg_count
     if remaining > 0:
         forming_chunk = candles_base[-remaining:]
@@ -253,6 +310,106 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         return False
 
 # ========================= INDICATOR CALCULATIONS =========================
+def calculate_wma(values: list, period: int) -> Optional[float]:
+    """Weighted Moving Average calculation"""
+    if len(values) < period:
+        return None
+    
+    recent_values = values[-period:]
+    weights = list(range(1, period + 1))
+    weighted_sum = sum(v * w for v, w in zip(recent_values, weights))
+    weight_sum = sum(weights)
+    
+    return weighted_sum / weight_sum if weight_sum > 0 else None
+
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: int = 2) -> Optional[float]:
+    """
+    Jurik Moving Average (JMA) calculation
+    Copyright (c) 2007-present Jurik Research and Consulting
+    Converted from Pine Script to Python
+    """
+    klines = state[symbol]["klines_agg"]
+
+    if len(klines) < length + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < length:
+        return None
+
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
+
+    # JMA parameters
+    phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = beta ** power
+
+    # Initialize state variables
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    jma = 0.0
+
+    # Calculate JMA for all values in sequence
+    for src in values:
+        e0 = (1 - alpha) * src + alpha * e0
+        e1 = (src - e0) * (1 - beta) + beta * e1
+        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
+        jma = e2 + jma
+
+    return jma
+
+def calculate_hull_ma(symbol: str, field: str, period: int) -> Optional[float]:
+    """Hull Moving Average calculation"""
+    klines = state[symbol]["klines_agg"]
+
+    if len(klines) < period + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < period:
+        return None
+
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
+
+    half_period = period // 2
+    sqrt_period = int(round(period ** 0.5))
+
+    wma_half_values = []
+    for i in range(half_period - 1, len(values)):
+        wma_half = calculate_wma(values[:i+1], half_period)
+        if wma_half is not None:
+            wma_half_values.append(wma_half)
+
+    wma_full_values = []
+    for i in range(period - 1, len(values)):
+        wma_full = calculate_wma(values[:i+1], period)
+        if wma_full is not None:
+            wma_full_values.append(wma_full)
+
+    if len(wma_half_values) < len(wma_full_values):
+        return None
+    
+    offset = len(wma_half_values) - len(wma_full_values)
+    raw_hull_values = []
+    for i in range(len(wma_full_values)):
+        raw_hull = 2 * wma_half_values[i + offset] - wma_full_values[i]
+        raw_hull_values.append(raw_hull)
+
+    if len(raw_hull_values) < sqrt_period:
+        return None
+    
+    hull_ma = calculate_wma(raw_hull_values, sqrt_period)
+    
+    if hull_ma is not None:
+        state[symbol][f"hull_{field}"] = hull_ma
+    
+    return hull_ma
+
 def calculate_dema(symbol: str, field: str, period: int) -> Optional[float]:
     """DEMA on aggregated candles"""
     klines = state[symbol]["klines_agg"]
@@ -288,6 +445,18 @@ def calculate_dema(symbol: str, field: str, period: int) -> Optional[float]:
 
     return dema_val
 
+def calculate_ma(symbol: str, field: str, period: int) -> Optional[float]:
+    """Calculate Moving Average based on MA_TYPE configuration"""
+    if MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH, JMA_PHASE, JMA_POWER)
+    elif MA_TYPE == "HULL":
+        return calculate_hull_ma(symbol, field, period)
+    elif MA_TYPE == "DEMA":
+        return calculate_dema(symbol, field, period)
+    else:
+        logging.error(f"Unknown MA_TYPE: {MA_TYPE}. Using DEMA as fallback.")
+        return calculate_dema(symbol, field, period)
+
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
     tr2 = abs(high1 - close0)
@@ -303,11 +472,15 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
 
 def calculate_di(symbol: str) -> Optional[float]:
     """DI on base candles"""
-    klines = state[symbol]["klines_base"]
-    if len(klines) < DI_PERIODS + 1:
+    klines_base = list(state[symbol]["klines_base"])
+    
+    if USE_HEIKIN_ASHI:
+        klines_base = convert_to_heikin_ashi(klines_base, symbol, level="base")
+    
+    if len(klines_base) < DI_PERIODS + 1:
         return None
 
-    completed = list(klines)[:-1]
+    completed = klines_base[:-1]
     if len(completed) < DI_PERIODS + 1:
         return None
 
@@ -358,31 +531,33 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    dema_close = calculate_dema(symbol, "close", DEMA_PERIODS)
-    dema_open = calculate_dema(symbol, "open", DEMA_PERIODS)
+    ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+    ma_open = calculate_ma(symbol, "open", MA_PERIODS)
     if USE_DI:
         calculate_di(symbol)
 
-    if dema_close is None or dema_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
+    if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    prev_close = st["prev_dema_close"]
-    prev_open = st["prev_dema_open"]
+    prev_close = st["prev_ma_close"]
+    prev_open = st["prev_ma_open"]
 
     if prev_close is None or prev_open is None:
-        st["prev_dema_close"] = dema_close
-        st["prev_dema_open"] = dema_open
+        st["prev_ma_close"] = ma_close
+        st["prev_ma_open"] = ma_open
         return {"changed": False, "action": "NONE", "signal": current_signal}
     
-    cross_up = (dema_close > dema_open) and (prev_close <= prev_open)
-    cross_down = (dema_close < dema_open) and (prev_close >= prev_open)
+    cross_up = (ma_close > ma_open) and (prev_close <= prev_open)
+    cross_down = (ma_close < ma_open) and (prev_close >= prev_open)
     
-    price_above_both = (price > dema_close) and (price > dema_open)
-    price_below_both = (price < dema_close) and (price < dema_open)
+    price_above_both = (price > ma_close) and (price > ma_open)
+    price_below_both = (price < ma_close) and (price < ma_open)
     
-    # DEMA trend states
-    dema_bullish = dema_close > dema_open
-    dema_bearish = dema_close < dema_open
+    crossover_aligned_long = (price > ma_close) and (ma_close > ma_open)
+    crossover_aligned_short = (price < ma_close) and (ma_close < ma_open)
+    
+    ma_trend_bearish = ma_close < ma_open
+    ma_trend_bullish = ma_close > ma_open
 
     plus_di = st["plus_di"]
     minus_di = st["minus_di"]
@@ -391,58 +566,76 @@ def update_trading_signals(symbol: str) -> dict:
 
     new_signal = current_signal
     action_type = "NONE"
+    
+    ma_name = MA_TYPE
 
-    # Check for flips (common to both strategies)
     if current_signal == "LONG":
         if cross_down and price_below_both and (di_bear if USE_DI else True):
             new_signal = "SHORT"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_DEMA {dema_close:.6f} crossunder open_DEMA {dema_open:.6f} & price {price:.6f} < both DEMAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
+            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_{ma_name} {ma_close:.6f} crossunder open_{ma_name} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
             logging.info(log_msg)
     elif current_signal == "SHORT":
         if cross_up and price_above_both and (di_bull if USE_DI else True):
             new_signal = "LONG"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_DEMA {dema_close:.6f} crossover open_DEMA {dema_open:.6f} & price {price:.6f} > both DEMAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
+            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_{ma_name} {ma_close:.6f} crossover open_{ma_name} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
             logging.info(log_msg)
 
-    # Check for exits if SYMMETRIC exit and not already flipped
-    if EXIT_STRATEGY == "SYMMETRIC" and new_signal == current_signal:
-        if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
-            new_signal = None
-            action_type = "EXIT"
-            logging.info(f"🔴 {symbol} EXIT LONG (price {price:.6f} fell below BOTH DEMAs: close={dema_close:.6f}, open={dema_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-        elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True):
-            new_signal = None
-            action_type = "EXIT"
-            logging.info(f"🔴 {symbol} EXIT SHORT (price {price:.6f} rose above BOTH DEMAs: close={dema_close:.6f}, open={dema_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+    # EXIT conditions - Based on EXIT_STRATEGY
+    if new_signal == current_signal:
+        if EXIT_STRATEGY == "SYMMETRIC":
+            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+        
+        elif EXIT_STRATEGY == "CROSSOVER":
+            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
             
-    # If no signal (was None or exited), check for entry
     if new_signal is None:
         entry_long = False
         entry_short = False
-        is_cross_entry = False
 
         if ENTRY_STRATEGY == "CROSSOVER":
-            entry_long = cross_up and price_above_both and (di_bull if USE_DI else True)
-            entry_short = cross_down and price_below_both and (di_bear if USE_DI else True)
-            is_cross_entry = True
+            entry_long = crossover_aligned_long and (di_bull if USE_DI else True)
+            entry_short = crossover_aligned_short and (di_bear if USE_DI else True)
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+        
         elif ENTRY_STRATEGY == "SYMMETRIC":
             entry_long = price_above_both and (di_bull if USE_DI else True)
             entry_short = price_below_both and (di_bear if USE_DI else True)
-            is_cross_entry = False
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
 
-        if entry_long:
-            new_signal = "LONG"
-            action_type = "ENTRY" if current_signal is None else "REENTRY"
-            logging.info(f"🟢 {symbol} {action_type} LONG (price {price:.6f} > both DEMAs: close={dema_close:.6f}, open={dema_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
-        elif entry_short:
-            new_signal = "SHORT"
-            action_type = "ENTRY" if current_signal is None else "REENTRY"
-            logging.info(f"🟢 {symbol} {action_type} SHORT (price {price:.6f} < both DEMAs: close={dema_close:.6f}, open={dema_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-
-    st["prev_dema_close"] = dema_close
-    st["prev_dema_open"] = dema_open
+    st["prev_ma_close"] = ma_close
+    st["prev_ma_open"] = ma_open
 
     if new_signal != current_signal:
         st["current_signal"] = new_signal
@@ -478,7 +671,6 @@ async def price_feed_loop(client: AsyncClient):
 
                             event_time /= 1000
                             
-                            # Build base candles
                             current_open_time = int(event_time // base_interval_seconds) * base_interval_seconds
                             klines_base = state[symbol]["klines_base"]
 
@@ -491,25 +683,23 @@ async def price_feed_loop(client: AsyncClient):
                                     "close": price
                                 })
                                 
-                                # Aggregate candles when new base candle starts
                                 aggregate_candles(symbol)
                             else:
                                 klines_base[-1]["high"]  = max(klines_base[-1]["high"],  price)
                                 klines_base[-1]["low"]   = min(klines_base[-1]["low"],   price)
                                 klines_base[-1]["close"] = price
                                 
-                                # Update aggregation for forming candle
                                 aggregate_candles(symbol)
 
-                            # Check readiness
-                            if len(state[symbol]["klines_agg"]) >= DEMA_PERIODS and not state[symbol]["ready"]:
-                                dema_close = calculate_dema(symbol, "close", DEMA_PERIODS)
-                                dema_open = calculate_dema(symbol, "open", DEMA_PERIODS)
+                            if len(state[symbol]["klines_agg"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+                                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
                                 if USE_DI:
                                     calculate_di(symbol)
-                                if (dema_close is not None) and (dema_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
                                     state[symbol]["ready"] = True
-                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines_agg'])} {AGGREGATION_MINUTES}m candles, close_DEMA {dema_close:.6f}, open_DEMA {dema_open:.6f})"
+                                    ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines_agg'])} {AGGREGATION_MINUTES}m candles, close_{MA_TYPE} {ma_close:.6f}, open_{MA_TYPE} {ma_open:.6f}){ha_status}"
                                     logging.info(log_msg)
                             else:
                                 if USE_DI:
@@ -538,19 +728,19 @@ async def status_logger():
                 candle_count_agg = len(st["klines_agg"])
                 price = st["price"]
                 
-                dema_close = calculate_dema(symbol, "close", DEMA_PERIODS)
-                dema_open = calculate_dema(symbol, "open", DEMA_PERIODS)
+                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
                 if USE_DI:
                     calculate_di(symbol)
                 
                 reasons = []
-                if candle_count_agg < DEMA_PERIODS + 1:
-                    needed = (DEMA_PERIODS + 1) - candle_count_agg
+                if candle_count_agg < MA_PERIODS + 1:
+                    needed = (MA_PERIODS + 1) - candle_count_agg
                     reasons.append(f"need {needed} more {AGGREGATION_MINUTES}m candles")
-                if dema_close is None:
-                    reasons.append("DEMA close not calculated")
-                if dema_open is None:
-                    reasons.append("DEMA open not calculated")
+                if ma_close is None:
+                    reasons.append(f"{MA_TYPE} close not calculated")
+                if ma_open is None:
+                    reasons.append(f"{MA_TYPE} open not calculated")
                 if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
                     reasons.append("DI not calculated")
                 
@@ -560,36 +750,32 @@ async def status_logger():
                 continue
 
             price = st["price"]
-            dema_close = calculate_dema(symbol, "close", DEMA_PERIODS)
-            dema_open = calculate_dema(symbol, "open", DEMA_PERIODS)
+            ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+            ma_open = calculate_ma(symbol, "open", MA_PERIODS)
             plus_di = st.get("plus_di")
             minus_di = st.get("minus_di")
 
-            if price and dema_close and dema_open:
+            if price and ma_close and ma_open:
                 current_sig = st["current_signal"] or "FLAT"
 
                 plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
                 minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
 
-                logging.info(f"{symbol}: Price={price:.6f} | close_DEMA={dema_close:.6f} | open_DEMA={dema_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
+                logging.info(f"{symbol}: Price={price:.6f} | close_{MA_TYPE}={ma_close:.6f} | open_{MA_TYPE}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
                 logging.info(f"  Signal: {current_sig}")
 
-                trend_up = (dema_close > dema_open)
-                trend_down = (dema_close < dema_open)
-                price_above_both = (price > dema_close) and (price > dema_open)
-                price_below_both = (price < dema_close) and (price < dema_open)
+                trend_up = (ma_close > ma_open)
+                trend_down = (ma_close < ma_open)
+                price_above_both = (price > ma_close) and (price > ma_open)
+                price_below_both = (price < ma_close) and (price < ma_open)
                 
                 logging.info(f"  Current Trend: {'UP' if trend_up else 'DOWN' if trend_down else 'FLAT'}")
-                logging.info(f"  Price Position: {'Above Both DEMAs' if price_above_both else 'Below Both DEMAs' if price_below_both else 'Between DEMAs'}")
+                logging.info(f"  Price Position: {'Above Both MAs' if price_above_both else 'Below Both MAs' if price_below_both else 'Between MAs'}")
                 if USE_DI and plus_di is not None and minus_di is not None:
                     di_direction = "Bullish" if plus_di > minus_di else "Bearish" if minus_di > plus_di else "Neutral"
-                    plus_di_str = f"{plus_di:.4f}"
-                    minus_di_str = f"{minus_di:.4f}"
                 else:
                     di_direction = "N/A"
-                    plus_di_str = "N/A"
-                    minus_di_str = "N/A"
-                logging.info(f"  DI Direction: {di_direction} (+DI={plus_di_str}, -DI={minus_di_str})")
+                logging.info(f"  DI Direction: {di_direction}")
 
         logging.info("📊 === END STATUS REPORT ===")
 
@@ -665,7 +851,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     if not ok:
                         return
 
-        else:  # target < 0
+        else:
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
                 if not ok:
@@ -693,7 +879,6 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
     except Exception as e:
         logging.error(f"❌ {symbol} position change failed: {e}")
 
-# ========================= POSITION RECOVERY =========================
 async def recover_positions_from_exchange(client: AsyncClient):
     """Recover actual positions from Binance"""
     logging.info("🔍 Checking exchange for existing positions...")
@@ -741,19 +926,26 @@ async def recover_positions_from_exchange(client: AsyncClient):
         logging.error(f"❌ Position recovery failed: {e}")
         logging.warning("⚠️ Bot will start with empty positions - verify manually!")
 
-# ========================= INITIALIZATION =========================
 async def init_bot(client: AsyncClient):
     """Initialize bot with historical data"""
     logging.info("🔧 Initializing bot...")
     logging.info(f"📊 Base: {BASE_TIMEFRAME} candles")
     logging.info(f"📊 Aggregated: {AGGREGATION_MINUTES}-minute ({AGGREGATION_MINUTES/60:.1f}h) candles")
-    logging.info(f"📊 DEMA: {DEMA_PERIODS} periods on {AGGREGATION_MINUTES}m = {DEMA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours")
+    
+    if MA_TYPE == "JMA":
+        logging.info(f"📊 JMA: length={JMA_LENGTH}, phase={JMA_PHASE}, power={JMA_POWER}")
+    else:
+        logging.info(f"📊 {MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m = {MA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours")
+    
+    if USE_HEIKIN_ASHI:
+        logging.info("📊 Heikin Ashi: ENABLED (Single Smoothing)")
+    else:
+        logging.info("📊 Heikin Ashi: DISABLED")
     if USE_DI:
-        logging.info(f"📊 DMI: {DI_PERIODS} periods on {BASE_TIMEFRAME} = {DI_PERIODS * BASE_MINUTES / 60:.1f} hours")
+        logging.info(f"📊 DMI: {DI_PERIODS} periods")
     else:
         logging.info("📊 DMI: Disabled")
-    logging.info(f"📊 Entry Strategy: {ENTRY_STRATEGY}")
-    logging.info(f"📊 Exit Strategy: {EXIT_STRATEGY}")
+    logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
 
     load_klines()
     load_positions()
@@ -762,13 +954,12 @@ async def init_bot(client: AsyncClient):
 
     symbols_needing_data = []
     for symbol in SYMBOLS:
-        # Aggregate loaded base candles
         if len(state[symbol]["klines_base"]) >= (AGGREGATION_MINUTES // BASE_MINUTES):
             aggregate_candles(symbol)
         
         klines_agg = state[symbol]["klines_agg"]
-        d_close_ready = len(klines_agg) >= DEMA_PERIODS and calculate_dema(symbol, "close", DEMA_PERIODS) is not None
-        d_open_ready = len(klines_agg) >= DEMA_PERIODS and calculate_dema(symbol, "open", DEMA_PERIODS) is not None
+        d_close_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "close", MA_PERIODS) is not None
+        d_open_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "open", MA_PERIODS) is not None
         if USE_DI:
             calculate_di(symbol)
         di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
@@ -786,13 +977,12 @@ async def init_bot(client: AsyncClient):
             try:
                 logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
-                # Fetch base candles
-                needed_candles = max(DEMA_PERIODS * (AGGREGATION_MINUTES // BASE_MINUTES) + 100, (DI_PERIODS + 100 if USE_DI else 100))
+                needed_candles = max(MA_PERIODS * (AGGREGATION_MINUTES // BASE_MINUTES) + 100, (DI_PERIODS + 100 if USE_DI else 100))
                 klines_data = await safe_api_call(
                     client.futures_mark_price_klines,
                     symbol=symbol,
                     interval=BASE_TIMEFRAME,
-                    limit=min(needed_candles, 1500)  # Binance limit is 1500
+                    limit=min(needed_candles, 1500)
                 )
 
                 st = state[symbol]
@@ -808,11 +998,10 @@ async def init_bot(client: AsyncClient):
                         "close": float(kline[4])
                     })
 
-                # Aggregate the base candles
                 aggregate_candles(symbol)
 
-                d_close_ok = calculate_dema(symbol, "close", DEMA_PERIODS) is not None
-                d_open_ok = calculate_dema(symbol, "open", DEMA_PERIODS) is not None
+                d_close_ok = calculate_ma(symbol, "close", MA_PERIODS) is not None
+                d_open_ok = calculate_ma(symbol, "open", MA_PERIODS) is not None
                 if USE_DI:
                     calculate_di(symbol)
                 di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
@@ -822,12 +1011,12 @@ async def init_bot(client: AsyncClient):
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(240)
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(240)
 
     else:
         logging.info("🎯 All symbols ready!")
@@ -836,7 +1025,6 @@ async def init_bot(client: AsyncClient):
     await asyncio.sleep(2)
     logging.info("🚀 Initialization complete")
 
-# ========================= MAIN =========================
 async def main():
     if not API_KEY or not API_SECRET:
         raise ValueError("Missing Binance API credentials")
@@ -868,28 +1056,21 @@ if __name__ == "__main__":
     )
 
     print("=" * 80)
-    print(f"DEMA STRATEGY - {BASE_TIMEFRAME.upper()} BASE → {AGGREGATION_MINUTES}M AGG - {ENTRY_STRATEGY} ENTRY - {EXIT_STRATEGY} EXIT")
+    ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
+    print(f"{MA_TYPE} OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
+    print(f"{BASE_TIMEFRAME.upper()} BASE → {AGGREGATION_MINUTES}M AGG")
     print("=" * 80)
-    print(f"Base Resolution: {BASE_TIMEFRAME} candles (updates every {BASE_MINUTES} minutes)")
-    print(f"Aggregation: {AGGREGATION_MINUTES} minutes ({AGGREGATION_MINUTES/60:.1f} hours)")
-    print(f"DEMA: {DEMA_PERIODS} periods on {AGGREGATION_MINUTES}m = {DEMA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours total")
-    if USE_DI:
-        print(f"DMI: {DI_PERIODS} periods on {BASE_TIMEFRAME} = {DI_PERIODS * BASE_MINUTES / 60:.1f} hours total")
+    print(f"MA Type: {MA_TYPE}")
+    if MA_TYPE == "JMA":
+        print(f"JMA Parameters: Length={JMA_LENGTH}, Phase={JMA_PHASE}, Power={JMA_POWER}")
     else:
-        print("DMI: Disabled")
+        print(f"{MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m")
+    print(f"Base: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
+    print(f"Aggregation: {AGGREGATION_MINUTES} min ({AGGREGATION_MINUTES/60:.1f} hours)")
+    print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
+    print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
     print(f"Entry Strategy: {ENTRY_STRATEGY}")
     print(f"Exit Strategy: {EXIT_STRATEGY}")
-    print("")
-    if ENTRY_STRATEGY == "CROSSOVER":
-        print("ENTRY: Crossover + price confirmation + DI direction confirmation")
-    else:
-        print("ENTRY: Price confirmation + DI direction confirmation")
-    if EXIT_STRATEGY == "CROSSOVER":
-        print("EXIT: Only on opposite crossover")
-    else:
-        print("EXIT: Price breaks DEMA range (early exit)")
-    print("")
-    print("Position recovery enabled")
     print(f"Symbols: {list(SYMBOLS.keys())}")
     print("=" * 80)
 
