@@ -1,18 +1,141 @@
 #!/usr/bin/env python3
-import os, json, asyncio, logging, websockets, time, math
+import os, json, asyncio, logging, websockets, time
 import atexit
 from binance import AsyncClient
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional
 from dotenv import load_dotenv
 import numpy as np
 
+def jurik_moving_average(prices, length=12, phase=0, avglen=65):
+    """
+    Implements the Jurik Moving Average (JMA) based on the reverse-engineered algorithm.
+    
+    Parameters:
+    - prices: numpy array or list of price data.
+    - length: int, the base length for the moving average (default 7).
+    - phase: int, controls responsiveness vs. smoothness (-100 to +100, default 0).
+    - avglen: int, fixed length for averaging volatility (default 65).
+    
+    Returns:
+    - numpy array of JMA values.
+    
+    Note: This is an approximation based on public discussions and may not match the proprietary version exactly.
+    """
+    prices = np.array(prices, dtype=float)
+    n = len(prices)
+    if n == 0:
+        return np.array([])
+    
+    # Precompute fixed parameters
+    len1 = np.log(np.sqrt(length)) / np.log(2.0) + 2.0
+    len1 = max(len1, 0.0)
+    pow1 = len1 - 2.0
+    pow1 = max(pow1, 0.5)
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2.0)
+    pr = (phase / 100.0) + 1.5
+    pr = max(0.5, min(pr, 2.5))
+    
+    # Initialize arrays
+    upperband = np.full(n, np.nan)
+    lowerband = np.full(n, np.nan)
+    volty = np.full(n, 0.0)
+    vsum = np.full(n, 0.0)
+    avgvolty = np.full(n, 0.0)
+    rvolty = np.full(n, 1.0)
+    power = np.full(n, 1.0)
+    alpha = np.full(n, beta)  # Initial alpha
+    ma1 = np.full(n, np.nan)
+    det0 = np.full(n, np.nan)
+    ma2 = np.full(n, np.nan)
+    det1 = np.full(n, np.nan)
+    jma_val = np.full(n, np.nan)
+    
+    # Initial values
+    upperband[0] = lowerband[0] = ma1[0] = det0[0] = ma2[0] = det1[0] = jma_val[0] = prices[0]
+    
+    for i in range(1, n):
+        # Compute del1 and del2 using previous bands
+        del1 = prices[i] - upperband[i-1]
+        del2 = prices[i] - lowerband[i-1]
+        
+        if np.abs(del1) == np.abs(del2):
+            volty[i] = 0.0
+        else:
+            volty[i] = max(np.abs(del1), np.abs(del2))
+        
+        # Compute Kv (assuming pow2 ≈ pow1)
+        pow2 = pow1
+        kv = beta ** np.sqrt(pow2)
+        
+        # Update bands
+        upperband[i] = prices[i] if del1 > 0 else prices[i] - kv * del1
+        lowerband[i] = prices[i] if del2 < 0 else prices[i] - kv * del2
+        
+        # Compute vSum as SMA of volty over up to 10 periods
+        win_start = max(0, i - 9)
+        vsum[i] = np.mean(volty[win_start:i+1])
+        
+        # Compute AvgVolty as SMA of vSum over up to avglen periods
+        win_start_avg = max(0, i - avglen + 1)
+        avgvolty[i] = np.mean(vsum[win_start_avg:i+1])
+        
+        # Relative volatility
+        if avgvolty[i] > 0:
+            rvolty[i] = volty[i] / avgvolty[i]
+        else:
+            rvolty[i] = 1.0
+        
+        max_rvolty = len1 ** (1.0 / pow1) if pow1 != 0 else 1.0
+        rvolty[i] = max(1.0, min(rvolty[i], max_rvolty))
+        
+        # Power and alpha
+        power[i] = rvolty[i] ** pow1
+        alpha[i] = beta ** power[i]
+        
+        # Smoothing stages
+        ma1[i] = (1 - alpha[i]) * prices[i] + alpha[i] * ma1[i-1]
+        det0[i] = (prices[i] - ma1[i]) * (1 - beta) + beta * det0[i-1]
+        ma2[i] = ma1[i] + pr * det0[i]
+        det1[i] = (ma2[i] - jma_val[i-1]) * (1 - alpha[i])**2 + (alpha[i])**2 * det1[i-1]
+        jma_val[i] = jma_val[i-1] + det1[i]
+    
+    return jma_val
+
 # ========================= CONFIG =========================
-load_dotenv('config/example.env')
+load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
+DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
+USE_DI = False  # Toggle DMI indicator
+USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles (Single smoothing - matches TradingView)
+MA_TYPE = "JMA"  # Options: "DEMA", "HULL", or "JMA"
 
+# Base timeframe configuration (must be defined BEFORE JMA parameters)
+BASE_TIMEFRAME = "15m"  # or "1h" or "1m"
+
+if BASE_TIMEFRAME == "1m":
+    BASE_MINUTES = 1
+    AGGREGATION_MINUTES = 3     # Aggregate to 3 minutes
+    DEMA_PERIODS = 600          # 600 * 3m = 30 hours
+elif BASE_TIMEFRAME == "15m":
+    BASE_MINUTES = 15
+    AGGREGATION_MINUTES = 45    # Aggregate to 45 minutes
+    DEMA_PERIODS = 12           # 12 * 45m = 9 hours
+elif BASE_TIMEFRAME == "1h":
+    BASE_MINUTES = 60
+    AGGREGATION_MINUTES = 180   # Keep at 3 hours
+    DEMA_PERIODS = 3            # 3 * 180m = 9 hours
+else:
+    raise ValueError("Unsupported BASE_TIMEFRAME")
+
+# JMA specific parameters (defined AFTER DEMA_PERIODS, only used when MA_TYPE = "JMA")
+JMA_LENGTH = DEMA_PERIODS  # Matches DEMA for fair comparison
+JMA_PHASE = 0              # -100 to +100 (0 = balanced, negative = faster, positive = smoother)
+JMA_AVGLEN = 65            # Volatility averaging length (65 is standard)
+
+# Trading symbols and sizes
 SYMBOLS = {
     "ETHUSDT": 0.01,
     "BNBUSDT": 0.03,
@@ -23,115 +146,211 @@ SYMBOLS = {
     "TRXUSDT": 20.0,
 }
 
+# Hardcoded precisions
 PRECISIONS = {
-    "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1,
-    "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
+    "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-# SQUEEZE MOMENTUM PARAMETERS
-SQUEEZE_TIMEFRAME = int(os.getenv("SQUEEZE_TIMEFRAME", "570"))
-BB_LENGTH = int(os.getenv("BB_LENGTH", "570"))
-KC_LENGTH = int(os.getenv("KC_LENGTH", "570"))
-BB_MULT = float(os.getenv("BB_MULT", "0.8"))
-KC_MULT = float(os.getenv("KC_MULT", "0.6"))
-USE_TRUE_RANGE = os.getenv("USE_TRUE_RANGE", "True").lower() == "true"
+# MA_PERIODS is used for DEMA and HULL (JMA uses JMA_LENGTH)
+MA_PERIODS = DEMA_PERIODS if MA_TYPE in ["DEMA", "HULL"] else JMA_LENGTH
 
-# ADX PARAMETERS
-ADX_PERIODS = int(os.getenv("ADX_PERIODS", "570"))
-ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", "25"))
+# Compute limits
+agg_factor = AGGREGATION_MINUTES // BASE_MINUTES
+KLINE_LIMIT_BASE = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS * agg_factor + 100)
+KLINE_LIMIT_AGG = max(MA_PERIODS + 20, JMA_AVGLEN + 20 if MA_TYPE == "JMA" else 20)
 
-KLINE_LIMIT = max(BB_LENGTH, KC_LENGTH, ADX_PERIODS) + 100
+# ENTRY STRATEGY TOGGLE
+ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
-# Daily PNL limits
-DAILY_PROFIT_TARGET = float(os.getenv("DAILY_PROFIT_TARGET", "1000.0"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-100.0"))
+# EXIT STRATEGY TOGGLE
+EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
-        "klines": deque(maxlen=KLINE_LIMIT),
+        "klines_base": deque(maxlen=KLINE_LIMIT_BASE),
+        "klines_agg": deque(maxlen=KLINE_LIMIT_AGG),
         "current_signal": None,
         "last_signal_change": 0,
         "current_position": 0.0,
-        "adx": None,
-        "adx_ready": False,
+        "ma_close": None,
+        "ma_open": None,
+        "prev_ma_close": None,
+        "prev_ma_open": None,
+        "plus_di": None,
+        "minus_di": None,
+        "di_ready": False,
         "ready": False,
         "last_exec_ts": 0.0,
         "last_target": None,
-        "daily_pnl": 0.0,
-        "daily_pnl_reset_time": time.time(),
-        "daily_limit_reached": False,
-        "entry_price": None,
-        "squeeze_state": None,
-        "prev_squeeze_state": None,
-        "momentum": 0.0,
-        "momentum_color": "gray",
-        "prev_momentum": 0.0,
+        "ha_prev_close": None,
+        "ha_prev_open": None,
+        "ha_agg_prev_close": None,
+        "ha_agg_prev_open": None,
     }
     for symbol in SYMBOLS
 }
 
+# Rate limiting
 api_calls_count = 0
 api_calls_reset_time = time.time()
 
-# ========================= PERSISTENCE =========================
+# ========================= PERSISTENCE FUNCTIONS =========================
 def save_klines():
-    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
+    """Save base klines to JSON"""
+    save_data = {sym: list(state[sym]["klines_base"]) for sym in SYMBOLS}
     with open('klines.json', 'w') as f:
         json.dump(save_data, f)
-    logging.info("Saved klines to klines.json")
+    logging.info("📥 Saved klines to klines.json")
 
 def load_klines():
+    """Load base klines from JSON"""
     try:
         with open('klines.json', 'r') as f:
             load_data = json.load(f)
         for sym in SYMBOLS:
-            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
-        logging.info("Loaded klines from klines.json")
+            state[sym]["klines_base"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT_BASE)
+        logging.info("📤 Loaded klines from klines.json")
     except FileNotFoundError:
         logging.info("No klines.json found - starting fresh")
     except Exception as e:
-        logging.error(f"Failed to load klines: {e}")
+        logging.error(f"Failed to load klines: {e} - starting fresh")
+
+def save_positions():
+    """Save current positions and signals"""
+    position_data = {
+        sym: {
+            "current_signal": state[sym]["current_signal"],
+            "current_position": state[sym]["current_position"],
+            "last_signal_change": state[sym]["last_signal_change"]
+        }
+        for sym in SYMBOLS
+    }
+    with open('positions.json', 'w') as f:
+        json.dump(position_data, f)
+
+def load_positions():
+    """Load positions from JSON"""
+    try:
+        with open('positions.json', 'r') as f:
+            position_data = json.load(f)
+        for sym in SYMBOLS:
+            if sym in position_data:
+                state[sym]["current_signal"] = position_data[sym].get("current_signal")
+                state[sym]["current_position"] = position_data[sym].get("current_position", 0.0)
+                state[sym]["last_signal_change"] = position_data[sym].get("last_signal_change", 0)
+        logging.info("💾 Loaded positions from positions.json")
+    except FileNotFoundError:
+        logging.info("No positions.json found - starting fresh")
+    except Exception as e:
+        logging.error(f"Failed to load positions: {e} - starting fresh")
+
+# ========================= HEIKIN ASHI TRANSFORMATION =========================
+def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> list:
+    """Convert regular candles to Heikin Ashi candles"""
+    if not candles or not USE_HEIKIN_ASHI:
+        return candles
+    
+    ha_candles = []
+    
+    if level == "base":
+        prev_ha_open = state[symbol].get("ha_prev_open")
+        prev_ha_close = state[symbol].get("ha_prev_close")
+    else:
+        prev_ha_open = state[symbol].get("ha_agg_prev_open")
+        prev_ha_close = state[symbol].get("ha_agg_prev_close")
+    
+    for i, candle in enumerate(candles):
+        ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
+        
+        if i == 0 and prev_ha_open is not None and prev_ha_close is not None:
+            ha_open = (prev_ha_open + prev_ha_close) / 2
+        elif i == 0:
+            ha_open = (candle["open"] + candle["close"]) / 2
+        else:
+            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2
+        
+        ha_high = max(candle["high"], ha_open, ha_close)
+        ha_low = min(candle["low"], ha_open, ha_close)
+        
+        ha_candles.append({
+            "open_time": candle["open_time"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close
+        })
+    
+    if ha_candles:
+        if level == "base":
+            state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
+            state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
+        else:
+            state[symbol]["ha_agg_prev_open"] = ha_candles[-1]["open"]
+            state[symbol]["ha_agg_prev_close"] = ha_candles[-1]["close"]
+    
+    return ha_candles
+
+# ========================= CANDLE AGGREGATION =========================
+def aggregate_candles(symbol: str):
+    """Aggregate base candles into larger timeframe candles"""
+    klines_base = state[symbol]["klines_base"]
+    
+    agg_count = AGGREGATION_MINUTES // BASE_MINUTES
+    
+    if len(klines_base) < agg_count:
+        return
+    
+    state[symbol]["klines_agg"].clear()
+    
+    candles_base = list(klines_base)
+    if USE_HEIKIN_ASHI:
+        candles_base = convert_to_heikin_ashi(candles_base, symbol, level="base")
+    
+    for i in range(0, len(candles_base), agg_count):
+        chunk = candles_base[i:i + agg_count]
+        
+        if len(chunk) < agg_count:
+            continue
+        
+        agg_candle = {
+            "open_time": chunk[0]["open_time"],
+            "open": chunk[0]["open"],
+            "high": max(c["high"] for c in chunk),
+            "low": min(c["low"] for c in chunk),
+            "close": chunk[-1]["close"]
+        }
+        
+        state[symbol]["klines_agg"].append(agg_candle)
+    
+    remaining = len(candles_base) % agg_count
+    if remaining > 0:
+        forming_chunk = candles_base[-remaining:]
+        forming_candle = {
+            "open_time": forming_chunk[0]["open_time"],
+            "open": forming_chunk[0]["open"],
+            "high": max(c["high"] for c in forming_chunk),
+            "low": min(c["low"] for c in forming_chunk),
+            "close": forming_chunk[-1]["close"]
+        }
+        state[symbol]["klines_agg"].append(forming_candle)
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
+    """Round position size to appropriate precision"""
     prec = PRECISIONS.get(symbol, 3)
     return round(size, prec)
 
-def calculate_pnl_percent(symbol: str, current_price: float) -> float:
-    st = state[symbol]
-    if st["current_signal"] is None or st["entry_price"] is None:
-        return 0.0
-    
-    entry = st["entry_price"]
-    if st["current_signal"] == "LONG":
-        pnl_percent = ((current_price - entry) / entry) * 100
-    else:
-        pnl_percent = ((entry - current_price) / entry) * 100
-    
-    return pnl_percent * LEVERAGE
-
-def check_and_reset_daily_counters(symbol: str):
-    st = state[symbol]
-    current_time = time.time()
-    
-    last_reset = st.get("daily_pnl_reset_time", 0)
-    current_day = int(current_time // 86400)
-    last_reset_day = int(last_reset // 86400)
-    
-    if current_day > last_reset_day:
-        st["daily_pnl"] = 0.0
-        st["daily_limit_reached"] = False
-        st["daily_pnl_reset_time"] = current_time
-        logging.info(f"{symbol} Daily PNL counters reset (new day)")
-
 async def safe_api_call(func, *args, **kwargs):
+    """Make API call with exponential backoff"""
     global api_calls_count, api_calls_reset_time
+
     now = time.time()
     if now - api_calls_reset_time > 60:
         api_calls_count = 0
         api_calls_reset_time = now
+
     if api_calls_count >= 10:
         wait_time = 60 - (now - api_calls_reset_time)
         if wait_time > 0:
@@ -139,6 +358,7 @@ async def safe_api_call(func, *args, **kwargs):
             await asyncio.sleep(wait_time)
             api_calls_count = 0
             api_calls_reset_time = time.time()
+
     for attempt in range(3):
         try:
             api_calls_count += 1
@@ -151,13 +371,16 @@ async def safe_api_call(func, *args, **kwargs):
                 await asyncio.sleep(wait_time)
             else:
                 raise e
+
     raise Exception("Max API retry attempts reached")
 
 async def place_order(client: AsyncClient, symbol: str, side: str, quantity: float, action: str):
+    """Place market order"""
     try:
         quantity = round_size(abs(quantity), symbol)
         if quantity == 0:
             return True
+
         if "LONG" in action:
             position_side = "LONG"
         elif "SHORT" in action:
@@ -165,6 +388,7 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         else:
             logging.error(f"Unknown action type: {action}")
             return False
+
         params = {
             "symbol": symbol,
             "side": side,
@@ -172,195 +396,158 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
             "quantity": quantity,
             "positionSide": position_side
         }
+
         result = await safe_api_call(client.futures_create_order, **params)
-        logging.info(f"{symbol} {action} EXECUTED - {side} {quantity} - OrderID: {result.get('orderId')}")
+        logging.info(f"🚀 {symbol} {action} EXECUTED - {side} {quantity} - OrderID: {result.get('orderId')}")
         return True
+
     except Exception as e:
-        logging.error(f"{symbol} {action} FAILED: {e}")
+        logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
 
-# ========================= SQUEEZE MOMENTUM INDICATORS =========================
-def calculate_sma(data: list, period: int) -> Optional[float]:
-    if len(data) < period:
+# ========================= INDICATOR CALCULATIONS =========================
+def calculate_wma(values: list, period: int) -> Optional[float]:
+    """Weighted Moving Average calculation"""
+    if len(values) < period:
         return None
-    return sum(data[-period:]) / period
+    
+    recent_values = values[-period:]
+    weights = list(range(1, period + 1))
+    weighted_sum = sum(v * w for v, w in zip(recent_values, weights))
+    weight_sum = sum(weights)
+    
+    return weighted_sum / weight_sum if weight_sum > 0 else None
 
-def calculate_std_dev(data: list, period: int, sma: float) -> Optional[float]:
-    if len(data) < period or sma is None:
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 0, avglen: int = 65) -> Optional[float]:
+    """
+    Jurik Moving Average (JMA) calculation - Adaptive volatility-based version.
+    """
+    klines = state[symbol]["klines_agg"]
+
+    # JMA needs more data for volatility calculations
+    min_required = max(length + avglen, 100)
+    if len(klines) < min_required:
         return None
-    variance = sum((x - sma) ** 2 for x in data[-period:]) / period
-    return math.sqrt(variance)
 
-def calculate_true_range_value(high: float, low: float, prev_close: float) -> float:
-    tr1 = high - low
-    tr2 = abs(high - prev_close)
-    tr3 = abs(low - prev_close)
-    return max(tr1, tr2, tr3)
-
-def linear_regression(y_values: list) -> float:
-    """
-    Calculate linear regression value at the end point
-    Matches Pine Script's linreg(source, length, offset=0)
-    """
-    n = len(y_values)
-    if n == 0:
-        return 0.0
-    
-    # X values are just indices: 0, 1, 2, ..., n-1
-    x_values = list(range(n))
-    
-    # Calculate means
-    x_mean = sum(x_values) / n
-    y_mean = sum(y_values) / n
-    
-    # Calculate slope (beta)
-    numerator = sum((x_values[i] - x_mean) * (y_values[i] - y_mean) for i in range(n))
-    denominator = sum((x_values[i] - x_mean) ** 2 for i in range(n))
-    
-    if denominator == 0:
-        return y_values[-1]  # Return last value if no trend
-    
-    slope = numerator / denominator
-    
-    # Calculate intercept (alpha)
-    intercept = y_mean - slope * x_mean
-    
-    # Return value at the last point (x = n-1)
-    return intercept + slope * (n - 1)
-
-def calculate_squeeze_momentum(symbol: str) -> dict:
-    klines = state[symbol]["klines"]
-    
-    if len(klines) < max(BB_LENGTH, KC_LENGTH):
-        return {
-            "squeeze_state": None,
-            "momentum": 0.0,
-            "momentum_color": "gray"
-        }
-    
     completed = list(klines)[:-1]
-    if len(completed) < max(BB_LENGTH, KC_LENGTH):
-        return {
-            "squeeze_state": None,
-            "momentum": 0.0,
-            "momentum_color": "gray"
-        }
-    
-    closes = [k["close"] for k in completed]
-    highs = [k["high"] for k in completed]
-    lows = [k["low"] for k in completed]
-    
-    # Calculate Bollinger Bands
-    bb_basis = calculate_sma(closes, BB_LENGTH)
-    if bb_basis is None:
-        return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-    
-    std_dev = calculate_std_dev(closes, BB_LENGTH, bb_basis)
-    if std_dev is None:
-        return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-    
-    upper_bb = bb_basis + (BB_MULT * std_dev)
-    lower_bb = bb_basis - (BB_MULT * std_dev)
-    
-    # Calculate Keltner Channels
-    kc_basis = calculate_sma(closes, KC_LENGTH)
-    if kc_basis is None:
-        return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-    
-    if USE_TRUE_RANGE:
-        tr_values = []
-        for i in range(1, len(completed)):
-            tr = calculate_true_range_value(
-                completed[i]["high"],
-                completed[i]["low"],
-                completed[i-1]["close"]
-            )
-            tr_values.append(tr)
-        
-        if len(tr_values) < KC_LENGTH:
-            return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-        
-        atr = calculate_sma(tr_values, KC_LENGTH)
-        if atr is None:
-            return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-        
-        range_ma = atr
-    else:
-        ranges = [highs[i] - lows[i] for i in range(len(highs))]
-        range_ma = calculate_sma(ranges, KC_LENGTH)
-        if range_ma is None:
-            return {"squeeze_state": None, "momentum": 0.0, "momentum_color": "gray"}
-    
-    upper_kc = kc_basis + (range_ma * KC_MULT)
-    lower_kc = kc_basis - (range_ma * KC_MULT)
-    
-    # Determine squeeze state
-    sqz_on = (lower_bb > lower_kc) and (upper_bb < upper_kc)
-    sqz_off = (lower_bb < lower_kc) and (upper_bb > upper_kc)
-    
-    if sqz_on:
-        squeeze_state = "on"
-    elif sqz_off:
-        squeeze_state = "off"
-    else:
-        squeeze_state = "none"
-    
-    # Calculate momentum using linear regression (matching Pine Script exactly)
-    if len(completed) >= KC_LENGTH:
-        # Calculate the series: source - avg(avg(highest, lowest), sma(close))
-        differences = []
-        for i in range(len(completed) - KC_LENGTH, len(completed)):
-            # Get highest and lowest over KC_LENGTH period ending at i
-            start_idx = max(0, i - KC_LENGTH + 1)
-            period_highs = highs[start_idx:i+1]
-            period_lows = lows[start_idx:i+1]
-            period_closes = closes[start_idx:i+1]
-            
-            highest = max(period_highs) if period_highs else highs[i]
-            lowest = min(period_lows) if period_lows else lows[i]
-            midpoint = (highest + lowest) / 2
-            
-            close_sma = calculate_sma(period_closes, len(period_closes))
-            if close_sma is None:
-                close_sma = closes[i]
-            
-            avg_value = (midpoint + close_sma) / 2
-            differences.append(closes[i] - avg_value)
-        
-        # Apply linear regression to the differences
-        momentum = linear_regression(differences)
-    else:
-        momentum = 0.0
-    
-    # Determine momentum color based on Pine Script logic
-    prev_momentum = state[symbol].get("prev_momentum", 0.0)
-    
-    if momentum > 0:
-        # Positive momentum
-        if momentum > prev_momentum:
-            momentum_color = "lime"  # Increasing positive
-        else:
-            momentum_color = "green"  # Decreasing positive
-    else:
-        # Negative momentum
-        if momentum < prev_momentum:
-            momentum_color = "red"  # Decreasing negative (more negative)
-        else:
-            momentum_color = "maroon"  # Increasing negative (toward zero)
-    
-    return {
-        "squeeze_state": squeeze_state,
-        "momentum": momentum,
-        "momentum_color": momentum_color,
-        "upper_bb": upper_bb,
-        "lower_bb": lower_bb,
-        "upper_kc": upper_kc,
-        "lower_kc": lower_kc,
-        "bb_basis": bb_basis,
-        "kc_basis": kc_basis
-    }
+    if len(completed) < min_required:
+        return None
 
-# ========================= ADX CALCULATION =========================
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
+
+    # Convert to numpy array and calculate JMA
+    try:
+        prices = np.array(values, dtype=float)
+        jma_series = jurik_moving_average(prices, length=length, phase=phase, avglen=avglen)
+        
+        # Get the last non-NaN value
+        last_jma = jma_series[-1]
+        if np.isnan(last_jma):
+            return None
+        
+        return float(last_jma)
+    except Exception as e:
+        logging.error(f"JMA calculation error for {symbol} {field}: {e}")
+        return None
+
+def calculate_hull_ma(symbol: str, field: str, period: int) -> Optional[float]:
+    """Hull Moving Average calculation"""
+    klines = state[symbol]["klines_agg"]
+
+    if len(klines) < period + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < period:
+        return None
+
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
+
+    half_period = period // 2
+    sqrt_period = int(round(period ** 0.5))
+
+    wma_half_values = []
+    for i in range(half_period - 1, len(values)):
+        wma_half = calculate_wma(values[:i+1], half_period)
+        if wma_half is not None:
+            wma_half_values.append(wma_half)
+
+    wma_full_values = []
+    for i in range(period - 1, len(values)):
+        wma_full = calculate_wma(values[:i+1], period)
+        if wma_full is not None:
+            wma_full_values.append(wma_full)
+
+    if len(wma_half_values) < len(wma_full_values):
+        return None
+    
+    offset = len(wma_half_values) - len(wma_full_values)
+    raw_hull_values = []
+    for i in range(len(wma_full_values)):
+        raw_hull = 2 * wma_half_values[i + offset] - wma_full_values[i]
+        raw_hull_values.append(raw_hull)
+
+    if len(raw_hull_values) < sqrt_period:
+        return None
+    
+    hull_ma = calculate_wma(raw_hull_values, sqrt_period)
+    
+    if hull_ma is not None:
+        state[symbol][f"hull_{field}"] = hull_ma
+    
+    return hull_ma
+
+def calculate_dema(symbol: str, field: str, period: int) -> Optional[float]:
+    """DEMA on aggregated candles"""
+    klines = state[symbol]["klines_agg"]
+
+    if len(klines) < period + 1:
+        return None
+
+    completed = list(klines)[:-1]
+    if len(completed) < period:
+        return None
+
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
+
+    alpha = 2 / (period + 1)
+
+    ema_series = []
+    ema = values[0]
+    ema_series.append(ema)
+    for v in values[1:]:
+        ema = alpha * v + (1 - alpha) * ema
+        ema_series.append(ema)
+
+    ema1 = ema_series[-1]
+
+    ema2 = ema_series[0]
+    for es in ema_series[1:]:
+        ema2 = alpha * es + (1 - alpha) * ema2
+
+    dema_val = 2 * ema1 - ema2
+    state[symbol][f"dema_{field}"] = dema_val
+
+    return dema_val
+
+def calculate_ma(symbol: str, field: str, period: int) -> Optional[float]:
+    """Calculate Moving Average based on MA_TYPE configuration"""
+    if MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH, JMA_PHASE, JMA_AVGLEN)
+    elif MA_TYPE == "HULL":
+        return calculate_hull_ma(symbol, field, period)
+    elif MA_TYPE == "DEMA":
+        return calculate_dema(symbol, field, period)
+    else:
+        logging.error(f"Unknown MA_TYPE: {MA_TYPE}. Using DEMA as fallback.")
+        return calculate_dema(symbol, field, period)
+
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
     tr2 = abs(high1 - close0)
@@ -374,234 +561,330 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
     minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
     return plus_dm, minus_dm
 
-def calculate_adx(symbol: str) -> Optional[float]:
-    klines = state[symbol]["klines"]
-    if len(klines) < ADX_PERIODS + 1:
+def calculate_di(symbol: str) -> Optional[float]:
+    """DI on base candles"""
+    klines_base = list(state[symbol]["klines_base"])
+    
+    if USE_HEIKIN_ASHI:
+        klines_base = convert_to_heikin_ashi(klines_base, symbol, level="base")
+    
+    if len(klines_base) < DI_PERIODS + 1:
         return None
-    completed = list(klines)[:-1]
-    if len(completed) < ADX_PERIODS + 1:
+
+    completed = klines_base[:-1]
+    if len(completed) < DI_PERIODS + 1:
         return None
-    recent = completed[-(ADX_PERIODS + 1):]
-    tr_values, plus_dm_values, minus_dm_values = [], [], []
-    for i in range(1, len(recent)):
-        cur = recent[i]
-        prev = recent[i - 1]
-        tr_values.append(calculate_true_range(cur["high"], cur["low"], prev["close"]))
+
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+    for i in range(1, len(completed)):
+        cur = completed[i]
+        prev = completed[i - 1]
+        tr = calculate_true_range(cur["high"], cur["low"], prev["close"])
+        tr_values.append(tr)
         plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
         plus_dm_values.append(plus_dm)
         minus_dm_values.append(minus_dm)
-    alpha = 1.0 / ADX_PERIODS
-    sm_tr = tr_values[0]
-    for tr in tr_values[1:]:
-        sm_tr = alpha * tr + (1 - alpha) * sm_tr
-    sm_pdm = plus_dm_values[0]
-    for pdm in plus_dm_values[1:]:
-        sm_pdm = alpha * pdm + (1 - alpha) * sm_pdm
-    sm_mdm = minus_dm_values[0]
-    for mdm in minus_dm_values[1:]:
-        sm_mdm = alpha * mdm + (1 - alpha) * sm_mdm
+
+    if len(tr_values) < DI_PERIODS:
+        return None
+
+    alpha = 1.0 / DI_PERIODS
+
+    sm_tr = sum(tr_values[:DI_PERIODS]) / DI_PERIODS
+    sm_pdm = sum(plus_dm_values[:DI_PERIODS]) / DI_PERIODS
+    sm_mdm = sum(minus_dm_values[:DI_PERIODS]) / DI_PERIODS
+
+    for i in range(DI_PERIODS, len(tr_values)):
+        sm_tr = alpha * tr_values[i] + (1 - alpha) * sm_tr
+        sm_pdm = alpha * plus_dm_values[i] + (1 - alpha) * sm_pdm
+        sm_mdm = alpha * minus_dm_values[i] + (1 - alpha) * sm_mdm
+
     if sm_tr == 0:
         return None
+
     plus_di  = (sm_pdm / sm_tr) * 100
     minus_di = (sm_mdm / sm_tr) * 100
-    if (plus_di + minus_di) == 0:
-        return None
-    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
-    prev_adx = state[symbol].get("adx")
-    adx = dx if prev_adx is None else (alpha * dx + (1 - alpha) * prev_adx)
-    state[symbol]["adx"] = adx
-    state[symbol]["adx_ready"] = True
-    return adx
+
+    state[symbol]["plus_di"] = plus_di
+    state[symbol]["minus_di"] = minus_di
+    state[symbol]["di_ready"] = True
+    return None
 
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
+    """Trading signals with dual-timeframe indicators"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
-    
+
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
-    
-    check_and_reset_daily_counters(symbol)
-    
-    if st["daily_limit_reached"]:
-        if current_signal is not None:
-            logging.info(f"{symbol} Daily limit reached, forcing exit")
-            st["current_signal"] = None
-            return {"changed": True, "action": "LIMIT_EXIT", "signal": None}
-        return {"changed": False, "action": "NONE", "signal": None}
-    
-    if current_signal is not None:
-        current_pnl = calculate_pnl_percent(symbol, price)
-        
-        if st["daily_pnl"] >= DAILY_PROFIT_TARGET:
-            st["daily_limit_reached"] = True
-            logging.info(f"{symbol} DAILY PROFIT TARGET REACHED! Total PNL: +{st['daily_pnl']:.2f}%")
-            st["current_signal"] = None
-            return {"changed": True, "action": "PROFIT_TARGET_EXIT", "signal": None}
-        
-        if st["daily_pnl"] <= DAILY_LOSS_LIMIT:
-            st["daily_limit_reached"] = True
-            logging.info(f"{symbol} DAILY LOSS LIMIT HIT! Total PNL: {st['daily_pnl']:.2f}%")
-            st["current_signal"] = None
-            return {"changed": True, "action": "LOSS_LIMIT_EXIT", "signal": None}
-    
-    squeeze_result = calculate_squeeze_momentum(symbol)
-    adx = calculate_adx(symbol)
-    
-    if squeeze_result["squeeze_state"] is None or adx is None:
+
+    ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+    ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+    if USE_DI:
+        calculate_di(symbol)
+
+    if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
+        return {"changed": False, "action": "NONE", "signal": current_signal}
+
+    prev_close = st["prev_ma_close"]
+    prev_open = st["prev_ma_open"]
+
+    if prev_close is None or prev_open is None:
+        st["prev_ma_close"] = ma_close
+        st["prev_ma_open"] = ma_open
         return {"changed": False, "action": "NONE", "signal": current_signal}
     
-    prev_squeeze = st["prev_squeeze_state"]
-    st["squeeze_state"] = squeeze_result["squeeze_state"]
-    st["momentum"] = squeeze_result["momentum"]
-    st["momentum_color"] = squeeze_result["momentum_color"]
+    cross_up = (ma_close > ma_open) and (prev_close <= prev_open)
+    cross_down = (ma_close < ma_open) and (prev_close >= prev_open)
     
-    adx_ok = (adx >= ADX_THRESHOLD)
+    price_above_both = (price > ma_close) and (price > ma_open)
+    price_below_both = (price < ma_close) and (price < ma_open)
     
+    crossover_aligned_long = (price > ma_close) and (ma_close > ma_open)
+    crossover_aligned_short = (price < ma_close) and (ma_close < ma_open)
+    
+    ma_trend_bearish = ma_close < ma_open
+    ma_trend_bullish = ma_close > ma_open
+
+    plus_di = st["plus_di"]
+    minus_di = st["minus_di"]
+    di_bull = plus_di > minus_di if USE_DI else True
+    di_bear = minus_di > plus_di if USE_DI else True
+
     new_signal = current_signal
     action_type = "NONE"
     
-    # ENTRY LOGIC - Only on squeeze release
-    if current_signal is None:
-        if prev_squeeze == "on" and st["squeeze_state"] == "off" and adx_ok:
-            # LONG: Ascending momentum (lime = positive increasing, maroon = negative increasing toward zero)
-            if squeeze_result["momentum_color"] in ["lime", "maroon"]:
-                new_signal = "LONG"
-                action_type = "ENTRY"
-                logging.info(f"{symbol} ENTRY LONG (Squeeze released, Momentum ASCENDING: {squeeze_result['momentum']:.4f}, Color: {squeeze_result['momentum_color']}, ADX: {adx:.1f}>={ADX_THRESHOLD})")
-            # SHORT: Descending momentum (green = positive decreasing, red = negative decreasing)
-            elif squeeze_result["momentum_color"] in ["green", "red"]:
-                new_signal = "SHORT"
-                action_type = "ENTRY"
-                logging.info(f"{symbol} ENTRY SHORT (Squeeze released, Momentum DESCENDING: {squeeze_result['momentum']:.4f}, Color: {squeeze_result['momentum_color']}, ADX: {adx:.1f}>={ADX_THRESHOLD})")
-    
-    # EXIT LOGIC - Immediate momentum reversal
-    elif current_signal == "LONG":
-        # Exit LONG when momentum becomes descending (green or red)
-        if squeeze_result["momentum_color"] in ["green", "red"]:
-            new_signal = None
-            action_type = "EXIT"
-            current_pnl = calculate_pnl_percent(symbol, price)
-            logging.info(f"{symbol} EXIT LONG (Momentum now DESCENDING: {squeeze_result['momentum_color']}, PNL: {current_pnl:+.2f}%)")
-    
+    ma_name = MA_TYPE
+
+    if current_signal == "LONG":
+        if cross_down and price_below_both and (di_bear if USE_DI else True):
+            new_signal = "SHORT"
+            action_type = "FLIP"
+            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_{ma_name} {ma_close:.6f} crossunder open_{ma_name} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
+            logging.info(log_msg)
     elif current_signal == "SHORT":
-        # Exit SHORT when momentum becomes ascending (lime or maroon)
-        if squeeze_result["momentum_color"] in ["lime", "maroon"]:
-            new_signal = None
-            action_type = "EXIT"
-            current_pnl = calculate_pnl_percent(symbol, price)
-            logging.info(f"{symbol} EXIT SHORT (Momentum now ASCENDING: {squeeze_result['momentum_color']}, PNL: {current_pnl:+.2f}%)")
-    
-    st["prev_momentum"] = squeeze_result["momentum"]
-    st["prev_squeeze_state"] = st["squeeze_state"]
-    
+        if cross_up and price_above_both and (di_bull if USE_DI else True):
+            new_signal = "LONG"
+            action_type = "FLIP"
+            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_{ma_name} {ma_close:.6f} crossover open_{ma_name} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
+            logging.info(log_msg)
+
+    # EXIT conditions - Based on EXIT_STRATEGY
+    if new_signal == current_signal:
+        if EXIT_STRATEGY == "SYMMETRIC":
+            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+        
+        elif EXIT_STRATEGY == "CROSSOVER":
+            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True):
+                new_signal = None
+                action_type = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+            
+    if new_signal is None:
+        entry_long = False
+        entry_short = False
+
+        if ENTRY_STRATEGY == "CROSSOVER":
+            entry_long = crossover_aligned_long and (di_bull if USE_DI else True)
+            entry_short = crossover_aligned_short and (di_bear if USE_DI else True)
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+        
+        elif ENTRY_STRATEGY == "SYMMETRIC":
+            entry_long = price_above_both and (di_bull if USE_DI else True)
+            entry_short = price_below_both and (di_bear if USE_DI else True)
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+
+    st["prev_ma_close"] = ma_close
+    st["prev_ma_open"] = ma_open
+
     if new_signal != current_signal:
         st["current_signal"] = new_signal
         st["last_signal_change"] = time.time()
+        save_positions()
         return {"changed": True, "action": action_type, "signal": new_signal}
-    
-    return {"changed": False, "action": "NONE", "signal": current_signal}
 
-# ========================= LOOPS =========================
+    return {"changed": False, "action": "NONE", "signal": current_signal}
+    
+# ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
+    """WebSocket feed - builds base candles and aggregates them"""
     streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+
+    base_interval_seconds = BASE_MINUTES * 60
+
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                logging.info("WebSocket connected")
+                logging.info("📡 WebSocket connected")
+
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
                         symbol = data.get("s")
                         price_str = data.get("p")
                         event_time = data.get("E")
+
                         if symbol in SYMBOLS and price_str and event_time:
                             price = float(price_str)
                             state[symbol]["price"] = price
+
                             event_time /= 1000
-                            minute = int(event_time // 60)
-                            klines = state[symbol]["klines"]
-                            if not klines or klines[-1]["minute"] != minute:
-                                klines.append({"minute": minute, "high": price, "low": price, "close": price})
+                            
+                            current_open_time = int(event_time // base_interval_seconds) * base_interval_seconds
+                            klines_base = state[symbol]["klines_base"]
+
+                            if not klines_base or klines_base[-1]["open_time"] != current_open_time:
+                                klines_base.append({
+                                    "open_time": current_open_time,
+                                    "open": price,
+                                    "high": price,
+                                    "low": price,
+                                    "close": price
+                                })
+                                
+                                aggregate_candles(symbol)
                             else:
-                                klines[-1]["high"] = max(klines[-1]["high"], price)
-                                klines[-1]["low"] = min(klines[-1]["low"], price)
-                                klines[-1]["close"] = price
-                            if len(klines) >= max(BB_LENGTH, KC_LENGTH, ADX_PERIODS) and not state[symbol]["ready"]:
-                                squeeze_result = calculate_squeeze_momentum(symbol)
-                                adx = calculate_adx(symbol)
-                                if squeeze_result["squeeze_state"] is not None and adx is not None:
+                                klines_base[-1]["high"]  = max(klines_base[-1]["high"],  price)
+                                klines_base[-1]["low"]   = min(klines_base[-1]["low"],   price)
+                                klines_base[-1]["close"] = price
+                                
+                                aggregate_candles(symbol)
+
+                            if len(state[symbol]["klines_agg"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+                                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+                                if USE_DI:
+                                    calculate_di(symbol)
+                                if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
                                     state[symbol]["ready"] = True
-                                    logging.info(f"{symbol} ready ({len(klines)} candles, ADX {adx:.1f}, Squeeze: {squeeze_result['squeeze_state']})")
+                                    ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines_agg'])} {AGGREGATION_MINUTES}m candles, close_{MA_TYPE} {ma_close:.6f}, open_{MA_TYPE} {ma_open:.6f}){ha_status}"
+                                    logging.info(log_msg)
                             else:
-                                calculate_adx(symbol)
-                                calculate_squeeze_momentum(symbol)
+                                if USE_DI:
+                                    calculate_di(symbol)
+
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
+
         except Exception as e:
             logging.warning(f"WebSocket error: {e}. Reconnecting...")
             await asyncio.sleep(5)
 
 async def status_logger():
+    """5-minute status report"""
     while True:
         await asyncio.sleep(300)
+
         current_time = time.strftime("%H:%M", time.localtime())
-        logging.info(f"=== STATUS REPORT {current_time} ===")
+        logging.info(f"📊 === STATUS REPORT {current_time} ===")
+
         for symbol in SYMBOLS:
             st = state[symbol]
+
             if not st["ready"]:
-                candle_count = len(st["klines"])
-                remaining = max(0, max(BB_LENGTH, KC_LENGTH, ADX_PERIODS) - candle_count)
-                logging.info(f"{symbol}: Not ready - {candle_count}/{max(BB_LENGTH, KC_LENGTH, ADX_PERIODS)} candles ({remaining} more needed)")
+                candle_count_base = len(st["klines_base"])
+                candle_count_agg = len(st["klines_agg"])
+                price = st["price"]
+                
+                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+                if USE_DI:
+                    calculate_di(symbol)
+                
+                reasons = []
+                if candle_count_agg < MA_PERIODS + 1:
+                    needed = (MA_PERIODS + 1) - candle_count_agg
+                    reasons.append(f"need {needed} more {AGGREGATION_MINUTES}m candles")
+                if ma_close is None:
+                    reasons.append(f"{MA_TYPE} close not calculated")
+                if ma_open is None:
+                    reasons.append(f"{MA_TYPE} open not calculated")
+                if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
+                    reasons.append("DI not calculated")
+                
+                reason_str = ", ".join(reasons) if reasons else "unknown"
+                price_str = f"Price={price:.6f} | " if price else ""
+                logging.info(f"{symbol}: {price_str}Not ready - {candle_count_base} {BASE_TIMEFRAME} candles ({candle_count_agg} {AGGREGATION_MINUTES}m) - Waiting for: {reason_str}")
                 continue
-            
+
             price = st["price"]
-            adx = st.get("adx")
-            squeeze_state = st.get("squeeze_state")
-            momentum = st.get("momentum", 0.0)
-            momentum_color = st.get("momentum_color", "gray")
-            
-            if price:
-                current_sig = st["current_signal"]
-                display_sig = current_sig or "FLAT"
+            ma_close = calculate_ma(symbol, "close", MA_PERIODS)
+            ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+            plus_di = st.get("plus_di")
+            minus_di = st.get("minus_di")
+
+            if price and ma_close and ma_open:
+                current_sig = st["current_signal"] or "FLAT"
+
+                plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
+                minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
+
+                logging.info(f"{symbol}: Price={price:.6f} | close_{MA_TYPE}={ma_close:.6f} | open_{MA_TYPE}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
+                logging.info(f"  Signal: {current_sig}")
+
+                trend_up = (ma_close > ma_open)
+                trend_down = (ma_close < ma_open)
+                price_above_both = (price > ma_close) and (price > ma_open)
+                price_below_both = (price < ma_close) and (price < ma_open)
                 
-                logging.info(f"{symbol}: Price={price:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'}")
-                logging.info(f"  Squeeze State: {squeeze_state} | Momentum: {momentum:.4f} | Color: {momentum_color}")
-                logging.info(f"  Signal: {display_sig}")
-                
-                daily_pnl_color = "+" if st["daily_pnl"] >= 0 else ""
-                logging.info(f"  Daily PNL: {daily_pnl_color}{st['daily_pnl']:.2f}% (Target: +{DAILY_PROFIT_TARGET}% / Limit: {DAILY_LOSS_LIMIT}%)")
-                
-                if st["daily_limit_reached"]:
-                    if st["daily_pnl"] >= DAILY_PROFIT_TARGET:
-                        logging.info(f"  STATUS: PROFIT TARGET REACHED - Trading paused until next day")
-                    else:
-                        logging.info(f"  STATUS: LOSS LIMIT HIT - Trading paused until next day")
+                logging.info(f"  Current Trend: {'UP' if trend_up else 'DOWN' if trend_down else 'FLAT'}")
+                logging.info(f"  Price Position: {'Above Both MAs' if price_above_both else 'Below Both MAs' if price_below_both else 'Between MAs'}")
+                if USE_DI and plus_di is not None and minus_di is not None:
+                    di_direction = "Bullish" if plus_di > minus_di else "Bearish" if minus_di > plus_di else "Neutral"
                 else:
-                    if current_sig is None:
-                        logging.info(f"  FLAT - Waiting for squeeze release (ON->OFF) + momentum signal + ADX >={ADX_THRESHOLD}")
-                        logging.info(f"    LONG = lime/maroon (ascending), SHORT = green/red (descending)")
-                    elif current_sig == "LONG":
-                        current_pnl = calculate_pnl_percent(symbol, price)
-                        logging.info(f"  LONG - Current PNL: {current_pnl:+.2f}% | Will exit when momentum descends (green/red)")
-                    elif current_sig == "SHORT":
-                        current_pnl = calculate_pnl_percent(symbol, price)
-                        logging.info(f"  SHORT - Current PNL: {current_pnl:+.2f}% | Will exit when momentum ascends (lime/maroon)")
-        
-        logging.info("=== END STATUS REPORT ===")
+                    di_direction = "N/A"
+                logging.info(f"  DI Direction: {di_direction}")
+
+        logging.info("📊 === END STATUS REPORT ===")
 
 async def trading_loop(client: AsyncClient):
+    """Main trading logic"""
     while True:
         await asyncio.sleep(0.1)
+
         for symbol in SYMBOLS:
             st = state[symbol]
             if not st["ready"]:
                 continue
+
             signal_result = update_trading_signals(symbol)
+
             target_size = SYMBOLS[symbol]
             current_signal = st["current_signal"]
+
             if current_signal == "LONG":
                 final_position = target_size
             elif current_signal == "SHORT":
@@ -610,30 +893,27 @@ async def trading_loop(client: AsyncClient):
                 final_position = 0.0
             else:
                 final_position = st["current_position"]
+
             if signal_result["changed"]:
                 current_pos = st["current_position"]
                 if abs(final_position - current_pos) > 1e-12:
                     await execute_position_change(client, symbol, final_position, current_pos)
 
 async def execute_position_change(client: AsyncClient, symbol: str, target: float, current: float):
+    """Execute position changes"""
     st = state[symbol]
+
     now = time.time()
     last_target = st.get("last_target", None)
     last_when = st.get("last_exec_ts", 0.0)
     if last_target is not None and abs(target - last_target) < 1e-12 and (now - last_when) < 2.0:
-        logging.info(f"{symbol} dedup: skipping duplicate execution")
+        logging.info(f"🛡️ {symbol} dedup: skipping duplicate execution")
         return
+
     if abs(target - current) < 1e-12:
         return
-    
+
     try:
-        if current != 0.0 and target == 0.0 and st["entry_price"] is not None:
-            current_price = st["price"]
-            closed_pnl = calculate_pnl_percent(symbol, current_price)
-            st["daily_pnl"] += closed_pnl
-            pnl_sign = "+" if closed_pnl >= 0 else ""
-            logging.info(f"{symbol} Position closed with {pnl_sign}{closed_pnl:.2f}% PNL. Daily total: {st['daily_pnl']:+.2f}%")
-        
         if target == 0.0:
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
@@ -643,6 +923,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                 ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
                 if not ok:
                     return
+
         elif target > 0:
             if current < 0:
                 ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
@@ -660,6 +941,7 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     ok = await place_order(client, symbol, "SELL", current - target, "LONG CLOSE")
                     if not ok:
                         return
+
         else:
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
@@ -679,174 +961,208 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     ok = await place_order(client, symbol, "BUY", cur_abs - tgt_abs, "SHORT CLOSE")
                     if not ok:
                         return
-        
-        if target != 0.0 and current == 0.0:
-            st["entry_price"] = st["price"]
-            logging.info(f"{symbol} Entry price set: {st['entry_price']:.6f}")
-        elif target == 0.0:
-            st["entry_price"] = None
-        
+
         st["current_position"] = target
         st["last_target"] = target
         st["last_exec_ts"] = now
+        save_positions()
+
     except Exception as e:
-        logging.error(f"{symbol} position change failed: {e}")
+        logging.error(f"❌ {symbol} position change failed: {e}")
+
+async def recover_positions_from_exchange(client: AsyncClient):
+    """Recover actual positions from Binance"""
+    logging.info("🔍 Checking exchange for existing positions...")
+    
+    try:
+        account_info = await safe_api_call(client.futures_account)
+        positions = account_info.get('positions', [])
+        
+        recovered_count = 0
+        for position in positions:
+            symbol = position['symbol']
+            if symbol not in SYMBOLS:
+                continue
+            
+            position_amt = float(position['positionAmt'])
+            
+            if abs(position_amt) > 0.0001:
+                recovered_count += 1
+                
+                if position_amt > 0:
+                    signal = "LONG"
+                    state[symbol]["current_position"] = SYMBOLS[symbol]
+                elif position_amt < 0:
+                    signal = "SHORT"
+                    state[symbol]["current_position"] = -SYMBOLS[symbol]
+                
+                state[symbol]["current_signal"] = signal
+                
+                entry_price = float(position['entryPrice'])
+                unrealized_pnl = float(position['unrealizedProfit'])
+                
+                logging.info(
+                    f"♻️ {symbol} RECOVERED {signal} position: "
+                    f"Amount={position_amt}, Entry={entry_price:.6f}, "
+                    f"PNL={unrealized_pnl:.2f} USDT"
+                )
+        
+        if recovered_count > 0:
+            logging.info(f"✅ Recovered {recovered_count} active positions")
+            save_positions()
+        else:
+            logging.info("✅ No active positions found")
+            
+    except Exception as e:
+        logging.error(f"❌ Position recovery failed: {e}")
+        logging.warning("⚠️ Bot will start with empty positions - verify manually!")
 
 async def init_bot(client: AsyncClient):
-    logging.info("Initializing bot...")
+    """Initialize bot with historical data"""
+    logging.info("🔧 Initializing bot...")
+    logging.info(f"📊 Base: {BASE_TIMEFRAME} candles")
+    logging.info(f"📊 Aggregated: {AGGREGATION_MINUTES}-minute ({AGGREGATION_MINUTES/60:.1f}h) candles")
+    
+    if MA_TYPE == "JMA":
+        logging.info(f"📊 JMA: length={JMA_LENGTH}, phase={JMA_PHASE}, avglen={JMA_AVGLEN}")
+    else:
+        logging.info(f"📊 {MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m = {MA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours")
+    
+    if USE_HEIKIN_ASHI:
+        logging.info("📊 Heikin Ashi: ENABLED (Single Smoothing)")
+    else:
+        logging.info("📊 Heikin Ashi: DISABLED")
+    if USE_DI:
+        logging.info(f"📊 DMI: {DI_PERIODS} periods")
+    else:
+        logging.info("📊 DMI: Disabled")
+    logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
+
     load_klines()
+    load_positions()
+    
+    await recover_positions_from_exchange(client)
+
     symbols_needing_data = []
     for symbol in SYMBOLS:
-        klines = state[symbol]["klines"]
-        required_candles = max(BB_LENGTH, KC_LENGTH, ADX_PERIODS)
-        squeeze_result = calculate_squeeze_momentum(symbol)
-        adx_value = calculate_adx(symbol)
+        if len(state[symbol]["klines_base"]) >= (AGGREGATION_MINUTES // BASE_MINUTES):
+            aggregate_candles(symbol)
         
-        if len(klines) >= required_candles and squeeze_result["squeeze_state"] is not None and adx_value is not None:
+        klines_agg = state[symbol]["klines_agg"]
+        d_close_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "close", MA_PERIODS) is not None
+        d_open_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "open", MA_PERIODS) is not None
+        if USE_DI:
+            calculate_di(symbol)
+        di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
+
+        if d_close_ready and d_open_ready and di_ready:
             state[symbol]["ready"] = True
-            state[symbol]["prev_squeeze_state"] = squeeze_result["squeeze_state"]
-            logging.info(f"{symbol} ready ({len(klines)} candles, ADX {adx_value:.1f}, Squeeze: {squeeze_result['squeeze_state']})")
+            logging.info(f"✅ {symbol} ready from loaded data")
         else:
             symbols_needing_data.append(symbol)
-            logging.info(f"{symbol} needs data ({len(klines)}/{required_candles} candles)")
-    
+
     if symbols_needing_data:
-        logging.info(f"Fetching historical data for {len(symbols_needing_data)} symbols...")
-        successful_fetches = 0
+        logging.info(f"🔄 Fetching historical data for {len(symbols_needing_data)} symbols...")
+        
         for i, symbol in enumerate(symbols_needing_data):
             try:
-                logging.info(f"Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
-                required_candles = max(BB_LENGTH, KC_LENGTH, ADX_PERIODS)
-                klines_data = await safe_api_call(client.futures_mark_price_klines, symbol=symbol, interval="1m", limit=required_candles + 50)
+                logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
+
+                needed_candles = max(MA_PERIODS * (AGGREGATION_MINUTES // BASE_MINUTES) + 50, (DI_PERIODS + 50 if USE_DI else 50))
+                klines_data = await safe_api_call(
+                    client.futures_mark_price_klines,
+                    symbol=symbol,
+                    interval=BASE_TIMEFRAME,
+                    limit=min(needed_candles, 1500)
+                )
+
                 st = state[symbol]
-                st["klines"].clear()
+                st["klines_base"].clear()
+
                 for kline in klines_data:
-                    minute = int(float(kline[0]) / 1000 // 60)
-                    st["klines"].append({"minute": minute, "high": float(kline[2]), "low": float(kline[3]), "close": float(kline[4])})
-                
-                squeeze_result = calculate_squeeze_momentum(symbol)
-                adx_val = calculate_adx(symbol)
-                
-                if squeeze_result["squeeze_state"] is not None and adx_val is not None:
+                    open_time = int(float(kline[0]) / 1000)
+                    st["klines_base"].append({
+                        "open_time": open_time,
+                        "open": float(kline[1]),
+                        "high": float(kline[2]),
+                        "low": float(kline[3]),
+                        "close": float(kline[4])
+                    })
+
+                aggregate_candles(symbol)
+
+                d_close_ok = calculate_ma(symbol, "close", MA_PERIODS) is not None
+                d_open_ok = calculate_ma(symbol, "open", MA_PERIODS) is not None
+                if USE_DI:
+                    calculate_di(symbol)
+                di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
+
+                if d_close_ok and d_open_ok and di_ok:
                     st["ready"] = True
-                    st["prev_squeeze_state"] = squeeze_result["squeeze_state"]
-                    logging.info(f"{symbol} ready ({len(st['klines'])} candles, ADX {adx_val:.1f}, Squeeze: {squeeze_result['squeeze_state']})")
-                    successful_fetches += 1
-                else:
-                    logging.warning(f"{symbol} insufficient data ({len(st['klines'])} candles)")
-                
+                    logging.info(f"✅ {symbol} ready from API")
+
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(240)
+
             except Exception as e:
-                logging.error(f"{symbol} fetch failed: {e}")
+                logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
-        logging.info(f"Fetch complete: {successful_fetches}/{len(symbols_needing_data)} successful")
+                    await asyncio.sleep(240)
+
     else:
-        logging.info("All symbols ready from loaded data")
-    
-    logging.info("Synchronizing positions...")
-    try:
-        for symbol in SYMBOLS:
-            try:
-                position_info = await safe_api_call(client.futures_position_information, symbol=symbol)
-                actual_position_size = 0.0
-                for pos in position_info:
-                    if pos['symbol'] == symbol:
-                        actual_position_size = float(pos['positionAmt'])
-                        break
-                if actual_position_size > 0:
-                    state[symbol]["current_signal"] = "LONG"
-                    state[symbol]["current_position"] = actual_position_size
-                    logging.info(f"{symbol} synced: LONG {actual_position_size}")
-                elif actual_position_size < 0:
-                    state[symbol]["current_signal"] = "SHORT"
-                    state[symbol]["current_position"] = actual_position_size
-                    logging.info(f"{symbol} synced: SHORT {actual_position_size}")
-                else:
-                    state[symbol]["current_signal"] = None
-                    state[symbol]["current_position"] = 0.0
-                    logging.info(f"{symbol} synced: FLAT")
-            except Exception as e:
-                logging.warning(f"{symbol} sync failed: {e}")
-                state[symbol]["current_signal"] = None
-                state[symbol]["current_position"] = 0.0
-    except Exception as e:
-        logging.error(f"Position sync failed: {e}")
-    
+        logging.info("🎯 All symbols ready!")
+
     save_klines()
     await asyncio.sleep(2)
-    logging.info("Initialization complete")
+    logging.info("🚀 Initialization complete")
 
 async def main():
     if not API_KEY or not API_SECRET:
-        raise ValueError("Missing Binance API credentials in .env")
-    
-    # FOR TESTNET (safe testing with fake money):
-    # client = await AsyncClient.create(API_KEY, API_SECRET, testnet=True)
-    # logging.info("Connected to BINANCE TESTNET - Using fake money for testing")
-    
-    # FOR LIVE TRADING (REAL MONEY - COMMENT OUT TESTNET AND UNCOMMENT BELOW):
+        raise ValueError("Missing Binance API credentials")
+
     client = await AsyncClient.create(API_KEY, API_SECRET)
-    logging.info("Connected to BINANCE LIVE - Using REAL money")
-    
+
     atexit.register(save_klines)
+    atexit.register(save_positions)
+
     try:
         await init_bot(client)
+
         price_task = asyncio.create_task(price_feed_loop(client))
         trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
-        logging.info("Bot started")
+
+        logging.info("🚀 Bot started")
+
         await asyncio.gather(price_task, trade_task, status_task)
+
     finally:
         await client.close_connection()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
     print("=" * 80)
-    print("SQUEEZE MOMENTUM + ADX TRADING BOT (LINEAR REGRESSION CORRECTED)")
+    ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
+    print(f"{MA_TYPE} OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
+    print(f"{BASE_TIMEFRAME.upper()} BASE → {AGGREGATION_MINUTES}M AGG")
     print("=" * 80)
-    print("STRATEGY: Squeeze Momentum with Proper Linear Regression")
-    print("")
-    print("SQUEEZE MOMENTUM PARAMETERS:")
-    print(f"  BB Length: {BB_LENGTH}")
-    print(f"  KC Length: {KC_LENGTH}")
-    print(f"  BB MultFactor: {BB_MULT}")
-    print(f"  KC MultFactor: {KC_MULT}")
-    print(f"  Use True Range: {USE_TRUE_RANGE}")
-    print("")
-    print("ADX PARAMETERS:")
-    print(f"  ADX Period: {ADX_PERIODS} minutes")
-    print(f"  ADX Threshold: {ADX_THRESHOLD}")
-    print("")
-    print("ENTRY RULES:")
-    print("  LONG Entry:")
-    print("    - Squeeze transitions from ON to OFF (breakout)")
-    print("    - Momentum ASCENDING (lime or maroon colors)")
-    print("    - ADX >= threshold")
-    print("")
-    print("  SHORT Entry:")
-    print("    - Squeeze transitions from ON to OFF (breakout)")
-    print("    - Momentum DESCENDING (green or red colors)")
-    print("    - ADX >= threshold")
-    print("")
-    print("EXIT RULES:")
-    print("  LONG Exit: Momentum becomes DESCENDING (green or red)")
-    print("  SHORT Exit: Momentum becomes ASCENDING (lime or maroon)")
-    print("")
-    print("DAILY PNL LIMITS (Per Symbol):")
-    print(f"  Profit Target: +{DAILY_PROFIT_TARGET}%")
-    print(f"  Loss Limit: {DAILY_LOSS_LIMIT}%")
-    print("")
-    print("MOMENTUM COLORS (Pine Script):")
-    print("  - Lime: Positive momentum increasing")
-    print("  - Green: Positive momentum decreasing")
-    print("  - Red: Negative momentum decreasing (more negative)")
-    print("  - Maroon: Negative momentum increasing (toward zero)")
-    print("")
+    print(f"MA Type: {MA_TYPE}")
+    if MA_TYPE == "JMA":
+        print(f"JMA Parameters: Length={JMA_LENGTH}, Phase={JMA_PHASE}, AvgLen={JMA_AVGLEN}")
+    else:
+        print(f"{MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m")
+    print(f"Base: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
+    print(f"Aggregation: {AGGREGATION_MINUTES} min ({AGGREGATION_MINUTES/60:.1f} hours)")
+    print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
+    print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
+    print(f"Entry Strategy: {ENTRY_STRATEGY}")
+    print(f"Exit Strategy: {EXIT_STRATEGY}")
     print(f"Symbols: {list(SYMBOLS.keys())}")
-    print(f"Leverage: {LEVERAGE}x")
     print("=" * 80)
-    print("NOTE: Currently set to TESTNET mode")
-    print("=" * 80)
+
     asyncio.run(main())
