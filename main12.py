@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, asyncio, logging, websockets, time
+import os, json, asyncio, logging, websockets, time, math
 import atexit
 from binance import AsyncClient
 from collections import deque
@@ -15,6 +15,11 @@ DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
 USE_DI = False  # Toggle DMI indicator
 USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 
+# ADX settings for entry filter
+USE_ADX = True  # Toggle ADX filter for entries only
+ADX_PERIODS = 14  # Standard ADX period
+ADX_THRESHOLD = 25  # Minimum ADX value to allow entries (20-30 typical)
+
 # Timeframe configuration
 BASE_TIMEFRAME = "5m"  # Options: "1m", "5m", "1h"
 
@@ -27,11 +32,11 @@ elif BASE_TIMEFRAME == "1h":
 else:
     raise ValueError("Unsupported BASE_TIMEFRAME")
 
-# JMA parameters
+# JMA parameters - FULL IMPLEMENTATION
 JMA_LENGTH_CLOSE = 12      # JMA period for close
 JMA_LENGTH_OPEN = 13       # JMA period for open
-JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot (default 50)
-JMA_POWER = 3              # Smoothness level, 1-3 (default 2)
+JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot
+JMA_AVG_LEN = 65           # Fixed at 65 for volatility averaging
 
 # Trading symbols and sizes
 SYMBOLS = {
@@ -51,7 +56,9 @@ PRECISIONS = {
 
 # Calculate kline limits
 MA_PERIODS = max(JMA_LENGTH_CLOSE, JMA_LENGTH_OPEN)
-KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100)
+ADX_NEEDED = ADX_PERIODS * 2 if USE_ADX else 0
+DI_NEEDED = DI_PERIODS + 100 if USE_DI else 100
+KLINE_LIMIT = max(DI_NEEDED, ADX_NEEDED, MA_PERIODS + JMA_AVG_LEN + 100)
 
 # ENTRY STRATEGY TOGGLE
 ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
@@ -74,6 +81,8 @@ state = {
         "plus_di": None,
         "minus_di": None,
         "di_ready": False,
+        "adx": None,
+        "adx_ready": False,
         "ready": False,
         "last_exec_ts": 0.0,
         "last_target": None,
@@ -243,50 +252,183 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
 
-# ========================= INDICATOR CALCULATIONS =========================
-def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: int = 2) -> Optional[float]:
+# ========================= FULL JMA IMPLEMENTATION =========================
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, avg_len: int = 65) -> Optional[float]:
     """
-    Jurik Moving Average (JMA) calculation
-    Copyright (c) 2007-present Jurik Research and Consulting
-    Converted from Pine Script to Python
+    Full Jurik Moving Average (JMA) with volatility-based adaptation
+    
+    This is the complete implementation including:
+    - Dynamic volatility calculation via Jurik Bands
+    - Adaptive power based on relative volatility
+    - Three-stage adaptive filtering
+    
+    Args:
+        symbol: Trading symbol
+        field: Price field ('close', 'open', 'high', 'low')
+        length: Base length for moving average
+        phase: Controls responsiveness vs smoothness (-100 to +100)
+        avg_len: Fixed at 65 for volatility averaging
     """
+    
     klines = state[symbol]["klines"]
-
-    if len(klines) < length + 1:
+    
+    # Need enough data for volatility calculations
+    if len(klines) < max(length + avg_len + 10, 100):
         return None
-
+    
     completed = list(klines)[:-1]
-    if len(completed) < length:
+    if len(completed) < max(length + avg_len + 10, 100):
         return None
-
+    
     # Apply Heikin Ashi if enabled
     if USE_HEIKIN_ASHI:
         completed = convert_to_heikin_ashi(completed, symbol)
-
-    values = [k.get(field, None) for k in completed]
+    
+    # Extract price values
+    values = [k.get(field) for k in completed]
     if None in values:
         return None
+    
+    # Initialize JMA state variables if not exists
+    jma_key = f"jma_{field}_{length}"
+    if jma_key not in state[symbol]:
+        state[symbol][jma_key] = {
+            "upper_band": None,
+            "lower_band": None,
+            "ma1": None,
+            "det0": None,
+            "det1": None,
+            "jma": None,
+            "volty_history": deque(maxlen=avg_len + 10),
+            "vsum_history": deque(maxlen=avg_len),
+        }
+    
+    jma_state = state[symbol][jma_key]
+    
+    # ==================== PRELIMINARY CALCULATIONS ====================
+    
+    # 1. Additional periodic factor (len1)
+    len1 = math.log(math.sqrt(length)) / math.log(2.0) + 2.0
+    if len1 < 0:
+        len1 = 0.0
+    
+    # 2. Power of relative volatility (pow1)
+    pow1 = len1 - 2.0
+    if pow1 < 0.5:
+        pow1 = 0.5
+    
+    # 3. Phase ratio (PR)
+    if phase < -100:
+        phase_ratio = 0.5
+    elif phase > 100:
+        phase_ratio = 2.5
+    else:
+        phase_ratio = phase / 100.0 + 1.5
+    
+    # 4. Beta (periodic ratio)
+    beta = 0.45 * (length - 1.0) / (0.45 * (length - 1.0) + 2.0)
+    
+    # Initialize on first run
+    if jma_state["upper_band"] is None:
+        jma_state["upper_band"] = values[0]
+        jma_state["lower_band"] = values[0]
+        jma_state["ma1"] = values[0]
+        jma_state["det0"] = 0.0
+        jma_state["det1"] = 0.0
+        jma_state["jma"] = values[0]
+    
+    # Process each price value
+    for price in values:
+        
+        # ==================== VOLATILITY CALCULATION ====================
+        
+        # Calculate differences from Jurik Bands
+        del1 = price - jma_state["upper_band"]
+        del2 = price - jma_state["lower_band"]
+        
+        # Calculate volatility
+        abs_del1 = abs(del1)
+        abs_del2 = abs(del2)
+        
+        if abs_del1 == abs_del2:
+            volty = 0.0
+        else:
+            volty = max(abs_del1, abs_del2)
+        
+        # Calculate Kv for band adaptation
+        kv = beta ** math.sqrt(pow1)
+        
+        # Update Jurik Bands
+        if del1 > 0:
+            jma_state["upper_band"] = price
+        else:
+            jma_state["upper_band"] = price - kv * del1
+        
+        if del2 < 0:
+            jma_state["lower_band"] = price
+        else:
+            jma_state["lower_band"] = price - kv * del2
+        
+        # Store volatility
+        jma_state["volty_history"].append(volty)
+        
+        # Calculate vSum (incremental sum for volatility)
+        if len(jma_state["volty_history"]) >= 11:
+            volty_10_ago = jma_state["volty_history"][-11]
+            vsum = (volty - volty_10_ago) / 10.0
+        else:
+            vsum = volty / 10.0
+        
+        jma_state["vsum_history"].append(vsum)
+        
+        # ==================== AVERAGE VOLATILITY ====================
+        
+        # Calculate average volatility over avg_len periods
+        if len(jma_state["vsum_history"]) >= avg_len:
+            avg_volty = sum(jma_state["vsum_history"]) / avg_len
+        elif len(jma_state["vsum_history"]) > 0:
+            avg_volty = sum(jma_state["vsum_history"]) / len(jma_state["vsum_history"])
+        else:
+            avg_volty = 1.0
+        
+        # Prevent division by zero
+        if avg_volty == 0:
+            avg_volty = 1.0
+        
+        # ==================== RELATIVE VOLATILITY & DYNAMIC POWER ====================
+        
+        # Calculate relative price volatility
+        r_volty = volty / avg_volty
+        
+        # Apply limits to rVolty
+        max_r_volty = len1 ** (1.0 / pow1)
+        if r_volty > max_r_volty:
+            r_volty = max_r_volty
+        if r_volty < 1.0:
+            r_volty = 1.0
+        
+        # Calculate dynamic power (KEY DIFFERENCE from simplified JMA)
+        pow_dynamic = r_volty ** pow1
+        
+        # Calculate dynamic alpha based on volatility
+        alpha = beta ** pow_dynamic
+        
+        # ==================== THREE-STAGE SMOOTHING ====================
+        
+        # 1st stage - Preliminary smoothing by adaptive EMA
+        jma_state["ma1"] = (1.0 - alpha) * price + alpha * jma_state["ma1"]
+        
+        # 2nd stage - Preliminary smoothing by Kalman filter
+        jma_state["det0"] = (price - jma_state["ma1"]) * (1.0 - beta) + beta * jma_state["det0"]
+        ma2 = jma_state["ma1"] + phase_ratio * jma_state["det0"]
+        
+        # 3rd stage - Final smoothing by unique Jurik adaptive filter
+        jma_state["det1"] = (ma2 - jma_state["jma"]) * ((1.0 - alpha) ** 2) + (alpha ** 2) * jma_state["det1"]
+        jma_state["jma"] = jma_state["jma"] + jma_state["det1"]
+    
+    return jma_state["jma"]
 
-    # JMA parameters
-    phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
-    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
-    alpha = beta ** power
-
-    # Initialize state variables
-    e0 = 0.0
-    e1 = 0.0
-    e2 = 0.0
-    jma = 0.0
-
-    # Calculate JMA for all values in sequence
-    for src in values:
-        e0 = (1 - alpha) * src + alpha * e0
-        e1 = (src - e0) * (1 - beta) + beta * e1
-        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
-        jma = e2 + jma
-
-    return jma
-
+# ========================= DMI INDICATOR =========================
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
     tr2 = abs(high1 - close0)
@@ -351,9 +493,85 @@ def calculate_di(symbol: str) -> Optional[float]:
     state[symbol]["di_ready"] = True
     return None
 
+def calculate_adx(symbol: str) -> Optional[float]:
+    """
+    Calculate ADX (Average Directional Index) for trend strength
+    ADX > 25: Strong trend (good for entries)
+    ADX < 20: Weak trend (avoid entries)
+    """
+    klines = list(state[symbol]["klines"])
+    
+    if USE_HEIKIN_ASHI:
+        klines = convert_to_heikin_ashi(klines, symbol)
+    
+    if len(klines) < ADX_PERIODS * 2:
+        return None
+
+    completed = klines[:-1]
+    if len(completed) < ADX_PERIODS * 2:
+        return None
+
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+    
+    for i in range(1, len(completed)):
+        cur = completed[i]
+        prev = completed[i - 1]
+        tr = calculate_true_range(cur["high"], cur["low"], prev["close"])
+        tr_values.append(tr)
+        plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    if len(tr_values) < ADX_PERIODS:
+        return None
+
+    alpha = 1.0 / ADX_PERIODS
+
+    # Calculate smoothed TR, +DM, -DM
+    sm_tr = sum(tr_values[:ADX_PERIODS]) / ADX_PERIODS
+    sm_pdm = sum(plus_dm_values[:ADX_PERIODS]) / ADX_PERIODS
+    sm_mdm = sum(minus_dm_values[:ADX_PERIODS]) / ADX_PERIODS
+
+    dx_values = []
+    
+    for i in range(ADX_PERIODS, len(tr_values)):
+        sm_tr = alpha * tr_values[i] + (1 - alpha) * sm_tr
+        sm_pdm = alpha * plus_dm_values[i] + (1 - alpha) * sm_pdm
+        sm_mdm = alpha * minus_dm_values[i] + (1 - alpha) * sm_mdm
+        
+        if sm_tr == 0:
+            continue
+            
+        plus_di = (sm_pdm / sm_tr) * 100
+        minus_di = (sm_mdm / sm_tr) * 100
+        
+        # Calculate DX (Directional Index)
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            dx_values.append(0)
+        else:
+            dx = abs(plus_di - minus_di) / di_sum * 100
+            dx_values.append(dx)
+    
+    if len(dx_values) < ADX_PERIODS:
+        return None
+    
+    # Calculate ADX as smoothed average of DX
+    adx = sum(dx_values[:ADX_PERIODS]) / ADX_PERIODS
+    
+    # Continue smoothing for remaining values
+    for i in range(ADX_PERIODS, len(dx_values)):
+        adx = alpha * dx_values[i] + (1 - alpha) * adx
+    
+    state[symbol]["adx"] = adx
+    state[symbol]["adx_ready"] = True
+    return adx
+
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """Trading signals with JMA indicators"""
+    """Trading signals with FULL JMA indicators"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
@@ -361,12 +579,14 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
+    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
     if USE_DI:
         calculate_di(symbol)
+    if USE_ADX:
+        calculate_adx(symbol)
 
-    if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
+    if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)) or (USE_ADX and st["adx"] is None):
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
     prev_close = st["prev_ma_close"]
@@ -391,8 +611,12 @@ def update_trading_signals(symbol: str) -> dict:
 
     plus_di = st["plus_di"]
     minus_di = st["minus_di"]
+    adx = st.get("adx")
     di_bull = plus_di > minus_di if USE_DI else True
     di_bear = minus_di > plus_di if USE_DI else True
+    
+    # ADX filter - only for entries
+    adx_strong = adx >= ADX_THRESHOLD if USE_ADX else True
 
     new_signal = current_signal
     action_type = "NONE"
@@ -410,7 +634,7 @@ def update_trading_signals(symbol: str) -> dict:
             log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_JMA {ma_close:.6f} crossover open_JMA {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
             logging.info(log_msg)
 
-    # EXIT conditions - Based on EXIT_STRATEGY
+    # EXIT conditions
     if new_signal == current_signal:
         if EXIT_STRATEGY == "SYMMETRIC":
             if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
@@ -437,30 +661,34 @@ def update_trading_signals(symbol: str) -> dict:
         entry_short = False
 
         if ENTRY_STRATEGY == "CROSSOVER":
-            entry_long = crossover_aligned_long and (di_bull if USE_DI else True)
-            entry_short = crossover_aligned_short and (di_bear if USE_DI else True)
+            entry_long = crossover_aligned_long and (di_bull if USE_DI else True) and adx_strong
+            entry_short = crossover_aligned_short and (di_bear if USE_DI else True) and adx_strong
             
             if entry_long:
                 new_signal = "LONG"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                adx_msg = f" & ADX {adx:.2f} >= {ADX_THRESHOLD}" if USE_ADX else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + adx_msg + ")")
             elif entry_short:
                 new_signal = "SHORT"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                adx_msg = f" & ADX {adx:.2f} >= {ADX_THRESHOLD}" if USE_ADX else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + adx_msg + ")")
         
         elif ENTRY_STRATEGY == "SYMMETRIC":
-            entry_long = price_above_both and (di_bull if USE_DI else True)
-            entry_short = price_below_both and (di_bear if USE_DI else True)
+            entry_long = price_above_both and (di_bull if USE_DI else True) and adx_strong
+            entry_short = price_below_both and (di_bear if USE_DI else True) and adx_strong
             
             if entry_long:
                 new_signal = "LONG"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                adx_msg = f" & ADX {adx:.2f} >= {ADX_THRESHOLD}" if USE_ADX else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + adx_msg + ")")
             elif entry_short:
                 new_signal = "SHORT"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                adx_msg = f" & ADX {adx:.2f} >= {ADX_THRESHOLD}" if USE_ADX else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + adx_msg + ")")
 
     st["prev_ma_close"] = ma_close
     st["prev_ma_open"] = ma_open
@@ -510,19 +738,24 @@ async def price_feed_loop(client: AsyncClient):
                                 else:
                                     klines.append(kline_data)
 
-                                if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
-                                    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-                                    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
+                                if len(state[symbol]["klines"]) >= MA_PERIODS + JMA_AVG_LEN and not state[symbol]["ready"]:
+                                    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+                                    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
                                     if USE_DI:
                                         calculate_di(symbol)
-                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                    if USE_ADX:
+                                        calculate_adx(symbol)
+                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)) and (not USE_ADX or state[symbol]["adx"] is not None):
                                         state[symbol]["ready"] = True
                                         ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
-                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, close_JMA {ma_close:.6f}, open_JMA {ma_open:.6f}){ha_status}"
+                                        adx_status = f", ADX={state[symbol]['adx']:.2f}" if USE_ADX else ""
+                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, close_JMA {ma_close:.6f}, open_JMA {ma_open:.6f}{adx_status}){ha_status}"
                                         logging.info(log_msg)
                                 else:
                                     if USE_DI:
                                         calculate_di(symbol)
+                                    if USE_ADX:
+                                        calculate_adx(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
@@ -546,14 +779,16 @@ async def status_logger():
                 candle_count = len(st["klines"])
                 price = st["price"]
                 
-                ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-                ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
+                ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+                ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
                 if USE_DI:
                     calculate_di(symbol)
+                if USE_ADX:
+                    calculate_adx(symbol)
                 
                 reasons = []
-                if candle_count < MA_PERIODS + 1:
-                    needed = (MA_PERIODS + 1) - candle_count
+                if candle_count < MA_PERIODS + JMA_AVG_LEN + 1:
+                    needed = (MA_PERIODS + JMA_AVG_LEN + 1) - candle_count
                     reasons.append(f"need {needed} more {BASE_TIMEFRAME} candles")
                 if ma_close is None:
                     reasons.append("JMA close not calculated")
@@ -561,6 +796,8 @@ async def status_logger():
                     reasons.append("JMA open not calculated")
                 if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
                     reasons.append("DI not calculated")
+                if USE_ADX and st["adx"] is None:
+                    reasons.append("ADX not calculated")
                 
                 reason_str = ", ".join(reasons) if reasons else "unknown"
                 price_str = f"Price={price:.6f} | " if price else ""
@@ -568,18 +805,20 @@ async def status_logger():
                 continue
 
             price = st["price"]
-            ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-            ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
+            ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+            ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
             plus_di = st.get("plus_di")
             minus_di = st.get("minus_di")
+            adx = st.get("adx")
 
             if price and ma_close and ma_open:
                 current_sig = st["current_signal"] or "FLAT"
 
                 plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
                 minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
+                adx_str = f"{adx:.2f}" if USE_ADX and adx is not None else "N/A"
 
-                logging.info(f"{symbol}: Price={price:.6f} | close_JMA={ma_close:.6f} | open_JMA={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
+                logging.info(f"{symbol}: Price={price:.6f} | close_JMA={ma_close:.6f} | open_JMA={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str} | ADX={adx_str}")
                 logging.info(f"  Signal: {current_sig}")
 
                 trend_up = (ma_close > ma_open)
@@ -594,6 +833,9 @@ async def status_logger():
                 else:
                     di_direction = "N/A"
                 logging.info(f"  DI Direction: {di_direction}")
+                if USE_ADX and adx is not None:
+                    adx_strength = "Strong" if adx >= ADX_THRESHOLD else "Weak"
+                    logging.info(f"  Trend Strength: {adx_strength} (ADX={adx:.2f}, threshold={ADX_THRESHOLD})")
 
         logging.info("📊 === END STATUS REPORT ===")
 
@@ -748,7 +990,8 @@ async def init_bot(client: AsyncClient):
     """Initialize bot with historical data"""
     logging.info("🔧 Initializing bot...")
     logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
-    logging.info(f"📊 JMA: close_length={JMA_LENGTH_CLOSE}, open_length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, power={JMA_POWER}")
+    logging.info(f"📊 FULL JMA: close_length={JMA_LENGTH_CLOSE}, open_length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, avg_len={JMA_AVG_LEN}")
+    logging.info(f"📊 JMA Mode: FULL IMPLEMENTATION with volatility adaptation")
     
     if USE_HEIKIN_ASHI:
         logging.info("📊 Heikin Ashi: ENABLED")
@@ -758,6 +1001,10 @@ async def init_bot(client: AsyncClient):
         logging.info(f"📊 DMI: {DI_PERIODS} periods")
     else:
         logging.info("📊 DMI: DISABLED")
+    if USE_ADX:
+        logging.info(f"📊 ADX: ENABLED (periods={ADX_PERIODS}, threshold={ADX_THRESHOLD}) - Entry filter only")
+    else:
+        logging.info("📊 ADX: DISABLED")
     logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
 
     load_klines()
@@ -768,13 +1015,16 @@ async def init_bot(client: AsyncClient):
     symbols_needing_data = []
     for symbol in SYMBOLS:
         klines = state[symbol]["klines"]
-        jma_close_ready = len(klines) >= JMA_LENGTH_CLOSE and calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER) is not None
-        jma_open_ready = len(klines) >= JMA_LENGTH_OPEN and calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER) is not None
+        jma_close_ready = len(klines) >= JMA_LENGTH_CLOSE + JMA_AVG_LEN and calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN) is not None
+        jma_open_ready = len(klines) >= JMA_LENGTH_OPEN + JMA_AVG_LEN and calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN) is not None
         if USE_DI:
             calculate_di(symbol)
+        if USE_ADX:
+            calculate_adx(symbol)
         di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
+        adx_ready = (not USE_ADX) or (state[symbol]["adx"] is not None)
 
-        if jma_close_ready and jma_open_ready and di_ready:
+        if jma_close_ready and jma_open_ready and di_ready and adx_ready:
             state[symbol]["ready"] = True
             logging.info(f"✅ {symbol} ready from loaded data")
         else:
@@ -787,7 +1037,7 @@ async def init_bot(client: AsyncClient):
             try:
                 logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
-                needed_candles = max(MA_PERIODS + 100, (DI_PERIODS + 100 if USE_DI else 100))
+                needed_candles = max(MA_PERIODS + JMA_AVG_LEN + 100, (DI_PERIODS + 100 if USE_DI else 100))
                 klines_data = await safe_api_call(
                     client.futures_mark_price_klines,
                     symbol=symbol,
@@ -808,23 +1058,26 @@ async def init_bot(client: AsyncClient):
                         "close": float(kline[4])
                     })
 
-                jma_close_ok = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER) is not None
-                jma_open_ok = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER) is not None
+                jma_close_ok = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN) is not None
+                jma_open_ok = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN) is not None
                 if USE_DI:
                     calculate_di(symbol)
+                if USE_ADX:
+                    calculate_adx(symbol)
                 di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
+                adx_ok = (not USE_ADX) or (st["adx"] is not None)
 
-                if jma_close_ok and jma_open_ok and di_ok:
+                if jma_close_ok and jma_open_ok and di_ok and adx_ok:
                     st["ready"] = True
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(2)  # Small delay to avoid burst requests
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(2)
 
     else:
         logging.info("🎯 All symbols ready!")
@@ -849,7 +1102,7 @@ async def main():
         trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
 
-        logging.info("🚀 Bot started")
+        logging.info("🚀 Bot started with FULL JMA implementation")
 
         await asyncio.gather(price_task, trade_task, status_task)
 
@@ -865,10 +1118,11 @@ if __name__ == "__main__":
 
     print("=" * 80)
     ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
-    print(f"JMA OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
+    print(f"FULL JMA OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
     print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("=" * 80)
-    print(f"JMA Parameters: Close_Length={JMA_LENGTH_CLOSE}, Open_Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, Power={JMA_POWER}")
+    print(f"FULL JMA Parameters: Close_Length={JMA_LENGTH_CLOSE}, Open_Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, AvgLen={JMA_AVG_LEN}")
+    print(f"JMA Mode: FULL IMPLEMENTATION (volatility-adaptive)")
     print(f"Timeframe: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
     print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
     print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
