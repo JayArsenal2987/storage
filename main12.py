@@ -29,7 +29,7 @@ else:
 
 # JMA parameters
 JMA_LENGTH_CLOSE = 12      # JMA period for close
-JMA_LENGTH_OPEN = 15       # JMA period for open
+JMA_LENGTH_OPEN = 13       # JMA period for open
 JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot (default 50)
 JMA_POWER = 3              # Smoothness level, 1-3 (default 2)
 
