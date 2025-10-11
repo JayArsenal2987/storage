@@ -1,106 +1,10 @@
 #!/usr/bin/env python3
-import os, json, asyncio, logging, websockets, time
+import os, json, asyncio, logging, websockets, time, math
 import atexit
 from binance import AsyncClient
 from collections import deque
 from typing import Optional
 from dotenv import load_dotenv
-import numpy as np
-
-def jurik_moving_average(prices, length=12, phase=0, avglen=65):
-    """
-    Implements the Jurik Moving Average (JMA) based on the reverse-engineered algorithm.
-    
-    Parameters:
-    - prices: numpy array or list of price data.
-    - length: int, the base length for the moving average (default 7).
-    - phase: int, controls responsiveness vs. smoothness (-100 to +100, default 0).
-    - avglen: int, fixed length for averaging volatility (default 65).
-    
-    Returns:
-    - numpy array of JMA values.
-    
-    Note: This is an approximation based on public discussions and may not match the proprietary version exactly.
-    """
-    prices = np.array(prices, dtype=float)
-    n = len(prices)
-    if n == 0:
-        return np.array([])
-    
-    # Precompute fixed parameters
-    len1 = np.log(np.sqrt(length)) / np.log(2.0) + 2.0
-    len1 = max(len1, 0.0)
-    pow1 = len1 - 2.0
-    pow1 = max(pow1, 0.5)
-    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2.0)
-    pr = (phase / 100.0) + 1.5
-    pr = max(0.5, min(pr, 2.5))
-    
-    # Initialize arrays
-    upperband = np.full(n, np.nan)
-    lowerband = np.full(n, np.nan)
-    volty = np.full(n, 0.0)
-    vsum = np.full(n, 0.0)
-    avgvolty = np.full(n, 0.0)
-    rvolty = np.full(n, 1.0)
-    power = np.full(n, 1.0)
-    alpha = np.full(n, beta)  # Initial alpha
-    ma1 = np.full(n, np.nan)
-    det0 = np.full(n, np.nan)
-    ma2 = np.full(n, np.nan)
-    det1 = np.full(n, np.nan)
-    jma_val = np.full(n, np.nan)
-    
-    # Initial values
-    upperband[0] = lowerband[0] = ma1[0] = det0[0] = ma2[0] = det1[0] = jma_val[0] = prices[0]
-    
-    for i in range(1, n):
-        # Compute del1 and del2 using previous bands
-        del1 = prices[i] - upperband[i-1]
-        del2 = prices[i] - lowerband[i-1]
-        
-        if np.abs(del1) == np.abs(del2):
-            volty[i] = 0.0
-        else:
-            volty[i] = max(np.abs(del1), np.abs(del2))
-        
-        # Compute Kv (assuming pow2 ≈ pow1)
-        pow2 = pow1
-        kv = beta ** np.sqrt(pow2)
-        
-        # Update bands
-        upperband[i] = prices[i] if del1 > 0 else prices[i] - kv * del1
-        lowerband[i] = prices[i] if del2 < 0 else prices[i] - kv * del2
-        
-        # Compute vSum as SMA of volty over up to 10 periods
-        win_start = max(0, i - 9)
-        vsum[i] = np.mean(volty[win_start:i+1])
-        
-        # Compute AvgVolty as SMA of vSum over up to avglen periods
-        win_start_avg = max(0, i - avglen + 1)
-        avgvolty[i] = np.mean(vsum[win_start_avg:i+1])
-        
-        # Relative volatility
-        if avgvolty[i] > 0:
-            rvolty[i] = volty[i] / avgvolty[i]
-        else:
-            rvolty[i] = 1.0
-        
-        max_rvolty = len1 ** (1.0 / pow1) if pow1 != 0 else 1.0
-        rvolty[i] = max(1.0, min(rvolty[i], max_rvolty))
-        
-        # Power and alpha
-        power[i] = rvolty[i] ** pow1
-        alpha[i] = beta ** power[i]
-        
-        # Smoothing stages
-        ma1[i] = (1 - alpha[i]) * prices[i] + alpha[i] * ma1[i-1]
-        det0[i] = (prices[i] - ma1[i]) * (1 - beta) + beta * det0[i-1]
-        ma2[i] = ma1[i] + pr * det0[i]
-        det1[i] = (ma2[i] - jma_val[i-1]) * (1 - alpha[i])**2 + (alpha[i])**2 * det1[i-1]
-        jma_val[i] = jma_val[i-1] + det1[i]
-    
-    return jma_val
 
 # ========================= CONFIG =========================
 load_dotenv()
@@ -109,31 +13,25 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
 DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
 USE_DI = False  # Toggle DMI indicator
-USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles (Single smoothing - matches TradingView)
-MA_TYPE = "JMA"  # Options: "DEMA", "HULL", or "JMA"
+USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 
-# Base timeframe configuration (must be defined BEFORE JMA parameters)
-BASE_TIMEFRAME = "15m"  # or "1h" or "1m"
+# Timeframe configuration
+BASE_TIMEFRAME = "5m"  # Options: "1m", "5m", "1h"
 
 if BASE_TIMEFRAME == "1m":
     BASE_MINUTES = 1
-    AGGREGATION_MINUTES = 3     # Aggregate to 3 minutes
-    DEMA_PERIODS = 600          # 600 * 3m = 30 hours
-elif BASE_TIMEFRAME == "15m":
-    BASE_MINUTES = 15
-    AGGREGATION_MINUTES = 45    # Aggregate to 45 minutes
-    DEMA_PERIODS = 12           # 12 * 45m = 9 hours
+elif BASE_TIMEFRAME == "5m":
+    BASE_MINUTES = 5
 elif BASE_TIMEFRAME == "1h":
     BASE_MINUTES = 60
-    AGGREGATION_MINUTES = 180   # Keep at 3 hours
-    DEMA_PERIODS = 3            # 3 * 180m = 9 hours
 else:
     raise ValueError("Unsupported BASE_TIMEFRAME")
 
-# JMA specific parameters (defined AFTER DEMA_PERIODS, only used when MA_TYPE = "JMA")
-JMA_LENGTH = DEMA_PERIODS  # Matches DEMA for fair comparison
-JMA_PHASE = 0              # -100 to +100 (0 = balanced, negative = faster, positive = smoother)
-JMA_AVGLEN = 65            # Volatility averaging length (65 is standard)
+# JMA parameters - FULL IMPLEMENTATION
+JMA_LENGTH_CLOSE = 12      # JMA period for close
+JMA_LENGTH_OPEN = 13       # JMA period for open
+JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot
+JMA_AVG_LEN = 65           # Fixed at 65 for volatility averaging
 
 # Trading symbols and sizes
 SYMBOLS = {
@@ -151,13 +49,9 @@ PRECISIONS = {
     "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-# MA_PERIODS is used for DEMA and HULL (JMA uses JMA_LENGTH)
-MA_PERIODS = DEMA_PERIODS if MA_TYPE in ["DEMA", "HULL"] else JMA_LENGTH
-
-# Compute limits
-agg_factor = AGGREGATION_MINUTES // BASE_MINUTES
-KLINE_LIMIT_BASE = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS * agg_factor + 100)
-KLINE_LIMIT_AGG = max(MA_PERIODS + 20, JMA_AVGLEN + 20 if MA_TYPE == "JMA" else 20)
+# Calculate kline limits
+MA_PERIODS = max(JMA_LENGTH_CLOSE, JMA_LENGTH_OPEN)
+KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + JMA_AVG_LEN + 100)
 
 # ENTRY STRATEGY TOGGLE
 ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
@@ -169,8 +63,7 @@ EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
 state = {
     symbol: {
         "price": None,
-        "klines_base": deque(maxlen=KLINE_LIMIT_BASE),
-        "klines_agg": deque(maxlen=KLINE_LIMIT_AGG),
+        "klines": deque(maxlen=KLINE_LIMIT),
         "current_signal": None,
         "last_signal_change": 0,
         "current_position": 0.0,
@@ -186,8 +79,6 @@ state = {
         "last_target": None,
         "ha_prev_close": None,
         "ha_prev_open": None,
-        "ha_agg_prev_close": None,
-        "ha_agg_prev_open": None,
     }
     for symbol in SYMBOLS
 }
@@ -198,19 +89,19 @@ api_calls_reset_time = time.time()
 
 # ========================= PERSISTENCE FUNCTIONS =========================
 def save_klines():
-    """Save base klines to JSON"""
-    save_data = {sym: list(state[sym]["klines_base"]) for sym in SYMBOLS}
+    """Save klines to JSON"""
+    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
     with open('klines.json', 'w') as f:
         json.dump(save_data, f)
     logging.info("📥 Saved klines to klines.json")
 
 def load_klines():
-    """Load base klines from JSON"""
+    """Load klines from JSON"""
     try:
         with open('klines.json', 'r') as f:
             load_data = json.load(f)
         for sym in SYMBOLS:
-            state[sym]["klines_base"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT_BASE)
+            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
         logging.info("📤 Loaded klines from klines.json")
     except FileNotFoundError:
         logging.info("No klines.json found - starting fresh")
@@ -247,19 +138,14 @@ def load_positions():
         logging.error(f"Failed to load positions: {e} - starting fresh")
 
 # ========================= HEIKIN ASHI TRANSFORMATION =========================
-def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> list:
+def convert_to_heikin_ashi(candles: list, symbol: str) -> list:
     """Convert regular candles to Heikin Ashi candles"""
     if not candles or not USE_HEIKIN_ASHI:
         return candles
     
     ha_candles = []
-    
-    if level == "base":
-        prev_ha_open = state[symbol].get("ha_prev_open")
-        prev_ha_close = state[symbol].get("ha_prev_close")
-    else:
-        prev_ha_open = state[symbol].get("ha_agg_prev_open")
-        prev_ha_close = state[symbol].get("ha_agg_prev_close")
+    prev_ha_open = state[symbol].get("ha_prev_open")
+    prev_ha_close = state[symbol].get("ha_prev_close")
     
     for i, candle in enumerate(candles):
         ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
@@ -283,58 +169,10 @@ def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> l
         })
     
     if ha_candles:
-        if level == "base":
-            state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
-            state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
-        else:
-            state[symbol]["ha_agg_prev_open"] = ha_candles[-1]["open"]
-            state[symbol]["ha_agg_prev_close"] = ha_candles[-1]["close"]
+        state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
+        state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
     
     return ha_candles
-
-# ========================= CANDLE AGGREGATION =========================
-def aggregate_candles(symbol: str):
-    """Aggregate base candles into larger timeframe candles"""
-    klines_base = state[symbol]["klines_base"]
-    
-    agg_count = AGGREGATION_MINUTES // BASE_MINUTES
-    
-    if len(klines_base) < agg_count:
-        return
-    
-    state[symbol]["klines_agg"].clear()
-    
-    candles_base = list(klines_base)
-    if USE_HEIKIN_ASHI:
-        candles_base = convert_to_heikin_ashi(candles_base, symbol, level="base")
-    
-    for i in range(0, len(candles_base), agg_count):
-        chunk = candles_base[i:i + agg_count]
-        
-        if len(chunk) < agg_count:
-            continue
-        
-        agg_candle = {
-            "open_time": chunk[0]["open_time"],
-            "open": chunk[0]["open"],
-            "high": max(c["high"] for c in chunk),
-            "low": min(c["low"] for c in chunk),
-            "close": chunk[-1]["close"]
-        }
-        
-        state[symbol]["klines_agg"].append(agg_candle)
-    
-    remaining = len(candles_base) % agg_count
-    if remaining > 0:
-        forming_chunk = candles_base[-remaining:]
-        forming_candle = {
-            "open_time": forming_chunk[0]["open_time"],
-            "open": forming_chunk[0]["open"],
-            "high": max(c["high"] for c in forming_chunk),
-            "low": min(c["low"] for c in forming_chunk),
-            "close": forming_chunk[-1]["close"]
-        }
-        state[symbol]["klines_agg"].append(forming_candle)
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
@@ -405,149 +243,183 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
 
-# ========================= INDICATOR CALCULATIONS =========================
-def calculate_wma(values: list, period: int) -> Optional[float]:
-    """Weighted Moving Average calculation"""
-    if len(values) < period:
-        return None
-    
-    recent_values = values[-period:]
-    weights = list(range(1, period + 1))
-    weighted_sum = sum(v * w for v, w in zip(recent_values, weights))
-    weight_sum = sum(weights)
-    
-    return weighted_sum / weight_sum if weight_sum > 0 else None
-
-def calculate_jma(symbol: str, field: str, length: int, phase: int = 0, avglen: int = 65) -> Optional[float]:
+# ========================= FULL JMA IMPLEMENTATION =========================
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, avg_len: int = 65) -> Optional[float]:
     """
-    Jurik Moving Average (JMA) calculation - Adaptive volatility-based version.
+    Full Jurik Moving Average (JMA) with volatility-based adaptation
+    
+    This is the complete implementation including:
+    - Dynamic volatility calculation via Jurik Bands
+    - Adaptive power based on relative volatility
+    - Three-stage adaptive filtering
+    
+    Args:
+        symbol: Trading symbol
+        field: Price field ('close', 'open', 'high', 'low')
+        length: Base length for moving average
+        phase: Controls responsiveness vs smoothness (-100 to +100)
+        avg_len: Fixed at 65 for volatility averaging
     """
-    klines = state[symbol]["klines_agg"]
-
-    # JMA needs more data for volatility calculations
-    min_required = max(length + avglen, 100)
-    if len(klines) < min_required:
+    
+    klines = state[symbol]["klines"]
+    
+    # Need enough data for volatility calculations
+    if len(klines) < max(length + avg_len + 10, 100):
         return None
-
+    
     completed = list(klines)[:-1]
-    if len(completed) < min_required:
+    if len(completed) < max(length + avg_len + 10, 100):
         return None
-
-    values = [k.get(field, None) for k in completed]
+    
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
+    
+    # Extract price values
+    values = [k.get(field) for k in completed]
     if None in values:
         return None
-
-    # Convert to numpy array and calculate JMA
-    try:
-        prices = np.array(values, dtype=float)
-        jma_series = jurik_moving_average(prices, length=length, phase=phase, avglen=avglen)
-        
-        # Get the last non-NaN value
-        last_jma = jma_series[-1]
-        if np.isnan(last_jma):
-            return None
-        
-        return float(last_jma)
-    except Exception as e:
-        logging.error(f"JMA calculation error for {symbol} {field}: {e}")
-        return None
-
-def calculate_hull_ma(symbol: str, field: str, period: int) -> Optional[float]:
-    """Hull Moving Average calculation"""
-    klines = state[symbol]["klines_agg"]
-
-    if len(klines) < period + 1:
-        return None
-
-    completed = list(klines)[:-1]
-    if len(completed) < period:
-        return None
-
-    values = [k.get(field, None) for k in completed]
-    if None in values:
-        return None
-
-    half_period = period // 2
-    sqrt_period = int(round(period ** 0.5))
-
-    wma_half_values = []
-    for i in range(half_period - 1, len(values)):
-        wma_half = calculate_wma(values[:i+1], half_period)
-        if wma_half is not None:
-            wma_half_values.append(wma_half)
-
-    wma_full_values = []
-    for i in range(period - 1, len(values)):
-        wma_full = calculate_wma(values[:i+1], period)
-        if wma_full is not None:
-            wma_full_values.append(wma_full)
-
-    if len(wma_half_values) < len(wma_full_values):
-        return None
     
-    offset = len(wma_half_values) - len(wma_full_values)
-    raw_hull_values = []
-    for i in range(len(wma_full_values)):
-        raw_hull = 2 * wma_half_values[i + offset] - wma_full_values[i]
-        raw_hull_values.append(raw_hull)
-
-    if len(raw_hull_values) < sqrt_period:
-        return None
+    # Initialize JMA state variables if not exists
+    jma_key = f"jma_{field}_{length}"
+    if jma_key not in state[symbol]:
+        state[symbol][jma_key] = {
+            "upper_band": None,
+            "lower_band": None,
+            "ma1": None,
+            "det0": None,
+            "det1": None,
+            "jma": None,
+            "volty_history": deque(maxlen=avg_len + 10),
+            "vsum_history": deque(maxlen=avg_len),
+        }
     
-    hull_ma = calculate_wma(raw_hull_values, sqrt_period)
+    jma_state = state[symbol][jma_key]
     
-    if hull_ma is not None:
-        state[symbol][f"hull_{field}"] = hull_ma
+    # ==================== PRELIMINARY CALCULATIONS ====================
     
-    return hull_ma
-
-def calculate_dema(symbol: str, field: str, period: int) -> Optional[float]:
-    """DEMA on aggregated candles"""
-    klines = state[symbol]["klines_agg"]
-
-    if len(klines) < period + 1:
-        return None
-
-    completed = list(klines)[:-1]
-    if len(completed) < period:
-        return None
-
-    values = [k.get(field, None) for k in completed]
-    if None in values:
-        return None
-
-    alpha = 2 / (period + 1)
-
-    ema_series = []
-    ema = values[0]
-    ema_series.append(ema)
-    for v in values[1:]:
-        ema = alpha * v + (1 - alpha) * ema
-        ema_series.append(ema)
-
-    ema1 = ema_series[-1]
-
-    ema2 = ema_series[0]
-    for es in ema_series[1:]:
-        ema2 = alpha * es + (1 - alpha) * ema2
-
-    dema_val = 2 * ema1 - ema2
-    state[symbol][f"dema_{field}"] = dema_val
-
-    return dema_val
-
-def calculate_ma(symbol: str, field: str, period: int) -> Optional[float]:
-    """Calculate Moving Average based on MA_TYPE configuration"""
-    if MA_TYPE == "JMA":
-        return calculate_jma(symbol, field, JMA_LENGTH, JMA_PHASE, JMA_AVGLEN)
-    elif MA_TYPE == "HULL":
-        return calculate_hull_ma(symbol, field, period)
-    elif MA_TYPE == "DEMA":
-        return calculate_dema(symbol, field, period)
+    # 1. Additional periodic factor (len1)
+    len1 = math.log(math.sqrt(length)) / math.log(2.0) + 2.0
+    if len1 < 0:
+        len1 = 0.0
+    
+    # 2. Power of relative volatility (pow1)
+    pow1 = len1 - 2.0
+    if pow1 < 0.5:
+        pow1 = 0.5
+    
+    # 3. Phase ratio (PR)
+    if phase < -100:
+        phase_ratio = 0.5
+    elif phase > 100:
+        phase_ratio = 2.5
     else:
-        logging.error(f"Unknown MA_TYPE: {MA_TYPE}. Using DEMA as fallback.")
-        return calculate_dema(symbol, field, period)
+        phase_ratio = phase / 100.0 + 1.5
+    
+    # 4. Beta (periodic ratio)
+    beta = 0.45 * (length - 1.0) / (0.45 * (length - 1.0) + 2.0)
+    
+    # Initialize on first run
+    if jma_state["upper_band"] is None:
+        jma_state["upper_band"] = values[0]
+        jma_state["lower_band"] = values[0]
+        jma_state["ma1"] = values[0]
+        jma_state["det0"] = 0.0
+        jma_state["det1"] = 0.0
+        jma_state["jma"] = values[0]
+    
+    # Process each price value
+    for price in values:
+        
+        # ==================== VOLATILITY CALCULATION ====================
+        
+        # Calculate differences from Jurik Bands
+        del1 = price - jma_state["upper_band"]
+        del2 = price - jma_state["lower_band"]
+        
+        # Calculate volatility
+        abs_del1 = abs(del1)
+        abs_del2 = abs(del2)
+        
+        if abs_del1 == abs_del2:
+            volty = 0.0
+        else:
+            volty = max(abs_del1, abs_del2)
+        
+        # Calculate Kv for band adaptation
+        kv = beta ** math.sqrt(pow1)
+        
+        # Update Jurik Bands
+        if del1 > 0:
+            jma_state["upper_band"] = price
+        else:
+            jma_state["upper_band"] = price - kv * del1
+        
+        if del2 < 0:
+            jma_state["lower_band"] = price
+        else:
+            jma_state["lower_band"] = price - kv * del2
+        
+        # Store volatility
+        jma_state["volty_history"].append(volty)
+        
+        # Calculate vSum (incremental sum for volatility)
+        if len(jma_state["volty_history"]) >= 11:
+            volty_10_ago = jma_state["volty_history"][-11]
+            vsum = (volty - volty_10_ago) / 10.0
+        else:
+            vsum = volty / 10.0
+        
+        jma_state["vsum_history"].append(vsum)
+        
+        # ==================== AVERAGE VOLATILITY ====================
+        
+        # Calculate average volatility over avg_len periods
+        if len(jma_state["vsum_history"]) >= avg_len:
+            avg_volty = sum(jma_state["vsum_history"]) / avg_len
+        elif len(jma_state["vsum_history"]) > 0:
+            avg_volty = sum(jma_state["vsum_history"]) / len(jma_state["vsum_history"])
+        else:
+            avg_volty = 1.0
+        
+        # Prevent division by zero
+        if avg_volty == 0:
+            avg_volty = 1.0
+        
+        # ==================== RELATIVE VOLATILITY & DYNAMIC POWER ====================
+        
+        # Calculate relative price volatility
+        r_volty = volty / avg_volty
+        
+        # Apply limits to rVolty
+        max_r_volty = len1 ** (1.0 / pow1)
+        if r_volty > max_r_volty:
+            r_volty = max_r_volty
+        if r_volty < 1.0:
+            r_volty = 1.0
+        
+        # Calculate dynamic power (KEY DIFFERENCE from simplified JMA)
+        pow_dynamic = r_volty ** pow1
+        
+        # Calculate dynamic alpha based on volatility
+        alpha = beta ** pow_dynamic
+        
+        # ==================== THREE-STAGE SMOOTHING ====================
+        
+        # 1st stage - Preliminary smoothing by adaptive EMA
+        jma_state["ma1"] = (1.0 - alpha) * price + alpha * jma_state["ma1"]
+        
+        # 2nd stage - Preliminary smoothing by Kalman filter
+        jma_state["det0"] = (price - jma_state["ma1"]) * (1.0 - beta) + beta * jma_state["det0"]
+        ma2 = jma_state["ma1"] + phase_ratio * jma_state["det0"]
+        
+        # 3rd stage - Final smoothing by unique Jurik adaptive filter
+        jma_state["det1"] = (ma2 - jma_state["jma"]) * ((1.0 - alpha) ** 2) + (alpha ** 2) * jma_state["det1"]
+        jma_state["jma"] = jma_state["jma"] + jma_state["det1"]
+    
+    return jma_state["jma"]
 
+# ========================= DMI INDICATOR =========================
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
     tr2 = abs(high1 - close0)
@@ -562,16 +434,16 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
     return plus_dm, minus_dm
 
 def calculate_di(symbol: str) -> Optional[float]:
-    """DI on base candles"""
-    klines_base = list(state[symbol]["klines_base"])
+    """DI calculation"""
+    klines = list(state[symbol]["klines"])
     
     if USE_HEIKIN_ASHI:
-        klines_base = convert_to_heikin_ashi(klines_base, symbol, level="base")
+        klines = convert_to_heikin_ashi(klines, symbol)
     
-    if len(klines_base) < DI_PERIODS + 1:
+    if len(klines) < DI_PERIODS + 1:
         return None
 
-    completed = klines_base[:-1]
+    completed = klines[:-1]
     if len(completed) < DI_PERIODS + 1:
         return None
 
@@ -614,7 +486,7 @@ def calculate_di(symbol: str) -> Optional[float]:
 
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """Trading signals with dual-timeframe indicators"""
+    """Trading signals with FULL JMA indicators"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
@@ -622,8 +494,8 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-    ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
     if USE_DI:
         calculate_di(symbol)
 
@@ -657,23 +529,21 @@ def update_trading_signals(symbol: str) -> dict:
 
     new_signal = current_signal
     action_type = "NONE"
-    
-    ma_name = MA_TYPE
 
     if current_signal == "LONG":
         if cross_down and price_below_both and (di_bear if USE_DI else True):
             new_signal = "SHORT"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_{ma_name} {ma_close:.6f} crossunder open_{ma_name} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
+            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_JMA {ma_close:.6f} crossunder open_JMA {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
             logging.info(log_msg)
     elif current_signal == "SHORT":
         if cross_up and price_above_both and (di_bull if USE_DI else True):
             new_signal = "LONG"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_{ma_name} {ma_close:.6f} crossover open_{ma_name} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
+            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_JMA {ma_close:.6f} crossover open_JMA {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
             logging.info(log_msg)
 
-    # EXIT conditions - Based on EXIT_STRATEGY
+    # EXIT conditions
     if new_signal == current_signal:
         if EXIT_STRATEGY == "SYMMETRIC":
             if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
@@ -689,11 +559,11 @@ def update_trading_signals(symbol: str) -> dict:
             if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True):
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: JMA trend reversed - close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
             elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True):
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: JMA trend reversed - close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
             
     if new_signal is None:
         entry_long = False
@@ -706,11 +576,11 @@ def update_trading_signals(symbol: str) -> dict:
             if entry_long:
                 new_signal = "LONG"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
             elif entry_short:
                 new_signal = "SHORT"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
         
         elif ENTRY_STRATEGY == "SYMMETRIC":
             entry_long = price_above_both and (di_bull if USE_DI else True)
@@ -738,11 +608,9 @@ def update_trading_signals(symbol: str) -> dict:
     
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
-    """WebSocket feed - builds base candles and aggregates them"""
-    streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
+    """WebSocket feed - builds candles"""
+    streams = [f"{s.lower()}@kline_{BASE_TIMEFRAME.lower()}" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-
-    base_interval_seconds = BASE_MINUTES * 60
 
     while True:
         try:
@@ -752,49 +620,42 @@ async def price_feed_loop(client: AsyncClient):
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
-                        symbol = data.get("s")
-                        price_str = data.get("p")
-                        event_time = data.get("E")
-
-                        if symbol in SYMBOLS and price_str and event_time:
-                            price = float(price_str)
-                            state[symbol]["price"] = price
-
-                            event_time /= 1000
+                        
+                        if "k" in data:
+                            k = data["k"]
+                            symbol = k["s"]
                             
-                            current_open_time = int(event_time // base_interval_seconds) * base_interval_seconds
-                            klines_base = state[symbol]["klines_base"]
-
-                            if not klines_base or klines_base[-1]["open_time"] != current_open_time:
-                                klines_base.append({
-                                    "open_time": current_open_time,
-                                    "open": price,
-                                    "high": price,
-                                    "low": price,
-                                    "close": price
-                                })
+                            if symbol in SYMBOLS:
+                                state[symbol]["price"] = float(k["c"])
                                 
-                                aggregate_candles(symbol)
-                            else:
-                                klines_base[-1]["high"]  = max(klines_base[-1]["high"],  price)
-                                klines_base[-1]["low"]   = min(klines_base[-1]["low"],   price)
-                                klines_base[-1]["close"] = price
+                                kline_data = {
+                                    "open_time": int(k["t"] / 1000),
+                                    "open": float(k["o"]),
+                                    "high": float(k["h"]),
+                                    "low": float(k["l"]),
+                                    "close": float(k["c"])
+                                }
                                 
-                                aggregate_candles(symbol)
+                                klines = state[symbol]["klines"]
+                                
+                                if klines and klines[-1]["open_time"] == kline_data["open_time"]:
+                                    klines[-1] = kline_data
+                                else:
+                                    klines.append(kline_data)
 
-                            if len(state[symbol]["klines_agg"]) >= MA_PERIODS and not state[symbol]["ready"]:
-                                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-                                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
-                                if USE_DI:
-                                    calculate_di(symbol)
-                                if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
-                                    state[symbol]["ready"] = True
-                                    ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
-                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines_agg'])} {AGGREGATION_MINUTES}m candles, close_{MA_TYPE} {ma_close:.6f}, open_{MA_TYPE} {ma_open:.6f}){ha_status}"
-                                    logging.info(log_msg)
-                            else:
-                                if USE_DI:
-                                    calculate_di(symbol)
+                                if len(state[symbol]["klines"]) >= MA_PERIODS + JMA_AVG_LEN and not state[symbol]["ready"]:
+                                    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+                                    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
+                                    if USE_DI:
+                                        calculate_di(symbol)
+                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                        state[symbol]["ready"] = True
+                                        ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, close_JMA {ma_close:.6f}, open_JMA {ma_open:.6f}){ha_status}"
+                                        logging.info(log_msg)
+                                else:
+                                    if USE_DI:
+                                        calculate_di(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
@@ -815,34 +676,33 @@ async def status_logger():
             st = state[symbol]
 
             if not st["ready"]:
-                candle_count_base = len(st["klines_base"])
-                candle_count_agg = len(st["klines_agg"])
+                candle_count = len(st["klines"])
                 price = st["price"]
                 
-                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+                ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+                ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
                 if USE_DI:
                     calculate_di(symbol)
                 
                 reasons = []
-                if candle_count_agg < MA_PERIODS + 1:
-                    needed = (MA_PERIODS + 1) - candle_count_agg
-                    reasons.append(f"need {needed} more {AGGREGATION_MINUTES}m candles")
+                if candle_count < MA_PERIODS + JMA_AVG_LEN + 1:
+                    needed = (MA_PERIODS + JMA_AVG_LEN + 1) - candle_count
+                    reasons.append(f"need {needed} more {BASE_TIMEFRAME} candles")
                 if ma_close is None:
-                    reasons.append(f"{MA_TYPE} close not calculated")
+                    reasons.append("JMA close not calculated")
                 if ma_open is None:
-                    reasons.append(f"{MA_TYPE} open not calculated")
+                    reasons.append("JMA open not calculated")
                 if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
                     reasons.append("DI not calculated")
                 
                 reason_str = ", ".join(reasons) if reasons else "unknown"
                 price_str = f"Price={price:.6f} | " if price else ""
-                logging.info(f"{symbol}: {price_str}Not ready - {candle_count_base} {BASE_TIMEFRAME} candles ({candle_count_agg} {AGGREGATION_MINUTES}m) - Waiting for: {reason_str}")
+                logging.info(f"{symbol}: {price_str}Not ready - {candle_count} {BASE_TIMEFRAME} candles - Waiting for: {reason_str}")
                 continue
 
             price = st["price"]
-            ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-            ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+            ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
+            ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
             plus_di = st.get("plus_di")
             minus_di = st.get("minus_di")
 
@@ -852,7 +712,7 @@ async def status_logger():
                 plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
                 minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
 
-                logging.info(f"{symbol}: Price={price:.6f} | close_{MA_TYPE}={ma_close:.6f} | open_{MA_TYPE}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
+                logging.info(f"{symbol}: Price={price:.6f} | close_JMA={ma_close:.6f} | open_JMA={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
                 logging.info(f"  Signal: {current_sig}")
 
                 trend_up = (ma_close > ma_open)
@@ -1020,22 +880,18 @@ async def recover_positions_from_exchange(client: AsyncClient):
 async def init_bot(client: AsyncClient):
     """Initialize bot with historical data"""
     logging.info("🔧 Initializing bot...")
-    logging.info(f"📊 Base: {BASE_TIMEFRAME} candles")
-    logging.info(f"📊 Aggregated: {AGGREGATION_MINUTES}-minute ({AGGREGATION_MINUTES/60:.1f}h) candles")
-    
-    if MA_TYPE == "JMA":
-        logging.info(f"📊 JMA: length={JMA_LENGTH}, phase={JMA_PHASE}, avglen={JMA_AVGLEN}")
-    else:
-        logging.info(f"📊 {MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m = {MA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours")
+    logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
+    logging.info(f"📊 FULL JMA: close_length={JMA_LENGTH_CLOSE}, open_length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, avg_len={JMA_AVG_LEN}")
+    logging.info(f"📊 JMA Mode: FULL IMPLEMENTATION with volatility adaptation")
     
     if USE_HEIKIN_ASHI:
-        logging.info("📊 Heikin Ashi: ENABLED (Single Smoothing)")
+        logging.info("📊 Heikin Ashi: ENABLED")
     else:
         logging.info("📊 Heikin Ashi: DISABLED")
     if USE_DI:
         logging.info(f"📊 DMI: {DI_PERIODS} periods")
     else:
-        logging.info("📊 DMI: Disabled")
+        logging.info("📊 DMI: DISABLED")
     logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
 
     load_klines()
@@ -1045,17 +901,14 @@ async def init_bot(client: AsyncClient):
 
     symbols_needing_data = []
     for symbol in SYMBOLS:
-        if len(state[symbol]["klines_base"]) >= (AGGREGATION_MINUTES // BASE_MINUTES):
-            aggregate_candles(symbol)
-        
-        klines_agg = state[symbol]["klines_agg"]
-        d_close_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "close", MA_PERIODS) is not None
-        d_open_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "open", MA_PERIODS) is not None
+        klines = state[symbol]["klines"]
+        jma_close_ready = len(klines) >= JMA_LENGTH_CLOSE + JMA_AVG_LEN and calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN) is not None
+        jma_open_ready = len(klines) >= JMA_LENGTH_OPEN + JMA_AVG_LEN and calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN) is not None
         if USE_DI:
             calculate_di(symbol)
         di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
 
-        if d_close_ready and d_open_ready and di_ready:
+        if jma_close_ready and jma_open_ready and di_ready:
             state[symbol]["ready"] = True
             logging.info(f"✅ {symbol} ready from loaded data")
         else:
@@ -1068,7 +921,7 @@ async def init_bot(client: AsyncClient):
             try:
                 logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
-                needed_candles = max(MA_PERIODS * (AGGREGATION_MINUTES // BASE_MINUTES) + 50, (DI_PERIODS + 50 if USE_DI else 50))
+                needed_candles = max(MA_PERIODS + JMA_AVG_LEN + 100, (DI_PERIODS + 100 if USE_DI else 100))
                 klines_data = await safe_api_call(
                     client.futures_mark_price_klines,
                     symbol=symbol,
@@ -1077,11 +930,11 @@ async def init_bot(client: AsyncClient):
                 )
 
                 st = state[symbol]
-                st["klines_base"].clear()
+                st["klines"].clear()
 
                 for kline in klines_data:
                     open_time = int(float(kline[0]) / 1000)
-                    st["klines_base"].append({
+                    st["klines"].append({
                         "open_time": open_time,
                         "open": float(kline[1]),
                         "high": float(kline[2]),
@@ -1089,25 +942,23 @@ async def init_bot(client: AsyncClient):
                         "close": float(kline[4])
                     })
 
-                aggregate_candles(symbol)
-
-                d_close_ok = calculate_ma(symbol, "close", MA_PERIODS) is not None
-                d_open_ok = calculate_ma(symbol, "open", MA_PERIODS) is not None
+                jma_close_ok = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN) is not None
+                jma_open_ok = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN) is not None
                 if USE_DI:
                     calculate_di(symbol)
                 di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
 
-                if d_close_ok and d_open_ok and di_ok:
+                if jma_close_ok and jma_open_ok and di_ok:
                     st["ready"] = True
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(240)
+                    await asyncio.sleep(150)
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(240)
+                    await asyncio.sleep(150)
 
     else:
         logging.info("🎯 All symbols ready!")
@@ -1132,7 +983,7 @@ async def main():
         trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
 
-        logging.info("🚀 Bot started")
+        logging.info("🚀 Bot started with FULL JMA implementation")
 
         await asyncio.gather(price_task, trade_task, status_task)
 
@@ -1148,16 +999,12 @@ if __name__ == "__main__":
 
     print("=" * 80)
     ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
-    print(f"{MA_TYPE} OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
-    print(f"{BASE_TIMEFRAME.upper()} BASE → {AGGREGATION_MINUTES}M AGG")
+    print(f"FULL JMA OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
+    print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("=" * 80)
-    print(f"MA Type: {MA_TYPE}")
-    if MA_TYPE == "JMA":
-        print(f"JMA Parameters: Length={JMA_LENGTH}, Phase={JMA_PHASE}, AvgLen={JMA_AVGLEN}")
-    else:
-        print(f"{MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m")
-    print(f"Base: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
-    print(f"Aggregation: {AGGREGATION_MINUTES} min ({AGGREGATION_MINUTES/60:.1f} hours)")
+    print(f"FULL JMA Parameters: Close_Length={JMA_LENGTH_CLOSE}, Open_Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, AvgLen={JMA_AVG_LEN}")
+    print(f"JMA Mode: FULL IMPLEMENTATION (volatility-adaptive)")
+    print(f"Timeframe: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
     print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
     print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
     print(f"Entry Strategy: {ENTRY_STRATEGY}")
