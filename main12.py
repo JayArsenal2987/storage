@@ -476,10 +476,8 @@ def update_trading_signals(symbol: str) -> dict:
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
     """WebSocket feed - builds candles"""
-    streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
+    streams = [f"{s.lower()}@kline_{BASE_TIMEFRAME.lower()}" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-
-    interval_seconds = BASE_MINUTES * 60
 
     while True:
         try:
@@ -489,45 +487,42 @@ async def price_feed_loop(client: AsyncClient):
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
-                        symbol = data.get("s")
-                        price_str = data.get("p")
-                        event_time = data.get("E")
-
-                        if symbol in SYMBOLS and price_str and event_time:
-                            price = float(price_str)
-                            state[symbol]["price"] = price
-
-                            event_time /= 1000
+                        
+                        if "k" in data:
+                            k = data["k"]
+                            symbol = k["s"]
                             
-                            current_open_time = int(event_time // interval_seconds) * interval_seconds
-                            klines = state[symbol]["klines"]
+                            if symbol in SYMBOLS:
+                                state[symbol]["price"] = float(k["c"])
+                                
+                                kline_data = {
+                                    "open_time": int(k["t"] / 1000),
+                                    "open": float(k["o"]),
+                                    "high": float(k["h"]),
+                                    "low": float(k["l"]),
+                                    "close": float(k["c"])
+                                }
+                                
+                                klines = state[symbol]["klines"]
+                                
+                                if klines and klines[-1]["open_time"] == kline_data["open_time"]:
+                                    klines[-1] = kline_data
+                                else:
+                                    klines.append(kline_data)
 
-                            if not klines or klines[-1]["open_time"] != current_open_time:
-                                klines.append({
-                                    "open_time": current_open_time,
-                                    "open": price,
-                                    "high": price,
-                                    "low": price,
-                                    "close": price
-                                })
-                            else:
-                                klines[-1]["high"]  = max(klines[-1]["high"],  price)
-                                klines[-1]["low"]   = min(klines[-1]["low"],   price)
-                                klines[-1]["close"] = price
-
-                            if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
-                                ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-                                ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
-                                if USE_DI:
-                                    calculate_di(symbol)
-                                if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
-                                    state[symbol]["ready"] = True
-                                    ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
-                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, close_JMA {ma_close:.6f}, open_JMA {ma_open:.6f}){ha_status}"
-                                    logging.info(log_msg)
-                            else:
-                                if USE_DI:
-                                    calculate_di(symbol)
+                                if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                                    ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
+                                    ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER)
+                                    if USE_DI:
+                                        calculate_di(symbol)
+                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                        state[symbol]["ready"] = True
+                                        ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, close_JMA {ma_close:.6f}, open_JMA {ma_open:.6f}){ha_status}"
+                                        logging.info(log_msg)
+                                else:
+                                    if USE_DI:
+                                        calculate_di(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
