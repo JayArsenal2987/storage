@@ -57,19 +57,19 @@ KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + JMA_AVG_LEN 
 ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # EXIT STRATEGY TOGGLE
-EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER" or "TRAILING_STOP"
+EXIT_STRATEGY = "TRAILING_STOP"  # or "CROSSOVER" or "SYMMETRIC" or "TRAILING_STOP"
 
-# TRAILING STOP PERCENT
+# TRAILING STOP PERCENT (used for BOTH client-side and exchange-side)
 TRAILING_STOP_PERCENT = 0.5   # Trailing stop percentage (0.5%)
+
+# EXCHANGE-SIDE TRAILING STOP (shows in Binance open orders)
+USE_EXCHANGE_TRAILING_STOP = True  # Set to False for client-side trailing stops
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
         "klines": deque(maxlen=KLINE_LIMIT),
-        "current_signal": None,
-        "last_signal_change": 0,
-        "current_position": 0.0,
         "ma_close": None,
         "ma_open": None,
         "prev_ma_close": None,
@@ -78,12 +78,24 @@ state = {
         "minus_di": None,
         "di_ready": False,
         "ready": False,
-        "last_exec_ts": 0.0,
-        "last_target": None,
         "ha_prev_close": None,
         "ha_prev_open": None,
-        "entry_price": None,     # For trailing stop
-        "trailing_peak": None,   # High for long, low for short
+        
+        # LONG position tracking
+        "long_active": False,
+        "long_position": 0.0,
+        "long_entry_price": None,
+        "long_trailing_peak": None,
+        "long_trailing_stop_order_id": None,
+        "long_last_entry_ts": 0.0,
+        
+        # SHORT position tracking
+        "short_active": False,
+        "short_position": 0.0,
+        "short_entry_price": None,
+        "short_trailing_peak": None,
+        "short_trailing_stop_order_id": None,
+        "short_last_entry_ts": 0.0,
     }
     for symbol in SYMBOLS
 }
@@ -117,11 +129,16 @@ def save_positions():
     """Save current positions and signals"""
     position_data = {
         sym: {
-            "current_signal": state[sym]["current_signal"],
-            "current_position": state[sym]["current_position"],
-            "last_signal_change": state[sym]["last_signal_change"],
-            "entry_price": state[sym]["entry_price"],
-            "trailing_peak": state[sym]["trailing_peak"],
+            "long_active": state[sym]["long_active"],
+            "long_position": state[sym]["long_position"],
+            "long_entry_price": state[sym]["long_entry_price"],
+            "long_trailing_peak": state[sym]["long_trailing_peak"],
+            "long_trailing_stop_order_id": state[sym]["long_trailing_stop_order_id"],
+            "short_active": state[sym]["short_active"],
+            "short_position": state[sym]["short_position"],
+            "short_entry_price": state[sym]["short_entry_price"],
+            "short_trailing_peak": state[sym]["short_trailing_peak"],
+            "short_trailing_stop_order_id": state[sym]["short_trailing_stop_order_id"],
         }
         for sym in SYMBOLS
     }
@@ -135,11 +152,16 @@ def load_positions():
             position_data = json.load(f)
         for sym in SYMBOLS:
             if sym in position_data:
-                state[sym]["current_signal"] = position_data[sym].get("current_signal")
-                state[sym]["current_position"] = position_data[sym].get("current_position", 0.0)
-                state[sym]["last_signal_change"] = position_data[sym].get("last_signal_change", 0)
-                state[sym]["entry_price"] = position_data[sym].get("entry_price")
-                state[sym]["trailing_peak"] = position_data[sym].get("trailing_peak")
+                state[sym]["long_active"] = position_data[sym].get("long_active", False)
+                state[sym]["long_position"] = position_data[sym].get("long_position", 0.0)
+                state[sym]["long_entry_price"] = position_data[sym].get("long_entry_price")
+                state[sym]["long_trailing_peak"] = position_data[sym].get("long_trailing_peak")
+                state[sym]["long_trailing_stop_order_id"] = position_data[sym].get("long_trailing_stop_order_id")
+                state[sym]["short_active"] = position_data[sym].get("short_active", False)
+                state[sym]["short_position"] = position_data[sym].get("short_position", 0.0)
+                state[sym]["short_entry_price"] = position_data[sym].get("short_entry_price")
+                state[sym]["short_trailing_peak"] = position_data[sym].get("short_trailing_peak")
+                state[sym]["short_trailing_stop_order_id"] = position_data[sym].get("short_trailing_stop_order_id")
         logging.info("💾 Loaded positions from positions.json")
     except FileNotFoundError:
         logging.info("No positions.json found - starting fresh")
@@ -251,6 +273,107 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
     except Exception as e:
         logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
+
+# ========================= EXCHANGE-SIDE TRAILING STOP FUNCTIONS =========================
+async def place_trailing_stop_order(client: AsyncClient, symbol: str, position_side: str, quantity: float, callback_rate: float):
+    """
+    Place an exchange-side TRAILING_STOP_MARKET order
+    
+    Args:
+        symbol: Trading symbol
+        position_side: "LONG" or "SHORT"
+        quantity: Position size (absolute value)
+        callback_rate: Callback rate as percentage (e.g., 0.5 for 0.5%)
+    
+    Returns:
+        Order ID if successful, None otherwise
+    """
+    try:
+        quantity = round_size(abs(quantity), symbol)
+        if quantity == 0:
+            logging.error(f"{symbol} Cannot place trailing stop with 0 quantity")
+            return None
+
+        # For LONG positions, we need a SELL stop
+        # For SHORT positions, we need a BUY stop
+        if position_side == "LONG":
+            side = "SELL"
+        elif position_side == "SHORT":
+            side = "BUY"
+        else:
+            logging.error(f"Invalid position side: {position_side}")
+            return None
+
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "TRAILING_STOP_MARKET",
+            "quantity": quantity,
+            "callbackRate": callback_rate,  # Binance expects percentage (0.5 = 0.5%)
+            "positionSide": position_side,
+            "reduceOnly": True  # Important: only reduce position, don't reverse
+        }
+
+        result = await safe_api_call(client.futures_create_order, **params)
+        order_id = result.get('orderId')
+        
+        logging.info(
+            f"🎯 {symbol} EXCHANGE TRAILING STOP placed: {position_side} "
+            f"quantity={quantity}, callback={callback_rate}%, OrderID={order_id}"
+        )
+        
+        return order_id
+
+    except Exception as e:
+        logging.error(f"❌ {symbol} TRAILING STOP placement failed: {e}")
+        return None
+
+async def cancel_trailing_stop_order(client: AsyncClient, symbol: str, order_id: int):
+    """Cancel an existing trailing stop order"""
+    if order_id is None:
+        return True
+    
+    try:
+        await safe_api_call(
+            client.futures_cancel_order,
+            symbol=symbol,
+            orderId=order_id
+        )
+        logging.info(f"🗑️ {symbol} Cancelled trailing stop order {order_id}")
+        return True
+    except Exception as e:
+        # Order might already be filled or cancelled
+        if "Unknown order" in str(e) or "-2011" in str(e):
+            logging.info(f"ℹ️ {symbol} Trailing stop order {order_id} already gone (likely filled)")
+            return True
+        else:
+            logging.error(f"❌ {symbol} Failed to cancel trailing stop {order_id}: {e}")
+            return False
+
+async def check_open_orders(client: AsyncClient, symbol: str):
+    """Check for existing open orders (useful for recovery)"""
+    try:
+        open_orders = await safe_api_call(client.futures_get_open_orders, symbol=symbol)
+        
+        trailing_stops = {
+            "LONG": None,
+            "SHORT": None
+        }
+        
+        for order in open_orders:
+            if order['type'] == 'TRAILING_STOP_MARKET':
+                position_side = order['positionSide']
+                if position_side in trailing_stops:
+                    trailing_stops[position_side] = {
+                        "order_id": order['orderId'],
+                        "quantity": float(order['origQty']),
+                        "callback_rate": float(order.get('priceRate', 0))
+                    }
+        
+        return trailing_stops
+    except Exception as e:
+        logging.error(f"❌ {symbol} Failed to check open orders: {e}")
+        return {"LONG": None, "SHORT": None}
 
 # ========================= FULL JMA IMPLEMENTATION =========================
 def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, avg_len: int = 65) -> Optional[float]:
@@ -495,13 +618,15 @@ def calculate_di(symbol: str) -> Optional[float]:
 
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """Trading signals with FULL JMA indicators"""
+    """
+    Trading signals with independent LONG and SHORT positions (NO FLIPPING)
+    Returns dict with separate signals for LONG and SHORT sides
+    """
     st = state[symbol]
     price = st["price"]
-    current_signal = st["current_signal"]
 
     if price is None or not st["ready"]:
-        return {"changed": False, "action": "NONE", "signal": current_signal}
+        return {"long_action": "NONE", "short_action": "NONE"}
 
     ma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_AVG_LEN)
     ma_open = calculate_jma(symbol, "open", JMA_LENGTH_OPEN, JMA_PHASE, JMA_AVG_LEN)
@@ -509,7 +634,7 @@ def update_trading_signals(symbol: str) -> dict:
         calculate_di(symbol)
 
     if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
-        return {"changed": False, "action": "NONE", "signal": current_signal}
+        return {"long_action": "NONE", "short_action": "NONE"}
 
     prev_close = st["prev_ma_close"]
     prev_open = st["prev_ma_open"]
@@ -517,8 +642,9 @@ def update_trading_signals(symbol: str) -> dict:
     if prev_close is None or prev_open is None:
         st["prev_ma_close"] = ma_close
         st["prev_ma_open"] = ma_open
-        return {"changed": False, "action": "NONE", "signal": current_signal}
+        return {"long_action": "NONE", "short_action": "NONE"}
     
+    # Market conditions
     cross_up = (ma_close > ma_open) and (prev_close <= prev_open)
     cross_down = (ma_close < ma_open) and (prev_close >= prev_open)
     
@@ -536,125 +662,93 @@ def update_trading_signals(symbol: str) -> dict:
     di_bull = plus_di > minus_di if USE_DI else True
     di_bear = minus_di > plus_di if USE_DI else True
 
-    new_signal = current_signal
-    action_type = "NONE"
+    long_action = "NONE"
+    short_action = "NONE"
 
-    if current_signal == "LONG":
-        if cross_down and price_below_both and (di_bear if USE_DI else True):
-            new_signal = "SHORT"
-            action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_JMA {ma_close:.6f} crossunder open_JMA {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
-            logging.info(log_msg)
-    elif current_signal == "SHORT":
-        if cross_up and price_above_both and (di_bull if USE_DI else True):
-            new_signal = "LONG"
-            action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_JMA {ma_close:.6f} crossover open_JMA {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
-            logging.info(log_msg)
-
-    # EXIT conditions
-    if new_signal == current_signal:
-        if EXIT_STRATEGY == "SYMMETRIC":
-            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
-                new_signal = None
-                action_type = "EXIT"
+    # ==================== LONG POSITION LOGIC ====================
+    if st["long_active"]:
+        # EXIT CONDITIONS for LONG
+        if EXIT_STRATEGY == "TRAILING_STOP" and not USE_EXCHANGE_TRAILING_STOP:
+            # Client-side trailing stop for LONG
+            trailing_pct = TRAILING_STOP_PERCENT / 100.0
+            if st["long_trailing_peak"] is not None:
+                if price > st["long_trailing_peak"]:
+                    st["long_trailing_peak"] = price
+                stop_level = st["long_trailing_peak"] * (1 - trailing_pct)
+                if price <= stop_level:
+                    long_action = "EXIT"
+                    logging.info(f"🔴 {symbol} TRAILING EXIT LONG: price {price:.6f} <= {stop_level:.6f} ({TRAILING_STOP_PERCENT}% from peak {st['long_trailing_peak']:.6f})")
+        
+        elif EXIT_STRATEGY == "SYMMETRIC":
+            if price_below_both and (di_bear if USE_DI else True):
+                long_action = "EXIT"
                 logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True):
-                new_signal = None
-                action_type = "EXIT"
+        
+        elif EXIT_STRATEGY == "CROSSOVER":
+            if ma_trend_bearish and (di_bear if USE_DI else True):
+                long_action = "EXIT"
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: JMA trend reversed - close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+    
+    else:
+        # ENTRY CONDITIONS for LONG
+        if ENTRY_STRATEGY == "CROSSOVER":
+            if crossover_aligned_long and (di_bull if USE_DI else True):
+                long_action = "ENTRY"
+                logging.info(f"🟢 {symbol} ENTRY LONG (CROSSOVER: price {price:.6f} > close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+        
+        elif ENTRY_STRATEGY == "SYMMETRIC":
+            if price_above_both and (di_bull if USE_DI else True):
+                long_action = "ENTRY"
+                logging.info(f"🟢 {symbol} ENTRY LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+
+    # ==================== SHORT POSITION LOGIC ====================
+    if st["short_active"]:
+        # EXIT CONDITIONS for SHORT
+        if EXIT_STRATEGY == "TRAILING_STOP" and not USE_EXCHANGE_TRAILING_STOP:
+            # Client-side trailing stop for SHORT
+            trailing_pct = TRAILING_STOP_PERCENT / 100.0
+            if st["short_trailing_peak"] is not None:
+                if price < st["short_trailing_peak"]:
+                    st["short_trailing_peak"] = price
+                stop_level = st["short_trailing_peak"] * (1 + trailing_pct)
+                if price >= stop_level:
+                    short_action = "EXIT"
+                    logging.info(f"🔴 {symbol} TRAILING EXIT SHORT: price {price:.6f} >= {stop_level:.6f} ({TRAILING_STOP_PERCENT}% from peak {st['short_trailing_peak']:.6f})")
+        
+        elif EXIT_STRATEGY == "SYMMETRIC":
+            if price_above_both and (di_bull if USE_DI else True):
+                short_action = "EXIT"
                 logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
         
         elif EXIT_STRATEGY == "CROSSOVER":
-            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True):
-                new_signal = None
-                action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: JMA trend reversed - close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True):
-                new_signal = None
-                action_type = "EXIT"
+            if ma_trend_bullish and (di_bull if USE_DI else True):
+                short_action = "EXIT"
                 logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: JMA trend reversed - close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
-        
-        elif EXIT_STRATEGY == "TRAILING_STOP":
-            trailing_pct = TRAILING_STOP_PERCENT / 100.0
-            if current_signal == "LONG" and st["trailing_peak"] is not None:
-                # Update trailing peak if price is higher
-                if price > st["trailing_peak"]:
-                    st["trailing_peak"] = price
-                # Check if price fell below trailing stop
-                stop_level = st["trailing_peak"] * (1 - trailing_pct)
-                if price <= stop_level:
-                    new_signal = None
-                    action_type = "TRAILING_EXIT"
-                    logging.info(f"🔴 {symbol} TRAILING EXIT LONG: price {price:.6f} <= {stop_level:.6f} ({TRAILING_STOP_PERCENT}% from peak {st['trailing_peak']:.6f})")
-            elif current_signal == "SHORT" and st["trailing_peak"] is not None:
-                # Update trailing peak (low) if price is lower
-                if price < st["trailing_peak"]:
-                    st["trailing_peak"] = price
-                # Check if price rose above trailing stop
-                stop_level = st["trailing_peak"] * (1 + trailing_pct)
-                if price >= stop_level:
-                    new_signal = None
-                    action_type = "TRAILING_EXIT"
-                    logging.info(f"🔴 {symbol} TRAILING EXIT SHORT: price {price:.6f} >= {stop_level:.6f} ({TRAILING_STOP_PERCENT}% from peak {st['trailing_peak']:.6f})")
-
-    if new_signal is None:
-        entry_long = False
-        entry_short = False
-
+    
+    else:
+        # ENTRY CONDITIONS for SHORT
         if ENTRY_STRATEGY == "CROSSOVER":
-            entry_long = crossover_aligned_long and (di_bull if USE_DI else True)
-            entry_short = crossover_aligned_short and (di_bear if USE_DI else True)
-            
-            if entry_long:
-                new_signal = "LONG"
-                action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_JMA {ma_close:.6f} > open_JMA {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
-            elif entry_short:
-                new_signal = "SHORT"
-                action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            if crossover_aligned_short and (di_bear if USE_DI else True):
+                short_action = "ENTRY"
+                logging.info(f"🟢 {symbol} ENTRY SHORT (CROSSOVER: price {price:.6f} < close_JMA {ma_close:.6f} < open_JMA {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
         
         elif ENTRY_STRATEGY == "SYMMETRIC":
-            entry_long = price_above_both and (di_bull if USE_DI else True)
-            entry_short = price_below_both and (di_bear if USE_DI else True)
-            
-            if entry_long:
-                new_signal = "LONG"
-                action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
-            elif entry_short:
-                new_signal = "SHORT"
-                action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+            if price_below_both and (di_bear if USE_DI else True):
+                short_action = "ENTRY"
+                logging.info(f"🟢 {symbol} ENTRY SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
 
     st["prev_ma_close"] = ma_close
     st["prev_ma_open"] = ma_open
 
-    if new_signal != current_signal:
-        st["current_signal"] = new_signal
-        st["last_signal_change"] = time.time()
-        # Reset trailing on entry or reentry if using trailing stop
-        if EXIT_STRATEGY == "TRAILING_STOP" and new_signal is not None and (action_type in ["ENTRY", "REENTRY", "FLIP"]):
-            st["entry_price"] = price
-            st["trailing_peak"] = price
-        # Clear trailing on exit
-        if new_signal is None:
-            st["entry_price"] = None
-            st["trailing_peak"] = None
-        save_positions()
-        return {"changed": True, "action": action_type, "signal": new_signal}
+    # Update client-side trailing peaks
+    if not USE_EXCHANGE_TRAILING_STOP and EXIT_STRATEGY == "TRAILING_STOP":
+        if st["long_active"] and st["long_trailing_peak"] is not None and price > st["long_trailing_peak"]:
+            st["long_trailing_peak"] = price
+        if st["short_active"] and st["short_trailing_peak"] is not None and price < st["short_trailing_peak"]:
+            st["short_trailing_peak"] = price
 
-    # Update trailing peak even if no signal change (for ongoing positions, if using trailing stop)
-    if EXIT_STRATEGY == "TRAILING_STOP" and current_signal is not None:
-        if current_signal == "LONG" and st["trailing_peak"] is not None and price > st["trailing_peak"]:
-            st["trailing_peak"] = price
-            save_positions()
-        elif current_signal == "SHORT" and st["trailing_peak"] is not None and price < st["trailing_peak"]:
-            st["trailing_peak"] = price
-            save_positions()
+    return {"long_action": long_action, "short_action": short_action}
 
-    return {"changed": False, "action": "NONE", "signal": current_signal}
-    
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
     """WebSocket feed - builds candles"""
@@ -756,13 +850,33 @@ async def status_logger():
             minus_di = st.get("minus_di")
 
             if price and ma_close and ma_open:
-                current_sig = st["current_signal"] or "FLAT"
-
                 plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
                 minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
 
                 logging.info(f"{symbol}: Price={price:.6f} | close_JMA={ma_close:.6f} | open_JMA={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
-                logging.info(f"  Signal: {current_sig}")
+                
+                # Show position status
+                positions = []
+                if st["long_active"]:
+                    positions.append("LONG")
+                    if USE_EXCHANGE_TRAILING_STOP and st["long_trailing_stop_order_id"]:
+                        logging.info(f"  LONG: Active | Exchange Trailing Stop #{st['long_trailing_stop_order_id']}")
+                    elif not USE_EXCHANGE_TRAILING_STOP and st["long_trailing_peak"]:
+                        logging.info(f"  LONG: Active | Client Trailing Stop Peak={st['long_trailing_peak']:.6f}")
+                    else:
+                        logging.info(f"  LONG: Active")
+                
+                if st["short_active"]:
+                    positions.append("SHORT")
+                    if USE_EXCHANGE_TRAILING_STOP and st["short_trailing_stop_order_id"]:
+                        logging.info(f"  SHORT: Active | Exchange Trailing Stop #{st['short_trailing_stop_order_id']}")
+                    elif not USE_EXCHANGE_TRAILING_STOP and st["short_trailing_peak"]:
+                        logging.info(f"  SHORT: Active | Client Trailing Stop Peak={st['short_trailing_peak']:.6f}")
+                    else:
+                        logging.info(f"  SHORT: Active")
+                
+                if not positions:
+                    logging.info(f"  Positions: FLAT")
 
                 trend_up = (ma_close > ma_open)
                 trend_down = (ma_close < ma_open)
@@ -780,7 +894,7 @@ async def status_logger():
         logging.info("📊 === END STATUS REPORT ===")
 
 async def trading_loop(client: AsyncClient):
-    """Main trading logic"""
+    """Main trading logic - handles independent LONG and SHORT positions"""
     while True:
         await asyncio.sleep(0.1)
 
@@ -790,97 +904,143 @@ async def trading_loop(client: AsyncClient):
                 continue
 
             signal_result = update_trading_signals(symbol)
+            
+            # Handle LONG position changes
+            if signal_result["long_action"] != "NONE":
+                await handle_long_position(client, symbol, signal_result["long_action"])
+            
+            # Handle SHORT position changes
+            if signal_result["short_action"] != "NONE":
+                await handle_short_position(client, symbol, signal_result["short_action"])
 
-            target_size = SYMBOLS[symbol]
-            current_signal = st["current_signal"]
-
-            if current_signal == "LONG":
-                final_position = target_size
-            elif current_signal == "SHORT":
-                final_position = -target_size
-            elif current_signal is None:
-                final_position = 0.0
-            else:
-                final_position = st["current_position"]
-
-            if signal_result["changed"]:
-                current_pos = st["current_position"]
-                if abs(final_position - current_pos) > 1e-12:
-                    await execute_position_change(client, symbol, final_position, current_pos)
-
-async def execute_position_change(client: AsyncClient, symbol: str, target: float, current: float):
-    """Execute position changes"""
+async def handle_long_position(client: AsyncClient, symbol: str, action: str):
+    """Handle LONG position entry/exit"""
     st = state[symbol]
-
     now = time.time()
-    last_target = st.get("last_target", None)
-    last_when = st.get("last_exec_ts", 0.0)
-    if last_target is not None and abs(target - last_target) < 1e-12 and (now - last_when) < 2.0:
-        logging.info(f"🛡️ {symbol} dedup: skipping duplicate execution")
+    
+    # Prevent duplicate entries within 2 seconds
+    if action == "ENTRY" and (now - st["long_last_entry_ts"]) < 2.0:
+        logging.info(f"🛡️ {symbol} LONG dedup: skipping duplicate entry")
         return
-
-    if abs(target - current) < 1e-12:
-        return
-
+    
     try:
-        if target == 0.0:
-            if current > 0:
-                ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
-                if not ok:
-                    return
-            elif current < 0:
-                ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
-                if not ok:
-                    return
-
-        elif target > 0:
-            if current < 0:
-                ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
-                if not ok:
-                    return
-                ok = await place_order(client, symbol, "BUY", target, "LONG ENTRY")
-                if not ok:
-                    return
-            else:
-                if target > current:
-                    ok = await place_order(client, symbol, "BUY", target - current, "LONG ENTRY")
-                    if not ok:
-                        return
+        if action == "ENTRY":
+            target_size = SYMBOLS[symbol]
+            
+            # Cancel any existing trailing stop first
+            if USE_EXCHANGE_TRAILING_STOP and st["long_trailing_stop_order_id"]:
+                await cancel_trailing_stop_order(client, symbol, st["long_trailing_stop_order_id"])
+                st["long_trailing_stop_order_id"] = None
+            
+            # Enter LONG position
+            ok = await place_order(client, symbol, "BUY", target_size, "LONG ENTRY")
+            if not ok:
+                return
+            
+            st["long_active"] = True
+            st["long_position"] = target_size
+            st["long_entry_price"] = st["price"]
+            st["long_last_entry_ts"] = now
+            
+            # Place trailing stop
+            if USE_EXCHANGE_TRAILING_STOP and EXIT_STRATEGY == "TRAILING_STOP":
+                await asyncio.sleep(1)
+                order_id = await place_trailing_stop_order(client, symbol, "LONG", target_size, TRAILING_STOP_PERCENT)
+                if order_id:
+                    st["long_trailing_stop_order_id"] = order_id
                 else:
-                    ok = await place_order(client, symbol, "SELL", current - target, "LONG CLOSE")
-                    if not ok:
-                        return
-
-        else:
-            if current > 0:
-                ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
-                if not ok:
-                    return
-                ok = await place_order(client, symbol, "SELL", abs(target), "SHORT ENTRY")
-                if not ok:
-                    return
-            else:
-                cur_abs = abs(current)
-                tgt_abs = abs(target)
-                if tgt_abs > cur_abs:
-                    ok = await place_order(client, symbol, "SELL", tgt_abs - cur_abs, "SHORT ENTRY")
-                    if not ok:
-                        return
-                else:
-                    ok = await place_order(client, symbol, "BUY", cur_abs - tgt_abs, "SHORT CLOSE")
-                    if not ok:
-                        return
-
-        st["current_position"] = target
-        st["last_target"] = target
-        st["last_exec_ts"] = now
-        save_positions()
-
+                    logging.warning(f"⚠️ {symbol} LONG entered but trailing stop failed!")
+            elif not USE_EXCHANGE_TRAILING_STOP and EXIT_STRATEGY == "TRAILING_STOP":
+                st["long_trailing_peak"] = st["price"]
+            
+            save_positions()
+        
+        elif action == "EXIT":
+            # Cancel trailing stop
+            if USE_EXCHANGE_TRAILING_STOP and st["long_trailing_stop_order_id"]:
+                await cancel_trailing_stop_order(client, symbol, st["long_trailing_stop_order_id"])
+                st["long_trailing_stop_order_id"] = None
+            
+            # Close LONG position
+            ok = await place_order(client, symbol, "SELL", st["long_position"], "LONG CLOSE")
+            if not ok:
+                return
+            
+            st["long_active"] = False
+            st["long_position"] = 0.0
+            st["long_entry_price"] = None
+            st["long_trailing_peak"] = None
+            
+            save_positions()
+    
     except Exception as e:
-        logging.error(f"❌ {symbol} position change failed: {e}")
+        logging.error(f"❌ {symbol} LONG position change failed: {e}")
+
+async def handle_short_position(client: AsyncClient, symbol: str, action: str):
+    """Handle SHORT position entry/exit"""
+    st = state[symbol]
+    now = time.time()
+    
+    # Prevent duplicate entries within 2 seconds
+    if action == "ENTRY" and (now - st["short_last_entry_ts"]) < 2.0:
+        logging.info(f"🛡️ {symbol} SHORT dedup: skipping duplicate entry")
+        return
+    
+    try:
+        if action == "ENTRY":
+            target_size = SYMBOLS[symbol]
+            
+            # Cancel any existing trailing stop first
+            if USE_EXCHANGE_TRAILING_STOP and st["short_trailing_stop_order_id"]:
+                await cancel_trailing_stop_order(client, symbol, st["short_trailing_stop_order_id"])
+                st["short_trailing_stop_order_id"] = None
+            
+            # Enter SHORT position
+            ok = await place_order(client, symbol, "SELL", target_size, "SHORT ENTRY")
+            if not ok:
+                return
+            
+            st["short_active"] = True
+            st["short_position"] = target_size
+            st["short_entry_price"] = st["price"]
+            st["short_last_entry_ts"] = now
+            
+            # Place trailing stop
+            if USE_EXCHANGE_TRAILING_STOP and EXIT_STRATEGY == "TRAILING_STOP":
+                await asyncio.sleep(1)
+                order_id = await place_trailing_stop_order(client, symbol, "SHORT", target_size, TRAILING_STOP_PERCENT)
+                if order_id:
+                    st["short_trailing_stop_order_id"] = order_id
+                else:
+                    logging.warning(f"⚠️ {symbol} SHORT entered but trailing stop failed!")
+            elif not USE_EXCHANGE_TRAILING_STOP and EXIT_STRATEGY == "TRAILING_STOP":
+                st["short_trailing_peak"] = st["price"]
+            
+            save_positions()
+        
+        elif action == "EXIT":
+            # Cancel trailing stop
+            if USE_EXCHANGE_TRAILING_STOP and st["short_trailing_stop_order_id"]:
+                await cancel_trailing_stop_order(client, symbol, st["short_trailing_stop_order_id"])
+                st["short_trailing_stop_order_id"] = None
+            
+            # Close SHORT position
+            ok = await place_order(client, symbol, "BUY", st["short_position"], "SHORT CLOSE")
+            if not ok:
+                return
+            
+            st["short_active"] = False
+            st["short_position"] = 0.0
+            st["short_entry_price"] = None
+            st["short_trailing_peak"] = None
+            
+            save_positions()
+    
+    except Exception as e:
+        logging.error(f"❌ {symbol} SHORT position change failed: {e}")
 
 async def recover_positions_from_exchange(client: AsyncClient):
-    """Recover actual positions from Binance"""
+    """Recover actual positions from Binance - supports simultaneous LONG/SHORT"""
     logging.info("🔍 Checking exchange for existing positions...")
     
     try:
@@ -894,30 +1054,56 @@ async def recover_positions_from_exchange(client: AsyncClient):
                 continue
             
             position_amt = float(position['positionAmt'])
+            position_side = position['positionSide']
             
             if abs(position_amt) > 0.0001:
                 recovered_count += 1
-                
-                if position_amt > 0:
-                    signal = "LONG"
-                    state[symbol]["current_position"] = SYMBOLS[symbol]
-                elif position_amt < 0:
-                    signal = "SHORT"
-                    state[symbol]["current_position"] = -SYMBOLS[symbol]
-                
-                state[symbol]["current_signal"] = signal
-                
                 entry_price = float(position['entryPrice'])
                 unrealized_pnl = float(position['unrealizedProfit'])
                 
-                state[symbol]["entry_price"] = entry_price
-                state[symbol]["trailing_peak"] = entry_price
+                if position_side == "LONG":
+                    state[symbol]["long_active"] = True
+                    state[symbol]["long_position"] = SYMBOLS[symbol]
+                    state[symbol]["long_entry_price"] = entry_price
+                    
+                    current_price = state[symbol].get("price")
+                    if current_price:
+                        state[symbol]["long_trailing_peak"] = current_price
+                    else:
+                        state[symbol]["long_trailing_peak"] = entry_price
+                    
+                    logging.info(f"♻️ {symbol} RECOVERED LONG: Amount={position_amt}, Entry={entry_price:.6f}, PNL={unrealized_pnl:.2f} USDT")
                 
-                logging.info(
-                    f"♻️ {symbol} RECOVERED {signal} position: "
-                    f"Amount={position_amt}, Entry={entry_price:.6f}, "
-                    f"PNL={unrealized_pnl:.2f} USDT"
-                )
+                elif position_side == "SHORT":
+                    state[symbol]["short_active"] = True
+                    state[symbol]["short_position"] = SYMBOLS[symbol]
+                    state[symbol]["short_entry_price"] = entry_price
+                    
+                    current_price = state[symbol].get("price")
+                    if current_price:
+                        state[symbol]["short_trailing_peak"] = current_price
+                    else:
+                        state[symbol]["short_trailing_peak"] = entry_price
+                    
+                    logging.info(f"♻️ {symbol} RECOVERED SHORT: Amount={position_amt}, Entry={entry_price:.6f}, PNL={unrealized_pnl:.2f} USDT")
+        
+        # Check for existing trailing stops
+        if USE_EXCHANGE_TRAILING_STOP:
+            for symbol in SYMBOLS:
+                if state[symbol]["long_active"] or state[symbol]["short_active"]:
+                    trailing_stops = await check_open_orders(client, symbol)
+                    
+                    if trailing_stops["LONG"] and state[symbol]["long_active"]:
+                        state[symbol]["long_trailing_stop_order_id"] = trailing_stops["LONG"]["order_id"]
+                        logging.info(f"♻️ {symbol} LONG trailing stop recovered: Order #{trailing_stops['LONG']['order_id']}")
+                    elif state[symbol]["long_active"]:
+                        logging.warning(f"⚠️ {symbol} LONG position exists but NO trailing stop found!")
+                    
+                    if trailing_stops["SHORT"] and state[symbol]["short_active"]:
+                        state[symbol]["short_trailing_stop_order_id"] = trailing_stops["SHORT"]["order_id"]
+                        logging.info(f"♻️ {symbol} SHORT trailing stop recovered: Order #{trailing_stops['SHORT']['order_id']}")
+                    elif state[symbol]["short_active"]:
+                        logging.warning(f"⚠️ {symbol} SHORT position exists but NO trailing stop found!")
         
         if recovered_count > 0:
             logging.info(f"✅ Recovered {recovered_count} active positions")
@@ -935,6 +1121,7 @@ async def init_bot(client: AsyncClient):
     logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
     logging.info(f"📊 FULL JMA: close_length={JMA_LENGTH_CLOSE}, open_length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, avg_len={JMA_AVG_LEN}")
     logging.info(f"📊 JMA Mode: FULL IMPLEMENTATION with volatility adaptation")
+    logging.info(f"📊 Position Mode: INDEPENDENT LONG/SHORT (No Flipping)")
     
     if USE_HEIKIN_ASHI:
         logging.info("📊 Heikin Ashi: ENABLED")
@@ -945,10 +1132,18 @@ async def init_bot(client: AsyncClient):
     else:
         logging.info("📊 DMI: DISABLED")
     logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
+    
+    if EXIT_STRATEGY == "TRAILING_STOP":
+        if USE_EXCHANGE_TRAILING_STOP:
+            logging.info(f"📊 Trailing Stop: EXCHANGE-SIDE ({TRAILING_STOP_PERCENT}%) - will show in Binance open orders")
+        else:
+            logging.info(f"📊 Trailing Stop: CLIENT-SIDE ({TRAILING_STOP_PERCENT}%) - bot managed")
 
     load_klines()
     load_positions()
     
+    # IMPORTANT: Recover positions AFTER loading prices
+    await asyncio.sleep(2)  # Give WebSocket time to get current prices
     await recover_positions_from_exchange(client)
 
     symbols_needing_data = []
@@ -1029,13 +1224,18 @@ async def main():
     atexit.register(save_positions)
 
     try:
+        # Start price feed first to get current prices
+        price_task = asyncio.create_task(price_feed_loop(client))
+        await asyncio.sleep(3)  # Let it connect and get initial prices
+        
+        # Then initialize bot (which needs current prices for recovery)
         await init_bot(client)
 
-        price_task = asyncio.create_task(price_feed_loop(client))
         trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
 
-        logging.info("🚀 Bot started with FULL JMA implementation")
+        trailing_mode = "EXCHANGE-SIDE" if USE_EXCHANGE_TRAILING_STOP else "CLIENT-SIDE"
+        logging.info(f"🚀 Bot started with independent LONG/SHORT positions ({trailing_mode} trailing stops)")
 
         await asyncio.gather(price_task, trade_task, status_task)
 
@@ -1052,6 +1252,7 @@ if __name__ == "__main__":
     print("=" * 80)
     ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
     print(f"FULL JMA OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
+    print(f"INDEPENDENT LONG/SHORT POSITIONS (NO FLIPPING)")
     print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("=" * 80)
     print(f"FULL JMA Parameters: Close_Length={JMA_LENGTH_CLOSE}, Open_Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, AvgLen={JMA_AVG_LEN}")
@@ -1061,6 +1262,10 @@ if __name__ == "__main__":
     print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
     print(f"Entry Strategy: {ENTRY_STRATEGY}")
     print(f"Exit Strategy: {EXIT_STRATEGY}")
+    if EXIT_STRATEGY == "TRAILING_STOP":
+        trailing_type = "EXCHANGE-SIDE (Binance managed)" if USE_EXCHANGE_TRAILING_STOP else "CLIENT-SIDE (Bot managed)"
+        print(f"Trailing Stop: {TRAILING_STOP_PERCENT}% - {trailing_type}")
+    print(f"Position Mode: INDEPENDENT LONG/SHORT (Both can be active simultaneously)")
     print(f"Symbols: {list(SYMBOLS.keys())}")
     print("=" * 80)
 
