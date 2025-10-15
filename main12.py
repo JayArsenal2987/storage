@@ -16,7 +16,7 @@ USE_DI = False  # Toggle DMI indicator
 USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 
 # Timeframe configuration
-BASE_TIMEFRAME = "5m"  # Options: "1m", "5m", "1h"
+BASE_TIMEFRAME = "1h"  # Options: "1m", "5m", "1h"
 
 if BASE_TIMEFRAME == "1m":
     BASE_MINUTES = 1
@@ -28,10 +28,10 @@ else:
     raise ValueError("Unsupported BASE_TIMEFRAME")
 
 # JMA parameters
-JMA_LENGTH_CLOSE = 12      # JMA period for close
-JMA_LENGTH_OPEN = 13       # JMA period for open
+JMA_LENGTH_CLOSE = 7      # JMA period for close
+JMA_LENGTH_OPEN = 19       # JMA period for open
 JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot (default 50)
-JMA_POWER = 3              # Smoothness level, 1-3 (default 2)
+JMA_POWER = 2              # Smoothness level, 1-3 (default 2)
 
 # Trading symbols and sizes
 SYMBOLS = {
@@ -57,7 +57,7 @@ KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100)
 ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # EXIT STRATEGY TOGGLE
-EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
+EXIT_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # ========================= STATE =========================
 state = {
@@ -532,9 +532,9 @@ async def price_feed_loop(client: AsyncClient):
             await asyncio.sleep(5)
 
 async def status_logger():
-    """5-minute status report"""
+    """1-minute status report"""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)
 
         current_time = time.strftime("%H:%M", time.localtime())
         logging.info(f"📊 === STATUS REPORT {current_time} ===")
@@ -819,12 +819,12 @@ async def init_bot(client: AsyncClient):
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(15)
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(15)
 
     else:
         logging.info("🎯 All symbols ready!")
