@@ -13,31 +13,54 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
 DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
 USE_DI = False  # Toggle DMI indicator
-USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles (Single smoothing - matches TradingView)
-MA_TYPE = "JMA"  # Options: "DEMA", "HULL", or "JMA"
+USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 
-# Base timeframe configuration (must be defined BEFORE JMA parameters)
-BASE_TIMEFRAME = "15m"  # or "1h" or "1m"
+# Timeframe configuration
+BASE_TIMEFRAME = "1h"  # Options: "1m", "15m", "1h"
 
 if BASE_TIMEFRAME == "1m":
     BASE_MINUTES = 1
-    AGGREGATION_MINUTES = 3     # Aggregate to 3 minutes
-    DEMA_PERIODS = 600          # 600 * 3m = 30 hours
 elif BASE_TIMEFRAME == "15m":
     BASE_MINUTES = 15
-    AGGREGATION_MINUTES = 45    # Aggregate to 45 minutes
-    DEMA_PERIODS = 12           # 12 * 45m = 9 hours
 elif BASE_TIMEFRAME == "1h":
     BASE_MINUTES = 60
-    AGGREGATION_MINUTES = 180   # Keep at 3 hours
-    DEMA_PERIODS = 3            # 3 * 180m = 9 hours
 else:
     raise ValueError("Unsupported BASE_TIMEFRAME")
 
-# JMA specific parameters (defined AFTER DEMA_PERIODS, only used when MA_TYPE = "JMA")
-JMA_LENGTH = DEMA_PERIODS  # Matches DEMA for fair comparison
-JMA_PHASE = 50             # -100 to 100, controls lag vs overshoot (default 50)
-JMA_POWER = 2              # Smoothness level, 1-3 (default 2)
+# JMA parameters
+JMA_LENGTH_CLOSE = 7      # JMA period for entry MA (used when ENTRY_MA_TYPE = "JMA")
+JMA_LENGTH_OPEN = 40      # JMA period for exit MA (used when EXIT_MA_TYPE = "JMA")
+JMA_PHASE = 50            # -100 to 100, controls lag vs overshoot (default 50)
+JMA_POWER = 2             # Smoothness level, 1-3 (default 2)
+
+# MA Type Configuration
+# Both MAs are calculated on the CLOSE price for crossover signals
+ENTRY_MA_TYPE = "JMA"   # Options: "JMA", "KAMA" - faster MA for entries
+EXIT_MA_TYPE = "KAMA"   # Options: "JMA", "KAMA" - slower MA for exits/trend
+
+# KAMA parameters - ONE set used for whichever MA type is set to KAMA
+KAMA_ER_PERIOD = 9     # Efficiency Ratio lookback period (MA Length in TradingView)
+KAMA_FAST = 2          # Fast EMA period (max sensitivity)
+KAMA_SLOW = 30         # Slow EMA period (min sensitivity)
+
+# KAMA Source Configuration (Double-Smoothing Feature)
+# This replicates TradingView's "Source: JMA: JMA" option
+KAMA_USE_JMA_SOURCE = False   # True: JMA→KAMA (ultra-smooth, like TradingView)
+                              # False: Raw price→KAMA (standard, faster response)
+KAMA_JMA_SOURCE_LENGTH = 7    # JMA length when using JMA as KAMA source
+
+# Efficiency Ratio (ER) Filter - Prevents trading in sideways/choppy markets
+USE_ER_FILTER = False         # Enable/disable ER filter
+ER_THRESHOLD = 0.3            # Only trade when ER > threshold (0.0-1.0)
+                              # 0.4 = Conservative, 0.3 = Moderate, 0.2 = Aggressive
+USE_ER_FOR_ENTRY = False      # Apply ER filter to entry signals
+USE_ER_FOR_EXIT = False       # Apply ER filter to exit signals (usually False)
+
+# Real-Time Calculation Mode
+USE_REALTIME_CALCULATION = True   # True: Include current incomplete candle (instant signals)
+                                   # False: Use only closed candles (more stable, standard)
+REALTIME_EXIT_OVERRIDE = True      # True: ALWAYS use completed candles for EXIT MA (recommended)
+                                   # False: Use same mode as entry
 
 # Trading symbols and sizes
 SYMBOLS = {
@@ -55,26 +78,29 @@ PRECISIONS = {
     "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-# MA_PERIODS is used for DEMA and HULL (JMA uses JMA_LENGTH)
-MA_PERIODS = DEMA_PERIODS if MA_TYPE in ["DEMA", "HULL"] else JMA_LENGTH
+# Calculate kline limits
+if KAMA_USE_JMA_SOURCE:
+    # Need extra candles for JMA calculation when using double-smoothing
+    ENTRY_MA_PERIOD = max(KAMA_ER_PERIOD, KAMA_JMA_SOURCE_LENGTH) if ENTRY_MA_TYPE == "KAMA" else JMA_LENGTH_CLOSE
+    EXIT_MA_PERIOD = max(KAMA_ER_PERIOD, KAMA_JMA_SOURCE_LENGTH) if EXIT_MA_TYPE == "KAMA" else JMA_LENGTH_OPEN
+else:
+    ENTRY_MA_PERIOD = KAMA_ER_PERIOD if ENTRY_MA_TYPE == "KAMA" else JMA_LENGTH_CLOSE
+    EXIT_MA_PERIOD = KAMA_ER_PERIOD if EXIT_MA_TYPE == "KAMA" else JMA_LENGTH_OPEN
 
-# Compute limits
-agg_factor = AGGREGATION_MINUTES // BASE_MINUTES
-KLINE_LIMIT_BASE = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS * agg_factor + 100)
-KLINE_LIMIT_AGG = MA_PERIODS + 20
+MA_PERIODS = max(ENTRY_MA_PERIOD, EXIT_MA_PERIOD)
+KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100)
 
 # ENTRY STRATEGY TOGGLE
 ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # EXIT STRATEGY TOGGLE
-EXIT_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
+EXIT_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
-        "klines_base": deque(maxlen=KLINE_LIMIT_BASE),
-        "klines_agg": deque(maxlen=KLINE_LIMIT_AGG),
+        "klines": deque(maxlen=KLINE_LIMIT),
         "current_signal": None,
         "last_signal_change": 0,
         "current_position": 0.0,
@@ -90,8 +116,9 @@ state = {
         "last_target": None,
         "ha_prev_close": None,
         "ha_prev_open": None,
-        "ha_agg_prev_close": None,
-        "ha_agg_prev_open": None,
+        "kama_state": None,  # For KAMA calculation state
+        "efficiency_ratio": None,  # Store latest Efficiency Ratio
+        "last_er_block_log": 0,  # Track when we last logged ER block to prevent spam
     }
     for symbol in SYMBOLS
 }
@@ -102,19 +129,19 @@ api_calls_reset_time = time.time()
 
 # ========================= PERSISTENCE FUNCTIONS =========================
 def save_klines():
-    """Save base klines to JSON"""
-    save_data = {sym: list(state[sym]["klines_base"]) for sym in SYMBOLS}
+    """Save klines to JSON"""
+    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
     with open('klines.json', 'w') as f:
         json.dump(save_data, f)
     logging.info("📥 Saved klines to klines.json")
 
 def load_klines():
-    """Load base klines from JSON"""
+    """Load klines from JSON"""
     try:
         with open('klines.json', 'r') as f:
             load_data = json.load(f)
         for sym in SYMBOLS:
-            state[sym]["klines_base"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT_BASE)
+            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
         logging.info("📤 Loaded klines from klines.json")
     except FileNotFoundError:
         logging.info("No klines.json found - starting fresh")
@@ -151,19 +178,14 @@ def load_positions():
         logging.error(f"Failed to load positions: {e} - starting fresh")
 
 # ========================= HEIKIN ASHI TRANSFORMATION =========================
-def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> list:
+def convert_to_heikin_ashi(candles: list, symbol: str) -> list:
     """Convert regular candles to Heikin Ashi candles"""
     if not candles or not USE_HEIKIN_ASHI:
         return candles
     
     ha_candles = []
-    
-    if level == "base":
-        prev_ha_open = state[symbol].get("ha_prev_open")
-        prev_ha_close = state[symbol].get("ha_prev_close")
-    else:
-        prev_ha_open = state[symbol].get("ha_agg_prev_open")
-        prev_ha_close = state[symbol].get("ha_agg_prev_close")
+    prev_ha_open = state[symbol].get("ha_prev_open")
+    prev_ha_close = state[symbol].get("ha_prev_close")
     
     for i, candle in enumerate(candles):
         ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
@@ -187,58 +209,10 @@ def convert_to_heikin_ashi(candles: list, symbol: str, level: str = "base") -> l
         })
     
     if ha_candles:
-        if level == "base":
-            state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
-            state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
-        else:
-            state[symbol]["ha_agg_prev_open"] = ha_candles[-1]["open"]
-            state[symbol]["ha_agg_prev_close"] = ha_candles[-1]["close"]
+        state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
+        state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
     
     return ha_candles
-
-# ========================= CANDLE AGGREGATION =========================
-def aggregate_candles(symbol: str):
-    """Aggregate base candles into larger timeframe candles"""
-    klines_base = state[symbol]["klines_base"]
-    
-    agg_count = AGGREGATION_MINUTES // BASE_MINUTES
-    
-    if len(klines_base) < agg_count:
-        return
-    
-    state[symbol]["klines_agg"].clear()
-    
-    candles_base = list(klines_base)
-    if USE_HEIKIN_ASHI:
-        candles_base = convert_to_heikin_ashi(candles_base, symbol, level="base")
-    
-    for i in range(0, len(candles_base), agg_count):
-        chunk = candles_base[i:i + agg_count]
-        
-        if len(chunk) < agg_count:
-            continue
-        
-        agg_candle = {
-            "open_time": chunk[0]["open_time"],
-            "open": chunk[0]["open"],
-            "high": max(c["high"] for c in chunk),
-            "low": min(c["low"] for c in chunk),
-            "close": chunk[-1]["close"]
-        }
-        
-        state[symbol]["klines_agg"].append(agg_candle)
-    
-    remaining = len(candles_base) % agg_count
-    if remaining > 0:
-        forming_chunk = candles_base[-remaining:]
-        forming_candle = {
-            "open_time": forming_chunk[0]["open_time"],
-            "open": forming_chunk[0]["open"],
-            "high": max(c["high"] for c in forming_chunk),
-            "low": min(c["low"] for c in forming_chunk),
-            "close": forming_chunk[-1]["close"]
-        }
-        state[symbol]["klines_agg"].append(forming_candle)
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
@@ -310,32 +284,32 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         return False
 
 # ========================= INDICATOR CALCULATIONS =========================
-def calculate_wma(values: list, period: int) -> Optional[float]:
-    """Weighted Moving Average calculation"""
-    if len(values) < period:
-        return None
-    
-    recent_values = values[-period:]
-    weights = list(range(1, period + 1))
-    weighted_sum = sum(v * w for v, w in zip(recent_values, weights))
-    weight_sum = sum(weights)
-    
-    return weighted_sum / weight_sum if weight_sum > 0 else None
-
-def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: int = 2) -> Optional[float]:
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: int = 2, force_completed: bool = False) -> Optional[float]:
     """
     Jurik Moving Average (JMA) calculation
     Copyright (c) 2007-present Jurik Research and Consulting
     Converted from Pine Script to Python
+    
+    Args:
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
     """
-    klines = state[symbol]["klines_agg"]
+    klines = state[symbol]["klines"]
 
     if len(klines) < length + 1:
         return None
 
-    completed = list(klines)[:-1]
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
+    else:
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
     if len(completed) < length:
         return None
+
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
 
     values = [k.get(field, None) for k in completed]
     if None in values:
@@ -361,101 +335,150 @@ def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: 
 
     return jma
 
-def calculate_hull_ma(symbol: str, field: str, period: int) -> Optional[float]:
-    """Hull Moving Average calculation"""
-    klines = state[symbol]["klines_agg"]
-
-    if len(klines) < period + 1:
-        return None
-
-    completed = list(klines)[:-1]
-    if len(completed) < period:
-        return None
-
-    values = [k.get(field, None) for k in completed]
-    if None in values:
-        return None
-
-    half_period = period // 2
-    sqrt_period = int(round(period ** 0.5))
-
-    wma_half_values = []
-    for i in range(half_period - 1, len(values)):
-        wma_half = calculate_wma(values[:i+1], half_period)
-        if wma_half is not None:
-            wma_half_values.append(wma_half)
-
-    wma_full_values = []
-    for i in range(period - 1, len(values)):
-        wma_full = calculate_wma(values[:i+1], period)
-        if wma_full is not None:
-            wma_full_values.append(wma_full)
-
-    if len(wma_half_values) < len(wma_full_values):
-        return None
+def calculate_kama(symbol: str, field: str, er_period: int = 10, fast: int = 2, slow: int = 30, source_values: list = None, force_completed: bool = False) -> Optional[tuple]:
+    """
+    Kaufman's Adaptive Moving Average (KAMA) calculation
+    Based on Perry J. Kaufman's adaptive moving average formula
     
-    offset = len(wma_half_values) - len(wma_full_values)
-    raw_hull_values = []
-    for i in range(len(wma_full_values)):
-        raw_hull = 2 * wma_half_values[i + offset] - wma_full_values[i]
-        raw_hull_values.append(raw_hull)
-
-    if len(raw_hull_values) < sqrt_period:
-        return None
+    Formula:
+    1. Efficiency Ratio (ER) = |Change| / Sum(|Daily Changes|)
+    2. Smoothing Constant (SC) = [ER * (Fast_Alpha - Slow_Alpha) + Slow_Alpha]^2
+    3. KAMA = KAMA_prev + SC * (Price - KAMA_prev)
     
-    hull_ma = calculate_wma(raw_hull_values, sqrt_period)
+    Args:
+        source_values: Optional pre-calculated values (e.g., JMA output) to use as source
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
     
-    if hull_ma is not None:
-        state[symbol][f"hull_{field}"] = hull_ma
-    
-    return hull_ma
+    Returns:
+        Tuple of (kama_value, efficiency_ratio) or None
+    """
+    klines = state[symbol]["klines"]
 
-def calculate_dema(symbol: str, field: str, period: int) -> Optional[float]:
-    """DEMA on aggregated candles"""
-    klines = state[symbol]["klines_agg"]
-
-    if len(klines) < period + 1:
+    if len(klines) < er_period + 1:
         return None
 
-    completed = list(klines)[:-1]
-    if len(completed) < period:
-        return None
-
-    values = [k.get(field, None) for k in completed]
-    if None in values:
-        return None
-
-    alpha = 2 / (period + 1)
-
-    ema_series = []
-    ema = values[0]
-    ema_series.append(ema)
-    for v in values[1:]:
-        ema = alpha * v + (1 - alpha) * ema
-        ema_series.append(ema)
-
-    ema1 = ema_series[-1]
-
-    ema2 = ema_series[0]
-    for es in ema_series[1:]:
-        ema2 = alpha * es + (1 - alpha) * ema2
-
-    dema_val = 2 * ema1 - ema2
-    state[symbol][f"dema_{field}"] = dema_val
-
-    return dema_val
-
-def calculate_ma(symbol: str, field: str, period: int) -> Optional[float]:
-    """Calculate Moving Average based on MA_TYPE configuration"""
-    if MA_TYPE == "JMA":
-        return calculate_jma(symbol, field, JMA_LENGTH, JMA_PHASE, JMA_POWER)
-    elif MA_TYPE == "HULL":
-        return calculate_hull_ma(symbol, field, period)
-    elif MA_TYPE == "DEMA":
-        return calculate_dema(symbol, field, period)
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
     else:
-        logging.error(f"Unknown MA_TYPE: {MA_TYPE}. Using DEMA as fallback.")
-        return calculate_dema(symbol, field, period)
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < er_period + 1:
+        return None
+
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
+
+    # Use provided source values or extract from klines
+    if source_values is not None:
+        values = source_values
+    else:
+        values = [k.get(field, None) for k in completed]
+        
+    if None in values:
+        return None
+
+    # Calculate alpha constants
+    fast_alpha = 2.0 / (fast + 1)
+    slow_alpha = 2.0 / (slow + 1)
+
+    # Initialize KAMA with first source price (matching TradingView)
+    kama = values[0]
+    latest_er = 0.0  # Store the latest ER value
+
+    # Calculate KAMA iteratively
+    for i in range(er_period, len(values)):
+        # Step 1: Calculate Efficiency Ratio (ER)
+        # ER = |Net Change| / Sum of absolute changes
+        change = abs(values[i] - values[i - er_period])
+        
+        volatility = 0.0
+        for j in range(i - er_period + 1, i + 1):
+            volatility += abs(values[j] - values[j - 1])
+        
+        # Avoid division by zero
+        if volatility == 0:
+            er = 0.0
+        else:
+            er = change / volatility
+        
+        # Store the latest ER value
+        if i == len(values) - 1:
+            latest_er = er
+
+        # Step 2: Calculate Smoothing Constant (SC)
+        sc = (er * (fast_alpha - slow_alpha) + slow_alpha) ** 2
+
+        # Step 3: Update KAMA
+        kama = kama + sc * (values[i] - kama)
+
+    return (kama, latest_er)
+
+def calculate_kama_with_jma_source(symbol: str, field: str, jma_length: int, er_period: int, fast: int, slow: int, force_completed: bool = False) -> Optional[tuple]:
+    """
+    Calculate KAMA using JMA as the source (double-smoothing)
+    Step 1: Calculate JMA on the specified field
+    Step 2: Use JMA values as input to KAMA
+    
+    Args:
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
+    
+    Returns:
+        Tuple of (kama_value, efficiency_ratio) or None
+    """
+    klines = state[symbol]["klines"]
+    
+    if len(klines) < max(jma_length, er_period) + 1:
+        return None
+    
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
+    else:
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < max(jma_length, er_period) + 1:
+        return None
+    
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
+    
+    # Extract price values
+    price_values = [k.get(field, None) for k in completed]
+    if None in price_values:
+        return None
+    
+    # Step 1: Calculate JMA for all values
+    jma_values = []
+    
+    # JMA parameters
+    phaseRatio = 0.5 if JMA_PHASE < -100 else (2.5 if JMA_PHASE > 100 else JMA_PHASE / 100 + 1.5)
+    beta = 0.45 * (jma_length - 1) / (0.45 * (jma_length - 1) + 2)
+    alpha = beta ** JMA_POWER
+    
+    # Calculate JMA progressively for each point
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    jma = 0.0
+    
+    for i, src in enumerate(price_values):
+        e0 = (1 - alpha) * src + alpha * e0
+        e1 = (src - e0) * (1 - beta) + beta * e1
+        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
+        jma = e2 + jma
+        
+        if i >= jma_length - 1:  # Only keep values after JMA is properly initialized
+            jma_values.append(jma)
+    
+    if len(jma_values) < er_period + 1:
+        return None
+    
+    # Step 2: Calculate KAMA using JMA values as source (returns tuple)
+    # Note: Pass force_completed=False here because we already handled it above
+    return calculate_kama(symbol, field, er_period, fast, slow, source_values=jma_values, force_completed=False)
 
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
@@ -471,16 +494,21 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
     return plus_dm, minus_dm
 
 def calculate_di(symbol: str) -> Optional[float]:
-    """DI on base candles"""
-    klines_base = list(state[symbol]["klines_base"])
+    """DI calculation"""
+    klines = list(state[symbol]["klines"])
     
     if USE_HEIKIN_ASHI:
-        klines_base = convert_to_heikin_ashi(klines_base, symbol, level="base")
+        klines = convert_to_heikin_ashi(klines, symbol)
     
-    if len(klines_base) < DI_PERIODS + 1:
+    if len(klines) < DI_PERIODS + 1:
         return None
 
-    completed = klines_base[:-1]
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION:
+        completed = klines  # Include current incomplete candle
+    else:
+        completed = klines[:-1]  # Exclude current candle (standard)
+    
     if len(completed) < DI_PERIODS + 1:
         return None
 
@@ -521,9 +549,70 @@ def calculate_di(symbol: str) -> Optional[float]:
     state[symbol]["di_ready"] = True
     return None
 
+def calculate_entry_ma(symbol: str, field: str = "close") -> Optional[float]:
+    """
+    Calculate entry MA based on ENTRY_MA_TYPE configuration
+    Also stores Efficiency Ratio in state when using KAMA
+    """
+    if ENTRY_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            # Double-smoothing: JMA → KAMA (returns tuple)
+            result = calculate_kama_with_jma_source(symbol, field, KAMA_JMA_SOURCE_LENGTH, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+        else:
+            # Standard: KAMA on raw price (returns tuple)
+            result = calculate_kama(symbol, field, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+    elif ENTRY_MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
+    else:
+        # Default to JMA
+        return calculate_jma(symbol, field, JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
+
+def calculate_exit_ma(symbol: str, field: str = "close") -> Optional[float]:
+    """
+    Calculate exit MA based on EXIT_MA_TYPE configuration
+    Also stores Efficiency Ratio in state when using KAMA
+    
+    Note: If REALTIME_EXIT_OVERRIDE is True, this will always use completed candles
+    """
+    # Determine if we should force completed candles for exit MA
+    use_completed = REALTIME_EXIT_OVERRIDE if USE_REALTIME_CALCULATION else False
+    
+    if EXIT_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            # Double-smoothing: JMA → KAMA (returns tuple)
+            result = calculate_kama_with_jma_source(symbol, field, KAMA_JMA_SOURCE_LENGTH, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW, force_completed=use_completed)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+        else:
+            # Standard: KAMA on raw price (returns tuple)
+            result = calculate_kama(symbol, field, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW, force_completed=use_completed)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+    elif EXIT_MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER, force_completed=use_completed)
+    else:
+        # Default to JMA
+        return calculate_jma(symbol, field, JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER, force_completed=use_completed)
+
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """Trading signals with dual-timeframe indicators"""
+    """Trading signals with JMA/KAMA indicators"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
@@ -531,8 +620,8 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-    ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+    ma_close = calculate_entry_ma(symbol, "close")  # Uses JMA or KAMA based on ENTRY_MA_TYPE
+    ma_open = calculate_exit_ma(symbol, "close")    # Uses JMA or KAMA based on EXIT_MA_TYPE (both on close)
     if USE_DI:
         calculate_di(symbol)
 
@@ -563,76 +652,109 @@ def update_trading_signals(symbol: str) -> dict:
     minus_di = st["minus_di"]
     di_bull = plus_di > minus_di if USE_DI else True
     di_bear = minus_di > plus_di if USE_DI else True
+    
+    # Get Efficiency Ratio for filtering
+    efficiency_ratio = st.get("efficiency_ratio")
+    er_allows_entry = True
+    er_allows_exit = True
+    
+    if USE_ER_FILTER and efficiency_ratio is not None:
+        er_allows_entry = efficiency_ratio > ER_THRESHOLD if USE_ER_FOR_ENTRY else True
+        er_allows_exit = efficiency_ratio > ER_THRESHOLD if USE_ER_FOR_EXIT else True
 
     new_signal = current_signal
     action_type = "NONE"
     
-    ma_name = MA_TYPE
+    # MA type labels for logging
+    entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+    exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
 
     if current_signal == "LONG":
         if cross_down and price_below_both and (di_bear if USE_DI else True):
             new_signal = "SHORT"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP LONG→SHORT (close_{ma_name} {ma_close:.6f} crossunder open_{ma_name} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")"
+            er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
+            log_msg = f"🔄 {symbol} FLIP LONG→SHORT ({entry_ma_label} {ma_close:.6f} crossunder {exit_ma_label} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")"
             logging.info(log_msg)
     elif current_signal == "SHORT":
         if cross_up and price_above_both and (di_bull if USE_DI else True):
             new_signal = "LONG"
             action_type = "FLIP"
-            log_msg = f"🔄 {symbol} FLIP SHORT→LONG (close_{ma_name} {ma_close:.6f} crossover open_{ma_name} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")"
+            er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
+            log_msg = f"🔄 {symbol} FLIP SHORT→LONG ({entry_ma_label} {ma_close:.6f} crossover {exit_ma_label} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")"
             logging.info(log_msg)
 
     # EXIT conditions - Based on EXIT_STRATEGY
     if new_signal == current_signal:
         if EXIT_STRATEGY == "SYMMETRIC":
-            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True):
+            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True) and er_allows_exit:
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True):
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True) and er_allows_exit:
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
         
         elif EXIT_STRATEGY == "CROSSOVER":
-            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True):
+            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True) and er_allows_exit:
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
-            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True):
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: MA trend reversed - {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True) and er_allows_exit:
                 new_signal = None
                 action_type = "EXIT"
-                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: {ma_name} trend reversed - close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: MA trend reversed - {entry_ma_label} {ma_close:.6f} > {exit_ma_label} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
             
     if new_signal is None:
         entry_long = False
         entry_short = False
 
         if ENTRY_STRATEGY == "CROSSOVER":
-            entry_long = crossover_aligned_long and (di_bull if USE_DI else True)
-            entry_short = crossover_aligned_short and (di_bear if USE_DI else True)
+            entry_long = crossover_aligned_long and (di_bull if USE_DI else True) and er_allows_entry
+            entry_short = crossover_aligned_short and (di_bear if USE_DI else True) and er_allows_entry
             
             if entry_long:
                 new_signal = "LONG"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > close_{ma_name} {ma_close:.6f} > open_{ma_name} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > {entry_ma_label} {ma_close:.6f} > {exit_ma_label} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
             elif entry_short:
                 new_signal = "SHORT"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < close_{ma_name} {ma_close:.6f} < open_{ma_name} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif not er_allows_entry and (crossover_aligned_long or crossover_aligned_short):
+                # Log when ER blocks an entry (but only once every 5 minutes to prevent spam)
+                now = time.time()
+                if now - st["last_er_block_log"] > 300:  # 5 minutes cooldown
+                    logging.info(f"⚠️ {symbol} ENTRY BLOCKED by ER filter (ER={efficiency_ratio:.3f} < threshold {ER_THRESHOLD}) [Next log in 5min]")
+                    st["last_er_block_log"] = now
         
         elif ENTRY_STRATEGY == "SYMMETRIC":
-            entry_long = price_above_both and (di_bull if USE_DI else True)
-            entry_short = price_below_both and (di_bear if USE_DI else True)
+            entry_long = price_above_both and (di_bull if USE_DI else True) and er_allows_entry
+            entry_short = price_below_both and (di_bear if USE_DI else True) and er_allows_entry
             
             if entry_long:
                 new_signal = "LONG"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
             elif entry_short:
                 new_signal = "SHORT"
                 action_type = "ENTRY" if current_signal is None else "REENTRY"
-                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: close={ma_close:.6f}, open={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + ")")
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif not er_allows_entry and (price_above_both or price_below_both):
+                # Log when ER blocks an entry (but only once every 5 minutes to prevent spam)
+                now = time.time()
+                if now - st["last_er_block_log"] > 300:  # 5 minutes cooldown
+                    logging.info(f"⚠️ {symbol} ENTRY BLOCKED by ER filter (ER={efficiency_ratio:.3f} < threshold {ER_THRESHOLD}) [Next log in 5min]")
+                    st["last_er_block_log"] = now
 
     st["prev_ma_close"] = ma_close
     st["prev_ma_open"] = ma_open
@@ -644,14 +766,12 @@ def update_trading_signals(symbol: str) -> dict:
         return {"changed": True, "action": action_type, "signal": new_signal}
 
     return {"changed": False, "action": "NONE", "signal": current_signal}
-    
+       
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
-    """WebSocket feed - builds base candles and aggregates them"""
-    streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
+    """WebSocket feed - builds candles"""
+    streams = [f"{s.lower()}@kline_{BASE_TIMEFRAME.lower()}" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-
-    base_interval_seconds = BASE_MINUTES * 60
 
     while True:
         try:
@@ -661,49 +781,44 @@ async def price_feed_loop(client: AsyncClient):
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
-                        symbol = data.get("s")
-                        price_str = data.get("p")
-                        event_time = data.get("E")
-
-                        if symbol in SYMBOLS and price_str and event_time:
-                            price = float(price_str)
-                            state[symbol]["price"] = price
-
-                            event_time /= 1000
+                        
+                        if "k" in data:
+                            k = data["k"]
+                            symbol = k["s"]
                             
-                            current_open_time = int(event_time // base_interval_seconds) * base_interval_seconds
-                            klines_base = state[symbol]["klines_base"]
-
-                            if not klines_base or klines_base[-1]["open_time"] != current_open_time:
-                                klines_base.append({
-                                    "open_time": current_open_time,
-                                    "open": price,
-                                    "high": price,
-                                    "low": price,
-                                    "close": price
-                                })
+                            if symbol in SYMBOLS:
+                                state[symbol]["price"] = float(k["c"])
                                 
-                                aggregate_candles(symbol)
-                            else:
-                                klines_base[-1]["high"]  = max(klines_base[-1]["high"],  price)
-                                klines_base[-1]["low"]   = min(klines_base[-1]["low"],   price)
-                                klines_base[-1]["close"] = price
+                                kline_data = {
+                                    "open_time": int(k["t"] / 1000),
+                                    "open": float(k["o"]),
+                                    "high": float(k["h"]),
+                                    "low": float(k["l"]),
+                                    "close": float(k["c"])
+                                }
                                 
-                                aggregate_candles(symbol)
+                                klines = state[symbol]["klines"]
+                                
+                                if klines and klines[-1]["open_time"] == kline_data["open_time"]:
+                                    klines[-1] = kline_data
+                                else:
+                                    klines.append(kline_data)
 
-                            if len(state[symbol]["klines_agg"]) >= MA_PERIODS and not state[symbol]["ready"]:
-                                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-                                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
-                                if USE_DI:
-                                    calculate_di(symbol)
-                                if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
-                                    state[symbol]["ready"] = True
-                                    ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
-                                    log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines_agg'])} {AGGREGATION_MINUTES}m candles, close_{MA_TYPE} {ma_close:.6f}, open_{MA_TYPE} {ma_open:.6f}){ha_status}"
-                                    logging.info(log_msg)
-                            else:
-                                if USE_DI:
-                                    calculate_di(symbol)
+                                if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                                    ma_close = calculate_entry_ma(symbol, "close")
+                                    ma_open = calculate_exit_ma(symbol, "close")
+                                    if USE_DI:
+                                        calculate_di(symbol)
+                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                        state[symbol]["ready"] = True
+                                        ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                        entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+                                        exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
+                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, {entry_ma_label} {ma_close:.6f}, {exit_ma_label} {ma_open:.6f}){ha_status}"
+                                        logging.info(log_msg)
+                                else:
+                                    if USE_DI:
+                                        calculate_di(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
@@ -724,44 +839,49 @@ async def status_logger():
             st = state[symbol]
 
             if not st["ready"]:
-                candle_count_base = len(st["klines_base"])
-                candle_count_agg = len(st["klines_agg"])
+                candle_count = len(st["klines"])
                 price = st["price"]
                 
-                ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-                ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+                ma_close = calculate_entry_ma(symbol, "close")
+                ma_open = calculate_exit_ma(symbol, "close")
                 if USE_DI:
                     calculate_di(symbol)
                 
                 reasons = []
-                if candle_count_agg < MA_PERIODS + 1:
-                    needed = (MA_PERIODS + 1) - candle_count_agg
-                    reasons.append(f"need {needed} more {AGGREGATION_MINUTES}m candles")
+                if candle_count < MA_PERIODS + 1:
+                    needed = (MA_PERIODS + 1) - candle_count
+                    reasons.append(f"need {needed} more {BASE_TIMEFRAME} candles")
                 if ma_close is None:
-                    reasons.append(f"{MA_TYPE} close not calculated")
+                    entry_ma_label = "Entry KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry JMA"
+                    reasons.append(f"{entry_ma_label} not calculated")
                 if ma_open is None:
-                    reasons.append(f"{MA_TYPE} open not calculated")
+                    exit_ma_label = "Exit KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit JMA"
+                    reasons.append(f"{exit_ma_label} not calculated")
                 if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
                     reasons.append("DI not calculated")
                 
                 reason_str = ", ".join(reasons) if reasons else "unknown"
                 price_str = f"Price={price:.6f} | " if price else ""
-                logging.info(f"{symbol}: {price_str}Not ready - {candle_count_base} {BASE_TIMEFRAME} candles ({candle_count_agg} {AGGREGATION_MINUTES}m) - Waiting for: {reason_str}")
+                logging.info(f"{symbol}: {price_str}Not ready - {candle_count} {BASE_TIMEFRAME} candles - Waiting for: {reason_str}")
                 continue
 
             price = st["price"]
-            ma_close = calculate_ma(symbol, "close", MA_PERIODS)
-            ma_open = calculate_ma(symbol, "open", MA_PERIODS)
+            ma_close = calculate_entry_ma(symbol, "close")
+            ma_open = calculate_exit_ma(symbol, "close")
             plus_di = st.get("plus_di")
             minus_di = st.get("minus_di")
+            efficiency_ratio = st.get("efficiency_ratio")
 
             if price and ma_close and ma_open:
                 current_sig = st["current_signal"] or "FLAT"
 
                 plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
                 minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
+                er_str = f"{efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else "N/A"
 
-                logging.info(f"{symbol}: Price={price:.6f} | close_{MA_TYPE}={ma_close:.6f} | open_{MA_TYPE}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str}")
+                entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+                exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
+                logging.info(f"{symbol}: Price={price:.6f} | {entry_ma_label}={ma_close:.6f} | {exit_ma_label}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str} | ER={er_str}")
                 logging.info(f"  Signal: {current_sig}")
 
                 trend_up = (ma_close > ma_open)
@@ -929,22 +1049,45 @@ async def recover_positions_from_exchange(client: AsyncClient):
 async def init_bot(client: AsyncClient):
     """Initialize bot with historical data"""
     logging.info("🔧 Initializing bot...")
-    logging.info(f"📊 Base: {BASE_TIMEFRAME} candles")
-    logging.info(f"📊 Aggregated: {AGGREGATION_MINUTES}-minute ({AGGREGATION_MINUTES/60:.1f}h) candles")
+    logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
     
-    if MA_TYPE == "JMA":
-        logging.info(f"📊 JMA: length={JMA_LENGTH}, phase={JMA_PHASE}, power={JMA_POWER}")
+    if ENTRY_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            logging.info(f"📊 Entry MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}) with JMA({KAMA_JMA_SOURCE_LENGTH}) source (double-smoothing)")
+        else:
+            logging.info(f"📊 Entry MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW})")
     else:
-        logging.info(f"📊 {MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m = {MA_PERIODS * AGGREGATION_MINUTES / 60:.1f} hours")
+        logging.info(f"📊 Entry MA: JMA(length={JMA_LENGTH_CLOSE}, phase={JMA_PHASE}, power={JMA_POWER})")
+    
+    if EXIT_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            logging.info(f"📊 Exit MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}) with JMA({KAMA_JMA_SOURCE_LENGTH}) source (double-smoothing)")
+        else:
+            logging.info(f"📊 Exit MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW})")
+    else:
+        logging.info(f"📊 Exit MA: JMA(length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, power={JMA_POWER})")
     
     if USE_HEIKIN_ASHI:
-        logging.info("📊 Heikin Ashi: ENABLED (Single Smoothing)")
+        logging.info("📊 Heikin Ashi: ENABLED")
     else:
         logging.info("📊 Heikin Ashi: DISABLED")
     if USE_DI:
         logging.info(f"📊 DMI: {DI_PERIODS} periods")
     else:
-        logging.info("📊 DMI: Disabled")
+        logging.info("📊 DMI: DISABLED")
+    
+    if USE_ER_FILTER:
+        er_entry = "ENABLED" if USE_ER_FOR_ENTRY else "DISABLED"
+        er_exit = "ENABLED" if USE_ER_FOR_EXIT else "DISABLED"
+        logging.info(f"📊 ER Filter: Threshold={ER_THRESHOLD} | Entry={er_entry} | Exit={er_exit}")
+    else:
+        logging.info("📊 ER Filter: DISABLED")
+    
+    calc_mode = "REAL-TIME (includes current candle)" if USE_REALTIME_CALCULATION else "CANDLE-CLOSE (completed candles only)"
+    if USE_REALTIME_CALCULATION and REALTIME_EXIT_OVERRIDE:
+        calc_mode += " | Exit MA: ALWAYS completed candles"
+    logging.info(f"📊 Calculation Mode: {calc_mode}")
+    
     logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
 
     load_klines()
@@ -954,17 +1097,14 @@ async def init_bot(client: AsyncClient):
 
     symbols_needing_data = []
     for symbol in SYMBOLS:
-        if len(state[symbol]["klines_base"]) >= (AGGREGATION_MINUTES // BASE_MINUTES):
-            aggregate_candles(symbol)
-        
-        klines_agg = state[symbol]["klines_agg"]
-        d_close_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "close", MA_PERIODS) is not None
-        d_open_ready = len(klines_agg) >= MA_PERIODS and calculate_ma(symbol, "open", MA_PERIODS) is not None
+        klines = state[symbol]["klines"]
+        entry_ma_ready = len(klines) >= ENTRY_MA_PERIOD and calculate_entry_ma(symbol, "close") is not None
+        exit_ma_ready = len(klines) >= EXIT_MA_PERIOD and calculate_exit_ma(symbol, "close") is not None
         if USE_DI:
             calculate_di(symbol)
         di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
 
-        if d_close_ready and d_open_ready and di_ready:
+        if entry_ma_ready and exit_ma_ready and di_ready:
             state[symbol]["ready"] = True
             logging.info(f"✅ {symbol} ready from loaded data")
         else:
@@ -977,7 +1117,7 @@ async def init_bot(client: AsyncClient):
             try:
                 logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
-                needed_candles = max(MA_PERIODS * (AGGREGATION_MINUTES // BASE_MINUTES) + 100, (DI_PERIODS + 100 if USE_DI else 100))
+                needed_candles = max(MA_PERIODS + 100, (DI_PERIODS + 100 if USE_DI else 100))
                 klines_data = await safe_api_call(
                     client.futures_mark_price_klines,
                     symbol=symbol,
@@ -986,11 +1126,11 @@ async def init_bot(client: AsyncClient):
                 )
 
                 st = state[symbol]
-                st["klines_base"].clear()
+                st["klines"].clear()
 
                 for kline in klines_data:
                     open_time = int(float(kline[0]) / 1000)
-                    st["klines_base"].append({
+                    st["klines"].append({
                         "open_time": open_time,
                         "open": float(kline[1]),
                         "high": float(kline[2]),
@@ -998,25 +1138,23 @@ async def init_bot(client: AsyncClient):
                         "close": float(kline[4])
                     })
 
-                aggregate_candles(symbol)
-
-                d_close_ok = calculate_ma(symbol, "close", MA_PERIODS) is not None
-                d_open_ok = calculate_ma(symbol, "open", MA_PERIODS) is not None
+                jma_close_ok = calculate_entry_ma(symbol, "close") is not None
+                exit_ma_ok = calculate_exit_ma(symbol, "close") is not None
                 if USE_DI:
                     calculate_di(symbol)
                 di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
 
-                if d_close_ok and d_open_ok and di_ok:
+                if jma_close_ok and exit_ma_ok and di_ok:
                     st["ready"] = True
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(240)
+                    await asyncio.sleep(15)
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(240)
+                    await asyncio.sleep(15)
 
     else:
         logging.info("🎯 All symbols ready!")
@@ -1057,18 +1195,38 @@ if __name__ == "__main__":
 
     print("=" * 80)
     ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
-    print(f"{MA_TYPE} OPEN/CLOSE CROSS STRATEGY - {ha_mode}")
-    print(f"{BASE_TIMEFRAME.upper()} BASE → {AGGREGATION_MINUTES}M AGG")
+    print(f"DUAL MA CROSS STRATEGY - {ha_mode}")
+    print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("=" * 80)
-    print(f"MA Type: {MA_TYPE}")
-    if MA_TYPE == "JMA":
-        print(f"JMA Parameters: Length={JMA_LENGTH}, Phase={JMA_PHASE}, Power={JMA_POWER}")
+    
+    if ENTRY_MA_TYPE == "KAMA":
+        kama_mode = f" [JMA({KAMA_JMA_SOURCE_LENGTH})→KAMA]" if KAMA_USE_JMA_SOURCE else ""
+        print(f"Entry MA: KAMA (ER Period={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}){kama_mode}")
     else:
-        print(f"{MA_TYPE}: {MA_PERIODS} periods on {AGGREGATION_MINUTES}m")
-    print(f"Base: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
-    print(f"Aggregation: {AGGREGATION_MINUTES} min ({AGGREGATION_MINUTES/60:.1f} hours)")
+        print(f"Entry MA: JMA (Length={JMA_LENGTH_CLOSE}, Phase={JMA_PHASE}, Power={JMA_POWER})")
+    
+    if EXIT_MA_TYPE == "KAMA":
+        kama_mode = f" [JMA({KAMA_JMA_SOURCE_LENGTH})→KAMA]" if KAMA_USE_JMA_SOURCE else ""
+        print(f"Exit MA: KAMA (ER Period={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}){kama_mode}")
+    else:
+        print(f"Exit MA: JMA (Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, Power={JMA_POWER})")
+    
+    print(f"Timeframe: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
     print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
     print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
+    
+    if USE_ER_FILTER:
+        er_entry = "ENABLED" if USE_ER_FOR_ENTRY else "DISABLED"
+        er_exit = "ENABLED" if USE_ER_FOR_EXIT else "DISABLED"
+        print(f"ER Filter: Threshold={ER_THRESHOLD} | Entry={er_entry} | Exit={er_exit}")
+    else:
+        print("ER Filter: DISABLED")
+    
+    calc_mode = "REAL-TIME" if USE_REALTIME_CALCULATION else "CANDLE-CLOSE"
+    if USE_REALTIME_CALCULATION and REALTIME_EXIT_OVERRIDE:
+        calc_mode += " (Exit: Completed Only)"
+    print(f"Calculation Mode: {calc_mode}")
+    
     print(f"Entry Strategy: {ENTRY_STRATEGY}")
     print(f"Exit Strategy: {EXIT_STRATEGY}")
     print(f"Symbols: {list(SYMBOLS.keys())}")
