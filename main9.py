@@ -55,13 +55,13 @@ KAMA_JMA_SOURCE_LENGTH = 7    # JMA length when using JMA as KAMA source
 # Efficiency Ratio (ER) Filter
 USE_ER_FILTER = True          # Enable/disable ER filter
 ER_THRESHOLD = 0.3            # Only trade when ER > threshold
-USE_ER_FOR_ENTRY = True       # Apply ER filter to entry signals
+USE_ER_FOR_ENTRY = False       # Apply ER filter to entry signals
 
 # Chaikin Money Flow (CMF) Filter
 USE_CMF_FILTER = True           # Enable/disable CMF filter
 CMF_PERIOD = 27                 # CMF lookback period
 CMF_THRESHOLD = 0.05            # Only trade when abs(CMF) > threshold
-USE_CMF_FOR_ENTRY = True        # Apply CMF filter to entry signals
+USE_CMF_FOR_ENTRY = False        # Apply CMF filter to entry signals
 USE_CMF_DIRECTION = True        # Only LONG when CMF > 0, SHORT when CMF < 0
 
 # Real-Time Calculation Mode
@@ -97,7 +97,7 @@ CMF_BUFFER = CMF_PERIOD if USE_CMF_FILTER else 0
 KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100, CMF_BUFFER + 100)
 
 # ENTRY STRATEGY
-ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
+ENTRY_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
 
 # ========================= STATE =========================
 state = {
