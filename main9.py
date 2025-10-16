@@ -21,12 +21,12 @@ USE_DI = False  # Toggle DMI indicator
 USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 
 # Timeframe configuration
-BASE_TIMEFRAME = "1h"  # Options: "1m", "15m", "1h"
+BASE_TIMEFRAME = "30m"  # Options: "1m", "30m", "1h"
 
 if BASE_TIMEFRAME == "1m":
     BASE_MINUTES = 1
-elif BASE_TIMEFRAME == "15m":
-    BASE_MINUTES = 15
+elif BASE_TIMEFRAME == "30m":
+    BASE_MINUTES = 30
 elif BASE_TIMEFRAME == "1h":
     BASE_MINUTES = 60
 else:
@@ -40,7 +40,7 @@ JMA_POWER = 2             # Smoothness level, 1-3
 
 # MA Type Configuration
 ENTRY_MA_TYPE = "JMA"   # Options: "JMA", "KAMA" - faster MA for entries
-EXIT_MA_TYPE = "KAMA"   # Options: "JMA", "KAMA" - slower MA for trend confirmation
+EXIT_MA_TYPE = "JMA"   # Options: "JMA", "KAMA" - slower MA for trend confirmation
 
 # KAMA parameters
 KAMA_ER_PERIOD = 9     # Efficiency Ratio lookback period
@@ -122,6 +122,8 @@ state = {
         "last_filter_block_log": 0,
         "last_long_entry_time": 0,  # Prevent duplicate LONG entries
         "last_short_entry_time": 0, # Prevent duplicate SHORT entries
+        "last_long_signal_log": 0,  # Prevent log spam for LONG signals
+        "last_short_signal_log": 0, # Prevent log spam for SHORT signals
     }
     for symbol in SYMBOLS
 }
@@ -671,14 +673,18 @@ def update_trading_signals(symbol: str) -> dict:
         long_entry = crossover_aligned_long and di_bull and er_allows and cmf_allows_entry and cmf_allows_long
         short_entry = crossover_aligned_short and di_bear and er_allows and cmf_allows_entry and cmf_allows_short
         
-        if long_entry:
+        # Only log if signal is new or last logged >5 minutes ago (aligned with status report)
+        now = time.time()
+        if long_entry and (now - st.get("last_long_signal_log", 0)) > 300:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🟢 {symbol} LONG ENTRY SIGNAL (price {price:.6f} > {entry_ma_label} {ma_close:.6f} > {exit_ma_label} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
-        elif short_entry:
+            st["last_long_signal_log"] = now
+        elif short_entry and (now - st.get("last_short_signal_log", 0)) > 300:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🔴 {symbol} SHORT ENTRY SIGNAL (price {price:.6f} < {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
+            st["last_short_signal_log"] = now
         elif not (er_allows and cmf_allows_entry) and (crossover_aligned_long or crossover_aligned_short):
             # Log when filters block an entry
             now = time.time()
@@ -700,14 +706,18 @@ def update_trading_signals(symbol: str) -> dict:
         long_entry = price_above_both and di_bull and er_allows and cmf_allows_entry and cmf_allows_long
         short_entry = price_below_both and di_bear and er_allows and cmf_allows_entry and cmf_allows_short
         
-        if long_entry:
+        # Only log if signal is new or last logged >5 seconds ago (prevent spam)
+        now = time.time()
+        if long_entry and (now - st.get("last_long_signal_log", 0)) > 5:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🟢 {symbol} LONG ENTRY SIGNAL (price {price:.6f} > both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
-        elif short_entry:
+            st["last_long_signal_log"] = now
+        elif short_entry and (now - st.get("last_short_signal_log", 0)) > 5:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🔴 {symbol} SHORT ENTRY SIGNAL (price {price:.6f} < both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
+            st["last_short_signal_log"] = now
         elif not (er_allows and cmf_allows_entry) and (price_above_both or price_below_both):
             # Log when filters block an entry
             now = time.time()
@@ -798,7 +808,7 @@ async def price_feed_loop(client: AsyncClient):
 async def status_logger():
     """5-minute status report"""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)
 
         current_time = time.strftime("%H:%M", time.localtime())
         logging.info(f"📊 === STATUS REPORT {current_time} ===")
@@ -876,7 +886,7 @@ async def status_logger():
 async def trading_loop(client: AsyncClient):
     """Main trading logic - ENTRY ONLY, exits handled by trailing stops"""
     while True:
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(1)  # Check every 1 second (was 0.1 - too fast)
 
         for symbol in SYMBOLS:
             st = state[symbol]
@@ -890,7 +900,7 @@ async def trading_loop(client: AsyncClient):
 
             # Handle LONG entry
             if signals["long_entry"]:
-                # Check if we already have a LONG position or entered recently (prevent duplicates)
+                # Duplicate prevention: Only enter if no existing position AND 60 seconds since last entry
                 if st["long_position"] == 0 and (now - st["last_long_entry_time"]) > 60:
                     # Place LONG market order
                     result = await place_market_order(client, symbol, "BUY", position_size, "LONG")
@@ -905,7 +915,7 @@ async def trading_loop(client: AsyncClient):
 
             # Handle SHORT entry
             if signals["short_entry"]:
-                # Check if we already have a SHORT position or entered recently (prevent duplicates)
+                # Duplicate prevention: Only enter if no existing position AND 60 seconds since last entry
                 if st["short_position"] == 0 and (now - st["last_short_entry_time"]) > 60:
                     # Place SHORT market order
                     result = await place_market_order(client, symbol, "SELL", position_size, "SHORT")
@@ -1096,12 +1106,12 @@ async def init_bot(client: AsyncClient):
                     logging.info(f"✅ {symbol} ready from API")
 
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(15)
 
             except Exception as e:
                 logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(150)
+                    await asyncio.sleep(15)
 
     else:
         logging.info("🎯 All symbols ready!")
