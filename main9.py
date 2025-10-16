@@ -1,20 +1,69 @@
 #!/usr/bin/env python3
 import os, json, asyncio, logging, websockets, time
-import atexit  # Added for auto-save
+import atexit
 from binance import AsyncClient
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional
 from dotenv import load_dotenv
 
 # ========================= CONFIG =========================
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+LEVERAGE = int(os.getenv("LEVERAGE", "50"))
+DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
+USE_DI = False  # Toggle DMI indicator
+USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
+
+# Timeframe configuration
+BASE_TIMEFRAME = "30m"  # Options: "1m", "30m", "1h"
+
+if BASE_TIMEFRAME == "1m":
+    BASE_MINUTES = 1
+elif BASE_TIMEFRAME == "30m":
+    BASE_MINUTES = 30
+elif BASE_TIMEFRAME == "1h":
+    BASE_MINUTES = 60
+else:
+    raise ValueError("Unsupported BASE_TIMEFRAME")
+
+# JMA parameters
+JMA_LENGTH_CLOSE = 7      # JMA period for entry MA (used when ENTRY_MA_TYPE = "JMA")
+JMA_LENGTH_OPEN = 48      # JMA period for exit MA (used when EXIT_MA_TYPE = "JMA")
+JMA_PHASE = 50            # -100 to 100, controls lag vs overshoot (default 50)
+JMA_POWER = 2             # Smoothness level, 1-3 (default 2)
+
+# MA Type Configuration
+# Both MAs are calculated on the CLOSE price for crossover signals
+ENTRY_MA_TYPE = "JMA"   # Options: "JMA", "KAMA" - faster MA for entries
+EXIT_MA_TYPE = "JMA"   # Options: "JMA", "KAMA" - slower MA for exits/trend
+
+# KAMA parameters - ONE set used for whichever MA type is set to KAMA
+KAMA_ER_PERIOD = 9     # Efficiency Ratio lookback period (MA Length in TradingView)
+KAMA_FAST = 2          # Fast EMA period (max sensitivity)
+KAMA_SLOW = 30         # Slow EMA period (min sensitivity)
+
+# KAMA Source Configuration (Double-Smoothing Feature)
+# This replicates TradingView's "Source: JMA: JMA" option
+KAMA_USE_JMA_SOURCE = False   # True: JMA→KAMA (ultra-smooth, like TradingView)
+                              # False: Raw price→KAMA (standard, faster response)
+KAMA_JMA_SOURCE_LENGTH = 7    # JMA length when using JMA as KAMA source
+
+# Efficiency Ratio (ER) Filter - Prevents trading in sideways/choppy markets
+USE_ER_FILTER = True         # Enable/disable ER filter
+ER_THRESHOLD = 0.25           # Only trade when ER > threshold (0.0-1.0)
+                              # 0.4 = Conservative, 0.3 = Moderate, 0.2 = Aggressive
+USE_ER_FOR_ENTRY = True      # Apply ER filter to entry signals
+USE_ER_FOR_EXIT = False       # Apply ER filter to exit signals (usually False)
+
+# Real-Time Calculation Mode
+USE_REALTIME_CALCULATION = True   # True: Include current incomplete candle (instant signals)
+                                   # False: Use only closed candles (more stable, standard)
+REALTIME_EXIT_OVERRIDE = True      # True: ALWAYS use completed candles for EXIT MA (recommended)
+                                   # False: Use same mode as entry
 
 # Trading symbols and sizes
 SYMBOLS = {
-    "BTCUSDT": 0.001,
     "ETHUSDT": 0.01,
     "BNBUSDT": 0.03,
     "XRPUSDT": 10.0,
@@ -24,33 +73,52 @@ SYMBOLS = {
     "TRXUSDT": 20.0,
 }
 
-# Hardcoded precisions to avoid API calls
+# Hardcoded precisions
 PRECISIONS = {
-    "BTCUSDT": 3, "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1,
-    "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
+    "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
 }
 
-# Indicator settings
-DONCHIAN_PERIODS = 1200   # 20 hours (1200 minutes) for Donchian
-WMA10_PERIODS    = 600    # 10 hours (600 minutes) for 10h Weighted Moving Average (closes)
-ADX_PERIODS      = 1200   # ADX calculation window (20h)
-ADX_THRESHOLD    = 25     # Minimum ADX to allow trading
-KLINE_LIMIT      = 1300   # Keep last 1300 1m candles
+# Calculate kline limits
+if KAMA_USE_JMA_SOURCE:
+    # Need extra candles for JMA calculation when using double-smoothing
+    ENTRY_MA_PERIOD = max(KAMA_ER_PERIOD, KAMA_JMA_SOURCE_LENGTH) if ENTRY_MA_TYPE == "KAMA" else JMA_LENGTH_CLOSE
+    EXIT_MA_PERIOD = max(KAMA_ER_PERIOD, KAMA_JMA_SOURCE_LENGTH) if EXIT_MA_TYPE == "KAMA" else JMA_LENGTH_OPEN
+else:
+    ENTRY_MA_PERIOD = KAMA_ER_PERIOD if ENTRY_MA_TYPE == "KAMA" else JMA_LENGTH_CLOSE
+    EXIT_MA_PERIOD = KAMA_ER_PERIOD if EXIT_MA_TYPE == "KAMA" else JMA_LENGTH_OPEN
+
+MA_PERIODS = max(ENTRY_MA_PERIOD, EXIT_MA_PERIOD)
+KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100)
+
+# ENTRY STRATEGY TOGGLE
+ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
+
+# EXIT STRATEGY TOGGLE
+EXIT_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
         "klines": deque(maxlen=KLINE_LIMIT),
-        "current_signal": None,  # None, "LONG", "SHORT"
+        "current_signal": None,
         "last_signal_change": 0,
-        "current_position": 0.0,  # Current position size
-        "wma10": None,            # 10h Weighted MA (closes)
-        "adx": None,              # ADX value
-        "adx_ready": False,       # ADX availability flag
-        "ready": False,           # True when Donchian+WMA10+ADX are available (ADX≥25)
+        "current_position": 0.0,
+        "ma_close": None,
+        "ma_open": None,
+        "prev_ma_close": None,
+        "prev_ma_open": None,
+        "plus_di": None,
+        "minus_di": None,
+        "di_ready": False,
+        "ready": False,
         "last_exec_ts": 0.0,
         "last_target": None,
+        "ha_prev_close": None,
+        "ha_prev_open": None,
+        "kama_state": None,  # For KAMA calculation state
+        "efficiency_ratio": None,  # Store latest Efficiency Ratio
+        "last_er_block_log": 0,  # Track when we last logged ER block to prevent spam
     }
     for symbol in SYMBOLS
 }
@@ -61,24 +129,90 @@ api_calls_reset_time = time.time()
 
 # ========================= PERSISTENCE FUNCTIONS =========================
 def save_klines():
-    """Save klines to JSON on shutdown"""
-    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}  # Convert deque to list for JSON
+    """Save klines to JSON"""
+    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
     with open('klines.json', 'w') as f:
         json.dump(save_data, f)
     logging.info("📥 Saved klines to klines.json")
 
 def load_klines():
-    """Load klines from JSON on startup"""
+    """Load klines from JSON"""
     try:
         with open('klines.json', 'r') as f:
             load_data = json.load(f)
         for sym in SYMBOLS:
-            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)  # Restore as deque
+            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
         logging.info("📤 Loaded klines from klines.json")
     except FileNotFoundError:
         logging.info("No klines.json found - starting fresh")
     except Exception as e:
         logging.error(f"Failed to load klines: {e} - starting fresh")
+
+def save_positions():
+    """Save current positions and signals"""
+    position_data = {
+        sym: {
+            "current_signal": state[sym]["current_signal"],
+            "current_position": state[sym]["current_position"],
+            "last_signal_change": state[sym]["last_signal_change"]
+        }
+        for sym in SYMBOLS
+    }
+    with open('positions.json', 'w') as f:
+        json.dump(position_data, f)
+
+def load_positions():
+    """Load positions from JSON"""
+    try:
+        with open('positions.json', 'r') as f:
+            position_data = json.load(f)
+        for sym in SYMBOLS:
+            if sym in position_data:
+                state[sym]["current_signal"] = position_data[sym].get("current_signal")
+                state[sym]["current_position"] = position_data[sym].get("current_position", 0.0)
+                state[sym]["last_signal_change"] = position_data[sym].get("last_signal_change", 0)
+        logging.info("💾 Loaded positions from positions.json")
+    except FileNotFoundError:
+        logging.info("No positions.json found - starting fresh")
+    except Exception as e:
+        logging.error(f"Failed to load positions: {e} - starting fresh")
+
+# ========================= HEIKIN ASHI TRANSFORMATION =========================
+def convert_to_heikin_ashi(candles: list, symbol: str) -> list:
+    """Convert regular candles to Heikin Ashi candles"""
+    if not candles or not USE_HEIKIN_ASHI:
+        return candles
+    
+    ha_candles = []
+    prev_ha_open = state[symbol].get("ha_prev_open")
+    prev_ha_close = state[symbol].get("ha_prev_close")
+    
+    for i, candle in enumerate(candles):
+        ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
+        
+        if i == 0 and prev_ha_open is not None and prev_ha_close is not None:
+            ha_open = (prev_ha_open + prev_ha_close) / 2
+        elif i == 0:
+            ha_open = (candle["open"] + candle["close"]) / 2
+        else:
+            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2
+        
+        ha_high = max(candle["high"], ha_open, ha_close)
+        ha_low = min(candle["low"], ha_open, ha_close)
+        
+        ha_candles.append({
+            "open_time": candle["open_time"],
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close
+        })
+    
+    if ha_candles:
+        state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
+        state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
+    
+    return ha_candles
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
@@ -87,16 +221,14 @@ def round_size(size: float, symbol: str) -> float:
     return round(size, prec)
 
 async def safe_api_call(func, *args, **kwargs):
-    """Make API call with exponential backoff for rate limiting"""
+    """Make API call with exponential backoff"""
     global api_calls_count, api_calls_reset_time
 
-    # Reset counter every minute
     now = time.time()
     if now - api_calls_reset_time > 60:
         api_calls_count = 0
         api_calls_reset_time = now
 
-    # Limit API calls to 10 per minute (very conservative)
     if api_calls_count >= 10:
         wait_time = 60 - (now - api_calls_reset_time)
         if wait_time > 0:
@@ -105,7 +237,6 @@ async def safe_api_call(func, *args, **kwargs):
             api_calls_count = 0
             api_calls_reset_time = time.time()
 
-    # Exponential backoff retry logic
     for attempt in range(3):
         try:
             api_calls_count += 1
@@ -113,7 +244,7 @@ async def safe_api_call(func, *args, **kwargs):
             return result
         except Exception as e:
             if "-1003" in str(e) or "Way too many requests" in str(e):
-                wait_time = (2 ** attempt) * 60  # 1min, 2min, 4min
+                wait_time = (2 ** attempt) * 60
                 logging.warning(f"Rate limited, attempt {attempt+1}/3, waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
             else:
@@ -122,13 +253,12 @@ async def safe_api_call(func, *args, **kwargs):
     raise Exception("Max API retry attempts reached")
 
 async def place_order(client: AsyncClient, symbol: str, side: str, quantity: float, action: str):
-    """Place market order with rate limiting"""
+    """Place market order"""
     try:
         quantity = round_size(abs(quantity), symbol)
         if quantity == 0:
             return True
 
-        # Determine positionSide based on action
         if "LONG" in action:
             position_side = "LONG"
         elif "SHORT" in action:
@@ -154,49 +284,202 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         return False
 
 # ========================= INDICATOR CALCULATIONS =========================
-def get_donchian_levels(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    """Get Donchian channel high/low from last N (completed) 1m periods"""
+def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: int = 2, force_completed: bool = False) -> Optional[float]:
+    """
+    Jurik Moving Average (JMA) calculation
+    Copyright (c) 2007-present Jurik Research and Consulting
+    Converted from Pine Script to Python
+    
+    Args:
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
+    """
     klines = state[symbol]["klines"]
 
-    if len(klines) < DONCHIAN_PERIODS:
-        return None, None
+    if len(klines) < length + 1:
+        return None
 
-    # Use last N complete periods (exclude current forming candle)
-    recent = list(klines)[:-1][-DONCHIAN_PERIODS:]
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
+    else:
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < length:
+        return None
 
-    if not recent:
-        return None, None
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
 
-    highs = [k["high"] for k in recent]
-    lows  = [k["low"]  for k in recent]
+    values = [k.get(field, None) for k in completed]
+    if None in values:
+        return None
 
-    return min(lows), max(highs)
+    # JMA parameters
+    phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = beta ** power
 
-def calculate_wma_close(symbol: str, period: int) -> Optional[float]:
-    """Weighted Moving Average of closes over 'period' completed 1m candles (exclude forming)."""
+    # Initialize state variables
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    jma = 0.0
+
+    # Calculate JMA for all values in sequence
+    for src in values:
+        e0 = (1 - alpha) * src + alpha * e0
+        e1 = (src - e0) * (1 - beta) + beta * e1
+        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
+        jma = e2 + jma
+
+    return jma
+
+def calculate_kama(symbol: str, field: str, er_period: int = 10, fast: int = 2, slow: int = 30, source_values: list = None, force_completed: bool = False) -> Optional[tuple]:
+    """
+    Kaufman's Adaptive Moving Average (KAMA) calculation
+    Based on Perry J. Kaufman's adaptive moving average formula
+    
+    Formula:
+    1. Efficiency Ratio (ER) = |Change| / Sum(|Daily Changes|)
+    2. Smoothing Constant (SC) = [ER * (Fast_Alpha - Slow_Alpha) + Slow_Alpha]^2
+    3. KAMA = KAMA_prev + SC * (Price - KAMA_prev)
+    
+    Args:
+        source_values: Optional pre-calculated values (e.g., JMA output) to use as source
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
+    
+    Returns:
+        Tuple of (kama_value, efficiency_ratio) or None
+    """
     klines = state[symbol]["klines"]
 
-    # Need at least 'period' completed candles (+1 forming)
-    if len(klines) < period + 1:
+    if len(klines) < er_period + 1:
         return None
 
-    completed = list(klines)[:-1]
-    if len(completed) < period:
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
+    else:
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < er_period + 1:
         return None
 
-    closes  = [k["close"] for k in completed[-period:]]
-    weights = list(range(1, period + 1))
-    denom   = sum(weights)
-    num     = sum(c * w for c, w in zip(closes, weights))
-    wma_val = num / denom
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
 
-    # cache if it's the 10h WMA
-    if period == WMA10_PERIODS:
-        state[symbol]["wma10"] = wma_val
+    # Use provided source values or extract from klines
+    if source_values is not None:
+        values = source_values
+    else:
+        values = [k.get(field, None) for k in completed]
+        
+    if None in values:
+        return None
 
-    return wma_val
+    # Calculate alpha constants
+    fast_alpha = 2.0 / (fast + 1)
+    slow_alpha = 2.0 / (slow + 1)
 
-# ---------- ADX ----------
+    # Initialize KAMA with first source price (matching TradingView)
+    kama = values[0]
+    latest_er = 0.0  # Store the latest ER value
+
+    # Calculate KAMA iteratively
+    for i in range(er_period, len(values)):
+        # Step 1: Calculate Efficiency Ratio (ER)
+        # ER = |Net Change| / Sum of absolute changes
+        change = abs(values[i] - values[i - er_period])
+        
+        volatility = 0.0
+        for j in range(i - er_period + 1, i + 1):
+            volatility += abs(values[j] - values[j - 1])
+        
+        # Avoid division by zero
+        if volatility == 0:
+            er = 0.0
+        else:
+            er = change / volatility
+        
+        # Store the latest ER value
+        if i == len(values) - 1:
+            latest_er = er
+
+        # Step 2: Calculate Smoothing Constant (SC)
+        sc = (er * (fast_alpha - slow_alpha) + slow_alpha) ** 2
+
+        # Step 3: Update KAMA
+        kama = kama + sc * (values[i] - kama)
+
+    return (kama, latest_er)
+
+def calculate_kama_with_jma_source(symbol: str, field: str, jma_length: int, er_period: int, fast: int, slow: int, force_completed: bool = False) -> Optional[tuple]:
+    """
+    Calculate KAMA using JMA as the source (double-smoothing)
+    Step 1: Calculate JMA on the specified field
+    Step 2: Use JMA values as input to KAMA
+    
+    Args:
+        force_completed: If True, always use completed candles regardless of USE_REALTIME_CALCULATION
+    
+    Returns:
+        Tuple of (kama_value, efficiency_ratio) or None
+    """
+    klines = state[symbol]["klines"]
+    
+    if len(klines) < max(jma_length, er_period) + 1:
+        return None
+    
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION and not force_completed:
+        completed = list(klines)  # Include current incomplete candle
+    else:
+        completed = list(klines)[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < max(jma_length, er_period) + 1:
+        return None
+    
+    # Apply Heikin Ashi if enabled
+    if USE_HEIKIN_ASHI:
+        completed = convert_to_heikin_ashi(completed, symbol)
+    
+    # Extract price values
+    price_values = [k.get(field, None) for k in completed]
+    if None in price_values:
+        return None
+    
+    # Step 1: Calculate JMA for all values
+    jma_values = []
+    
+    # JMA parameters
+    phaseRatio = 0.5 if JMA_PHASE < -100 else (2.5 if JMA_PHASE > 100 else JMA_PHASE / 100 + 1.5)
+    beta = 0.45 * (jma_length - 1) / (0.45 * (jma_length - 1) + 2)
+    alpha = beta ** JMA_POWER
+    
+    # Calculate JMA progressively for each point
+    e0 = 0.0
+    e1 = 0.0
+    e2 = 0.0
+    jma = 0.0
+    
+    for i, src in enumerate(price_values):
+        e0 = (1 - alpha) * src + alpha * e0
+        e1 = (src - e0) * (1 - beta) + beta * e1
+        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
+        jma = e2 + jma
+        
+        if i >= jma_length - 1:  # Only keep values after JMA is properly initialized
+            jma_values.append(jma)
+    
+    if len(jma_values) < er_period + 1:
+        return None
+    
+    # Step 2: Calculate KAMA using JMA values as source (returns tuple)
+    # Note: Pass force_completed=False here because we already handled it above
+    return calculate_kama(symbol, field, er_period, fast, slow, source_values=jma_values, force_completed=False)
+
 def calculate_true_range(high1: float, low1: float, close0: float) -> float:
     tr1 = high1 - low1
     tr2 = abs(high1 - close0)
@@ -210,75 +493,126 @@ def calculate_directional_movement(high1: float, high0: float, low1: float, low0
     minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
     return plus_dm, minus_dm
 
-def calculate_adx(symbol: str) -> Optional[float]:
-    """Calculate ADX (Average Directional Index) for trend strength"""
-    klines = state[symbol]["klines"]
-    if len(klines) < ADX_PERIODS + 1:
+def calculate_di(symbol: str) -> Optional[float]:
+    """DI calculation"""
+    klines = list(state[symbol]["klines"])
+    
+    if USE_HEIKIN_ASHI:
+        klines = convert_to_heikin_ashi(klines, symbol)
+    
+    if len(klines) < DI_PERIODS + 1:
         return None
 
-    completed = list(klines)[:-1]
-    if len(completed) < ADX_PERIODS + 1:
+    # Use real-time or candle-close mode
+    if USE_REALTIME_CALCULATION:
+        completed = klines  # Include current incomplete candle
+    else:
+        completed = klines[:-1]  # Exclude current candle (standard)
+    
+    if len(completed) < DI_PERIODS + 1:
         return None
 
-    recent = completed[-(ADX_PERIODS + 1):]
-
-    tr_values, plus_dm_values, minus_dm_values = [], [], []
-    for i in range(1, len(recent)):
-        cur = recent[i]
-        prev = recent[i - 1]
-        tr_values.append(calculate_true_range(cur["high"], cur["low"], prev["close"]))
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+    for i in range(1, len(completed)):
+        cur = completed[i]
+        prev = completed[i - 1]
+        tr = calculate_true_range(cur["high"], cur["low"], prev["close"])
+        tr_values.append(tr)
         plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
         plus_dm_values.append(plus_dm)
         minus_dm_values.append(minus_dm)
 
-    alpha = 1.0 / ADX_PERIODS
+    if len(tr_values) < DI_PERIODS:
+        return None
 
-    # Smooth TR
-    sm_tr = tr_values[0]
-    for tr in tr_values[1:]:
-        sm_tr = alpha * tr + (1 - alpha) * sm_tr
+    alpha = 1.0 / DI_PERIODS
 
-    # Smooth +DM / -DM
-    sm_pdm = plus_dm_values[0]
-    for pdm in plus_dm_values[1:]:
-        sm_pdm = alpha * pdm + (1 - alpha) * sm_pdm
+    sm_tr = sum(tr_values[:DI_PERIODS]) / DI_PERIODS
+    sm_pdm = sum(plus_dm_values[:DI_PERIODS]) / DI_PERIODS
+    sm_mdm = sum(minus_dm_values[:DI_PERIODS]) / DI_PERIODS
 
-    sm_mdm = minus_dm_values[0]
-    for mdm in minus_dm_values[1:]:
-        sm_mdm = alpha * mdm + (1 - alpha) * sm_mdm
+    for i in range(DI_PERIODS, len(tr_values)):
+        sm_tr = alpha * tr_values[i] + (1 - alpha) * sm_tr
+        sm_pdm = alpha * plus_dm_values[i] + (1 - alpha) * sm_pdm
+        sm_mdm = alpha * minus_dm_values[i] + (1 - alpha) * sm_mdm
 
     if sm_tr == 0:
         return None
 
     plus_di  = (sm_pdm / sm_tr) * 100
     minus_di = (sm_mdm / sm_tr) * 100
-    if (plus_di + minus_di) == 0:
-        return None
 
-    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
-    prev_adx = state[symbol].get("adx")
-    adx = dx if prev_adx is None else (alpha * dx + (1 - alpha) * prev_adx)
+    state[symbol]["plus_di"] = plus_di
+    state[symbol]["minus_di"] = minus_di
+    state[symbol]["di_ready"] = True
+    return None
 
-    state[symbol]["adx"] = adx
-    state[symbol]["adx_ready"] = True
-    return adx
+def calculate_entry_ma(symbol: str, field: str = "close") -> Optional[float]:
+    """
+    Calculate entry MA based on ENTRY_MA_TYPE configuration
+    Also stores Efficiency Ratio in state when using KAMA
+    """
+    if ENTRY_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            # Double-smoothing: JMA → KAMA (returns tuple)
+            result = calculate_kama_with_jma_source(symbol, field, KAMA_JMA_SOURCE_LENGTH, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+        else:
+            # Standard: KAMA on raw price (returns tuple)
+            result = calculate_kama(symbol, field, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+    elif ENTRY_MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
+    else:
+        # Default to JMA
+        return calculate_jma(symbol, field, JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
+
+def calculate_exit_ma(symbol: str, field: str = "close") -> Optional[float]:
+    """
+    Calculate exit MA based on EXIT_MA_TYPE configuration
+    Also stores Efficiency Ratio in state when using KAMA
+    
+    Note: If REALTIME_EXIT_OVERRIDE is True, this will always use completed candles
+    """
+    # Determine if we should force completed candles for exit MA
+    use_completed = REALTIME_EXIT_OVERRIDE if USE_REALTIME_CALCULATION else False
+    
+    if EXIT_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            # Double-smoothing: JMA → KAMA (returns tuple)
+            result = calculate_kama_with_jma_source(symbol, field, KAMA_JMA_SOURCE_LENGTH, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW, force_completed=use_completed)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+        else:
+            # Standard: KAMA on raw price (returns tuple)
+            result = calculate_kama(symbol, field, KAMA_ER_PERIOD, KAMA_FAST, KAMA_SLOW, force_completed=use_completed)
+            if result is not None:
+                kama_value, er_value = result
+                state[symbol]["efficiency_ratio"] = er_value
+                return kama_value
+            return None
+    elif EXIT_MA_TYPE == "JMA":
+        return calculate_jma(symbol, field, JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER, force_completed=use_completed)
+    else:
+        # Default to JMA
+        return calculate_jma(symbol, field, JMA_LENGTH_OPEN, JMA_PHASE, JMA_POWER, force_completed=use_completed)
 
 # ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """
-    BREAKOUT ENTRY → PULLBACK FLIPPING Strategy with 1% Buffer
-    
-    Phase 1 - INITIAL ENTRY (from FLAT, need ALL 3 conditions):
-    - LONG:  price >= Donchian HIGH AND price > WMA10 AND ADX >= 25
-    - SHORT: price <= Donchian LOW  AND price < WMA10 AND ADX >= 25
-    
-    Phase 2 - PULLBACK FLIPPING with 1% BUFFER (once in position, need only 2 conditions):
-    - LONG → SHORT: price < WMA10 * 0.995 AND ADX >= 25 (0.5% below WMA10)
-    - SHORT → LONG: price > WMA10 * 1.005 AND ADX >= 25 (0.5% above WMA10)
-    
-    Never go FLAT again after initial entry - always LONG or SHORT!
-    0.5% buffer prevents whipsaw around WMA10 level.
-    """
+    """Trading signals with JMA/KAMA indicators"""
     st = state[symbol]
     price = st["price"]
     current_signal = st["current_signal"]
@@ -286,73 +620,157 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    d_low, d_high = get_donchian_levels(symbol)
-    wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
-    adx   = calculate_adx(symbol)
+    ma_close = calculate_entry_ma(symbol, "close")  # Uses JMA or KAMA based on ENTRY_MA_TYPE
+    ma_open = calculate_exit_ma(symbol, "close")    # Uses JMA or KAMA based on EXIT_MA_TYPE (both on close)
+    if USE_DI:
+        calculate_di(symbol)
 
-    if d_low is None or d_high is None or wma10 is None or adx is None:
+    if ma_close is None or ma_open is None or (USE_DI and (st["plus_di"] is None or st["minus_di"] is None)):
         return {"changed": False, "action": "NONE", "signal": current_signal}
 
-    # Phase 1: BREAKOUT entry conditions (ALL 3 must be true)
-    adx_ok         = (adx >= ADX_THRESHOLD)
-    breakout_long  = adx_ok and (price >= d_high) and (price > wma10)   # 3 conditions for entry
-    breakout_short = adx_ok and (price <= d_low)  and (price < wma10)   # 3 conditions for entry
+    prev_close = st["prev_ma_close"]
+    prev_open = st["prev_ma_open"]
+
+    if prev_close is None or prev_open is None:
+        st["prev_ma_close"] = ma_close
+        st["prev_ma_open"] = ma_open
+        return {"changed": False, "action": "NONE", "signal": current_signal}
     
-    # Phase 2: PULLBACK flipping conditions with 1% BUFFER (only 2 must be true)
-    pullback_to_short = (price < wma10 * 0.99) and adx_ok   # 1% below WMA10 + ADX
-    pullback_to_long  = (price > wma10 * 1.01) and adx_ok   # 1% above WMA10 + ADX
+    cross_up = (ma_close > ma_open) and (prev_close <= prev_open)
+    cross_down = (ma_close < ma_open) and (prev_close >= prev_open)
+    
+    price_above_both = (price > ma_close) and (price > ma_open)
+    price_below_both = (price < ma_close) and (price < ma_open)
+    
+    crossover_aligned_long = (price > ma_close) and (ma_close > ma_open)
+    crossover_aligned_short = (price < ma_close) and (ma_close < ma_open)
+    
+    ma_trend_bearish = ma_close < ma_open
+    ma_trend_bullish = ma_close > ma_open
+
+    plus_di = st["plus_di"]
+    minus_di = st["minus_di"]
+    di_bull = plus_di > minus_di if USE_DI else True
+    di_bear = minus_di > plus_di if USE_DI else True
+    
+    # Get Efficiency Ratio for filtering
+    efficiency_ratio = st.get("efficiency_ratio")
+    er_allows_entry = True
+    er_allows_exit = True
+    
+    if USE_ER_FILTER and efficiency_ratio is not None:
+        er_allows_entry = efficiency_ratio > ER_THRESHOLD if USE_ER_FOR_ENTRY else True
+        er_allows_exit = efficiency_ratio > ER_THRESHOLD if USE_ER_FOR_EXIT else True
 
     new_signal = current_signal
     action_type = "NONE"
+    
+    # MA type labels for logging
+    entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+    exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
 
-    # PHASE 1: Initial entry from FLAT (need strong breakout signal)
-    if current_signal is None:
-        if breakout_long:
-            new_signal = "LONG"
-            action_type = "ENTRY"
-            logging.info(
-                f"🚀 {symbol} BREAKOUT ENTRY LONG "
-                f"(price {price:.6f} >= DonchianHIGH {d_high:.6f} & > WMA10 {wma10:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
-            )
-        elif breakout_short:
+    if current_signal == "LONG":
+        if cross_down and price_below_both and (di_bear if USE_DI else True):
             new_signal = "SHORT"
-            action_type = "ENTRY"
-            logging.info(
-                f"🚀 {symbol} BREAKOUT ENTRY SHORT "
-                f"(price {price:.6f} <= DonchianLOW {d_low:.6f} & < WMA10 {wma10:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
-            )
-    
-    # PHASE 2: Pullback flipping with 1% buffer (faster signals, only 2 conditions)
-    elif current_signal == "LONG" and pullback_to_short:
-        new_signal = "SHORT"
-        action_type = "PULLBACK_FLIP"
-        logging.info(
-            f"🔄 {symbol} PULLBACK FLIP LONG→SHORT "
-            f"(price {price:.6f} < WMA10*0.99 {wma10*0.99:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
-        )
-    elif current_signal == "SHORT" and pullback_to_long:
-        new_signal = "LONG"
-        action_type = "PULLBACK_FLIP"
-        logging.info(
-            f"🔄 {symbol} PULLBACK FLIP SHORT→LONG "
-            f"(price {price:.6f} > WMA10*1.01 {wma10*1.01:.6f} & ADX {adx:.1f}≥{ADX_THRESHOLD})"
-        )
-    
-    # HOLD: All other cases (conditions not met, or price in 1% buffer zone)
-    # No action - new_signal stays as current_signal
+            action_type = "FLIP"
+            er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
+            log_msg = f"🔄 {symbol} FLIP LONG→SHORT ({entry_ma_label} {ma_close:.6f} crossunder {exit_ma_label} {ma_open:.6f} & price {price:.6f} < both MAs" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")"
+            logging.info(log_msg)
+    elif current_signal == "SHORT":
+        if cross_up and price_above_both and (di_bull if USE_DI else True):
+            new_signal = "LONG"
+            action_type = "FLIP"
+            er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
+            log_msg = f"🔄 {symbol} FLIP SHORT→LONG ({entry_ma_label} {ma_close:.6f} crossover {exit_ma_label} {ma_open:.6f} & price {price:.6f} > both MAs" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")"
+            logging.info(log_msg)
 
-    # Update state if signal changed
+    # EXIT conditions - Based on EXIT_STRATEGY
+    if new_signal == current_signal:
+        if EXIT_STRATEGY == "SYMMETRIC":
+            if current_signal == "LONG" and price_below_both and (di_bear if USE_DI else True) and er_allows_exit:
+                new_signal = None
+                action_type = "EXIT"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT LONG (SYMMETRIC: price {price:.6f} fell below BOTH MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif current_signal == "SHORT" and price_above_both and (di_bull if USE_DI else True) and er_allows_exit:
+                new_signal = None
+                action_type = "EXIT"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT SHORT (SYMMETRIC: price {price:.6f} rose above BOTH MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
+        
+        elif EXIT_STRATEGY == "CROSSOVER":
+            if current_signal == "LONG" and ma_trend_bearish and (di_bear if USE_DI else True) and er_allows_exit:
+                new_signal = None
+                action_type = "EXIT"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT LONG (CROSSOVER: MA trend reversed - {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}, price={price:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif current_signal == "SHORT" and ma_trend_bullish and (di_bull if USE_DI else True) and er_allows_exit:
+                new_signal = None
+                action_type = "EXIT"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_EXIT and efficiency_ratio is not None else ""
+                logging.info(f"🔴 {symbol} EXIT SHORT (CROSSOVER: MA trend reversed - {entry_ma_label} {ma_close:.6f} > {exit_ma_label} {ma_open:.6f}, price={price:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            
+    if new_signal is None:
+        entry_long = False
+        entry_short = False
+
+        if ENTRY_STRATEGY == "CROSSOVER":
+            entry_long = crossover_aligned_long and (di_bull if USE_DI else True) and er_allows_entry
+            entry_short = crossover_aligned_short and (di_bear if USE_DI else True) and er_allows_entry
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (CROSSOVER: price {price:.6f} > {entry_ma_label} {ma_close:.6f} > {exit_ma_label} {ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (CROSSOVER: price {price:.6f} < {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif not er_allows_entry and (crossover_aligned_long or crossover_aligned_short):
+                # Log when ER blocks an entry (but only once every 5 minutes to prevent spam)
+                now = time.time()
+                if now - st["last_er_block_log"] > 300:  # 5 minutes cooldown
+                    logging.info(f"⚠️ {symbol} ENTRY BLOCKED by ER filter (ER={efficiency_ratio:.3f} < threshold {ER_THRESHOLD}) [Next log in 5min]")
+                    st["last_er_block_log"] = now
+        
+        elif ENTRY_STRATEGY == "SYMMETRIC":
+            entry_long = price_above_both and (di_bull if USE_DI else True) and er_allows_entry
+            entry_short = price_below_both and (di_bear if USE_DI else True) and er_allows_entry
+            
+            if entry_long:
+                new_signal = "LONG"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} LONG (SYMMETRIC: price {price:.6f} > both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif entry_short:
+                new_signal = "SHORT"
+                action_type = "ENTRY" if current_signal is None else "REENTRY"
+                er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None else ""
+                logging.info(f"🟢 {symbol} {action_type} SHORT (SYMMETRIC: price {price:.6f} < both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + ")")
+            elif not er_allows_entry and (price_above_both or price_below_both):
+                # Log when ER blocks an entry (but only once every 5 minutes to prevent spam)
+                now = time.time()
+                if now - st["last_er_block_log"] > 300:  # 5 minutes cooldown
+                    logging.info(f"⚠️ {symbol} ENTRY BLOCKED by ER filter (ER={efficiency_ratio:.3f} < threshold {ER_THRESHOLD}) [Next log in 5min]")
+                    st["last_er_block_log"] = now
+
+    st["prev_ma_close"] = ma_close
+    st["prev_ma_open"] = ma_open
+
     if new_signal != current_signal:
         st["current_signal"] = new_signal
         st["last_signal_change"] = time.time()
+        save_positions()
         return {"changed": True, "action": action_type, "signal": new_signal}
 
     return {"changed": False, "action": "NONE", "signal": current_signal}
-
+       
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
-    """WebSocket price feed; builds 1m candles from markPrice@1s and sets readiness."""
-    streams = [f"{s.lower()}@markPrice@1s" for s in SYMBOLS]
+    """WebSocket feed - builds candles"""
+    streams = [f"{s.lower()}@kline_{BASE_TIMEFRAME.lower()}" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
     while True:
@@ -363,50 +781,44 @@ async def price_feed_loop(client: AsyncClient):
                 async for message in ws:
                     try:
                         data = json.loads(message).get("data", {})
-                        symbol = data.get("s")
-                        price_str = data.get("p")
-                        event_time = data.get("E")
-
-                        if symbol in SYMBOLS and price_str and event_time:
-                            price = float(price_str)
-                            state[symbol]["price"] = price
-
-                            # Update 1-minute candles using event time
-                            event_time /= 1000
-                            minute = int(event_time // 60)
-                            klines = state[symbol]["klines"]
-
-                            if not klines or klines[-1]["minute"] != minute:
-                                # New minute candle
-                                klines.append({
-                                    "minute": minute,
-                                    "high": price,
-                                    "low": price,
-                                    "close": price
-                                })
-                            else:
-                                # Update current candle
-                                klines[-1]["high"]  = max(klines[-1]["high"],  price)
-                                klines[-1]["low"]   = min(klines[-1]["low"],   price)
-                                klines[-1]["close"] = price
-
-                            # Readiness: require Donchian(20h) + WMA10 + ADX ≥ threshold
-                            if len(klines) >= DONCHIAN_PERIODS and not state[symbol]["ready"]:
-                                dlow, dhigh = get_donchian_levels(symbol)
-                                wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
-                                adx   = calculate_adx(symbol)
-                                if (dlow is not None) and (dhigh is not None) and (wma10 is not None) and (adx is not None and adx >= ADX_THRESHOLD):
-                                    state[symbol]["ready"] = True
-                                    logging.info(
-                                        f"✅ {symbol} ready for trading "
-                                        f"({len(klines)} candles, WMA10 {wma10:.6f}, ADX {adx:.1f}≥{ADX_THRESHOLD})"
-                                    )
+                        
+                        if "k" in data:
+                            k = data["k"]
+                            symbol = k["s"]
+                            
+                            if symbol in SYMBOLS:
+                                state[symbol]["price"] = float(k["c"])
+                                
+                                kline_data = {
+                                    "open_time": int(k["t"] / 1000),
+                                    "open": float(k["o"]),
+                                    "high": float(k["h"]),
+                                    "low": float(k["l"]),
+                                    "close": float(k["c"])
+                                }
+                                
+                                klines = state[symbol]["klines"]
+                                
+                                if klines and klines[-1]["open_time"] == kline_data["open_time"]:
+                                    klines[-1] = kline_data
                                 else:
-                                    # ensure ADX keeps updating for display even if not ready yet
-                                    calculate_adx(symbol)
-                            else:
-                                # keep ADX up-to-date (doesn't block trading once ready)
-                                calculate_adx(symbol)
+                                    klines.append(kline_data)
+
+                                if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                                    ma_close = calculate_entry_ma(symbol, "close")
+                                    ma_open = calculate_exit_ma(symbol, "close")
+                                    if USE_DI:
+                                        calculate_di(symbol)
+                                    if (ma_close is not None) and (ma_open is not None) and (not USE_DI or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)):
+                                        state[symbol]["ready"] = True
+                                        ha_status = " (Heikin Ashi enabled)" if USE_HEIKIN_ASHI else ""
+                                        entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+                                        exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
+                                        log_msg = f"✅ {symbol} ready for trading ({len(state[symbol]['klines'])} {BASE_TIMEFRAME} candles, {entry_ma_label} {ma_close:.6f}, {exit_ma_label} {ma_open:.6f}){ha_status}"
+                                        logging.info(log_msg)
+                                else:
+                                    if USE_DI:
+                                        calculate_di(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
@@ -416,9 +828,9 @@ async def price_feed_loop(client: AsyncClient):
             await asyncio.sleep(5)
 
 async def status_logger():
-    """5-minute status showing Phase 1 (breakout entry) vs Phase 2 (pullback flipping) conditions"""
+    """2-minute status report"""
     while True:
-        await asyncio.sleep(300)  # 5 minutes = 300 seconds
+        await asyncio.sleep(120)
 
         current_time = time.strftime("%H:%M", time.localtime())
         logging.info(f"📊 === STATUS REPORT {current_time} ===")
@@ -428,73 +840,77 @@ async def status_logger():
 
             if not st["ready"]:
                 candle_count = len(st["klines"])
-                remaining = max(0, DONCHIAN_PERIODS - candle_count)
-                logging.info(f"{symbol}: Not ready - {candle_count}/{DONCHIAN_PERIODS} candles ({remaining} more needed)")
+                price = st["price"]
+                
+                ma_close = calculate_entry_ma(symbol, "close")
+                ma_open = calculate_exit_ma(symbol, "close")
+                if USE_DI:
+                    calculate_di(symbol)
+                
+                reasons = []
+                if candle_count < MA_PERIODS + 1:
+                    needed = (MA_PERIODS + 1) - candle_count
+                    reasons.append(f"need {needed} more {BASE_TIMEFRAME} candles")
+                if ma_close is None:
+                    entry_ma_label = "Entry KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry JMA"
+                    reasons.append(f"{entry_ma_label} not calculated")
+                if ma_open is None:
+                    exit_ma_label = "Exit KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit JMA"
+                    reasons.append(f"{exit_ma_label} not calculated")
+                if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
+                    reasons.append("DI not calculated")
+                
+                reason_str = ", ".join(reasons) if reasons else "unknown"
+                price_str = f"Price={price:.6f} | " if price else ""
+                logging.info(f"{symbol}: {price_str}Not ready - {candle_count} {BASE_TIMEFRAME} candles - Waiting for: {reason_str}")
                 continue
 
             price = st["price"]
-            d_low, d_high = get_donchian_levels(symbol)
-            wma10 = calculate_wma_close(symbol, WMA10_PERIODS)
-            adx = st.get("adx")
+            ma_close = calculate_entry_ma(symbol, "close")
+            ma_open = calculate_exit_ma(symbol, "close")
+            plus_di = st.get("plus_di")
+            minus_di = st.get("minus_di")
+            efficiency_ratio = st.get("efficiency_ratio")
 
-            if d_low and d_high and price and wma10:
-                current_sig = st["current_signal"] or "WAIT"
+            if price and ma_close and ma_open:
+                current_sig = st["current_signal"] or "FLAT"
 
-                logging.info(f"{symbol}: Price={price:.6f} | WMA10={wma10:.6f} | ADX={f'{adx:.1f}' if adx is not None else 'N/A'}")
-                logging.info(f"  Donchian: LOW={d_low:.6f} HIGH={d_high:.6f}")
+                plus_di_str = f"{plus_di:.4f}" if USE_DI and plus_di is not None else "N/A"
+                minus_di_str = f"{minus_di:.4f}" if USE_DI and minus_di is not None else "N/A"
+                er_str = f"{efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else "N/A"
+
+                entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
+                exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
+                logging.info(f"{symbol}: Price={price:.6f} | {entry_ma_label}={ma_close:.6f} | {exit_ma_label}={ma_open:.6f} | +DI={plus_di_str} | -DI={minus_di_str} | ER={er_str}")
                 logging.info(f"  Signal: {current_sig}")
 
-                # Show different conditions based on current phase
-                adx_ok         = (adx is not None and adx >= ADX_THRESHOLD)
-                breakout_long  = adx_ok and (price >= d_high) and (price > wma10)  # 3 conditions
-                breakout_short = adx_ok and (price <= d_low)  and (price < wma10)  # 3 conditions
-                pullback_short = (price < wma10 * 0.99) and adx_ok  # 2 conditions with 1% buffer
-                pullback_long  = (price > wma10 * 1.01) and adx_ok  # 2 conditions with 1% buffer
+                trend_up = (ma_close > ma_open)
+                trend_down = (ma_close < ma_open)
+                price_above_both = (price > ma_close) and (price > ma_open)
+                price_below_both = (price < ma_close) and (price < ma_open)
                 
-                if current_sig is None:  # FLAT - waiting for breakout entry
-                    logging.info(f"  📍 PHASE 1: Waiting for BREAKOUT ENTRY (need ALL 3 conditions):")
-                    logging.info(f"    LONG: price≥DonchianHIGH={price >= d_high} & price>WMA10={price > wma10} & ADX≥{ADX_THRESHOLD}={adx_ok} → {breakout_long}")
-                    logging.info(f"    SHORT: price≤DonchianLOW={price <= d_low} & price<WMA10={price < wma10} & ADX≥{ADX_THRESHOLD}={adx_ok} → {breakout_short}")
-                    
-                    if breakout_long:
-                        logging.info(f"    ⚡ BREAKOUT LONG signal ready!")
-                    elif breakout_short:
-                        logging.info(f"    ⚡ BREAKOUT SHORT signal ready!")
-                    else:
-                        logging.info(f"    ⏸️ WAITING: Breakout conditions not fully met")
-                        
-                else:  # IN POSITION - pullback flipping mode with 1% buffer
-                    flip_short_trigger = wma10 * 0.99
-                    flip_long_trigger = wma10 * 1.01
-                    
-                    logging.info(f"  📍 PHASE 2: In position, watching for PULLBACK FLIPS with 1% BUFFER:")
-                    logging.info(f"    FLIP to SHORT: price<{flip_short_trigger:.6f} (WMA10*0.99) & ADX≥{ADX_THRESHOLD}={adx_ok} → {pullback_short}")
-                    logging.info(f"    FLIP to LONG:  price>{flip_long_trigger:.6f} (WMA10*1.01) & ADX≥{ADX_THRESHOLD}={adx_ok} → {pullback_long}")
-                    
-                    if current_sig == "LONG" and pullback_short:
-                        logging.info(f"    ⚡ PULLBACK FLIP signal: LONG→SHORT ready!")
-                    elif current_sig == "SHORT" and pullback_long:
-                        logging.info(f"    ⚡ PULLBACK FLIP signal: SHORT→LONG ready!")
-                    else:
-                        buffer_zone = f"${flip_short_trigger:.2f} - ${flip_long_trigger:.2f}"
-                        logging.info(f"    ⏸️ HOLDING {current_sig}: Price in buffer zone ({buffer_zone}) or ADX too low")
+                logging.info(f"  Current Trend: {'UP' if trend_up else 'DOWN' if trend_down else 'FLAT'}")
+                logging.info(f"  Price Position: {'Above Both MAs' if price_above_both else 'Below Both MAs' if price_below_both else 'Between MAs'}")
+                if USE_DI and plus_di is not None and minus_di is not None:
+                    di_direction = "Bullish" if plus_di > minus_di else "Bearish" if minus_di > plus_di else "Neutral"
+                else:
+                    di_direction = "N/A"
+                logging.info(f"  DI Direction: {di_direction}")
 
         logging.info("📊 === END STATUS REPORT ===")
 
 async def trading_loop(client: AsyncClient):
-    """Main trading logic: breakout entry from FLAT, then pullback flipping forever."""
+    """Main trading logic"""
     while True:
-        await asyncio.sleep(0.1)  # 10 FPS
+        await asyncio.sleep(0.1)
 
         for symbol in SYMBOLS:
             st = state[symbol]
             if not st["ready"]:
                 continue
 
-            # Update trading signals (no-FLAT; only change on explicit long/short)
             signal_result = update_trading_signals(symbol)
 
-            # Calculate target position based on current signal
             target_size = SYMBOLS[symbol]
             current_signal = st["current_signal"]
 
@@ -503,57 +919,47 @@ async def trading_loop(client: AsyncClient):
             elif current_signal == "SHORT":
                 final_position = -target_size
             elif current_signal is None:
-                # FLAT: Only at startup, waiting for first breakout entry
                 final_position = 0.0
             else:
-                # Fallback: keep current position
                 final_position = st["current_position"]
 
-            # Execute position change only when signal changed AND target differs
             if signal_result["changed"]:
                 current_pos = st["current_position"]
                 if abs(final_position - current_pos) > 1e-12:
                     await execute_position_change(client, symbol, final_position, current_pos)
 
 async def execute_position_change(client: AsyncClient, symbol: str, target: float, current: float):
-    """Execute position changes with minimal API calls"""
+    """Execute position changes"""
     st = state[symbol]
 
-    # Dedup guard
     now = time.time()
     last_target = st.get("last_target", None)
     last_when = st.get("last_exec_ts", 0.0)
     if last_target is not None and abs(target - last_target) < 1e-12 and (now - last_when) < 2.0:
-        logging.info(f"🛡️ {symbol} dedup: skipping duplicate execution to target {target} within 2s window")
+        logging.info(f"🛡️ {symbol} dedup: skipping duplicate execution")
         return
 
     if abs(target - current) < 1e-12:
-        return  # nothing to do
+        return
 
     try:
-        # FLATTEN to zero (only if target is exactly 0.0 — won't happen from WAIT because we keep position)
         if target == 0.0:
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
                 if not ok:
-                    logging.warning(f"{symbol} flatten LONG failed; aborting")
                     return
             elif current < 0:
                 ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
                 if not ok:
-                    logging.warning(f"{symbol} flatten SHORT failed; aborting")
                     return
 
-        # TARGET LONG (>0)
         elif target > 0:
             if current < 0:
                 ok = await place_order(client, symbol, "BUY", abs(current), "SHORT CLOSE")
                 if not ok:
-                    logging.warning(f"{symbol} SHORT close failed; aborting LONG open")
                     return
                 ok = await place_order(client, symbol, "BUY", target, "LONG ENTRY")
                 if not ok:
-                    logging.warning(f"{symbol} LONG open failed after closing SHORT")
                     return
             else:
                 if target > current:
@@ -565,16 +971,13 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     if not ok:
                         return
 
-        # TARGET SHORT (<0)
-        else:  # target < 0
+        else:
             if current > 0:
                 ok = await place_order(client, symbol, "SELL", current, "LONG CLOSE")
                 if not ok:
-                    logging.warning(f"{symbol} LONG close failed; aborting SHORT open")
                     return
                 ok = await place_order(client, symbol, "SELL", abs(target), "SHORT ENTRY")
                 if not ok:
-                    logging.warning(f"{symbol} SHORT open failed after closing LONG")
                     return
             else:
                 cur_abs = abs(current)
@@ -588,137 +991,195 @@ async def execute_position_change(client: AsyncClient, symbol: str, target: floa
                     if not ok:
                         return
 
-        # update state only after successful path
         st["current_position"] = target
         st["last_target"] = target
         st["last_exec_ts"] = now
+        save_positions()
 
     except Exception as e:
         logging.error(f"❌ {symbol} position change failed: {e}")
 
-# ========================= INITIALIZATION =========================
+async def recover_positions_from_exchange(client: AsyncClient):
+    """Recover actual positions from Binance"""
+    logging.info("🔍 Checking exchange for existing positions...")
+    
+    try:
+        account_info = await safe_api_call(client.futures_account)
+        positions = account_info.get('positions', [])
+        
+        recovered_count = 0
+        for position in positions:
+            symbol = position['symbol']
+            if symbol not in SYMBOLS:
+                continue
+            
+            position_amt = float(position['positionAmt'])
+            
+            if abs(position_amt) > 0.0001:
+                recovered_count += 1
+                
+                if position_amt > 0:
+                    signal = "LONG"
+                    state[symbol]["current_position"] = SYMBOLS[symbol]
+                elif position_amt < 0:
+                    signal = "SHORT"
+                    state[symbol]["current_position"] = -SYMBOLS[symbol]
+                
+                state[symbol]["current_signal"] = signal
+                
+                entry_price = float(position['entryPrice'])
+                unrealized_pnl = float(position['unrealizedProfit'])
+                
+                logging.info(
+                    f"♻️ {symbol} RECOVERED {signal} position: "
+                    f"Amount={position_amt}, Entry={entry_price:.6f}, "
+                    f"PNL={unrealized_pnl:.2f} USDT"
+                )
+        
+        if recovered_count > 0:
+            logging.info(f"✅ Recovered {recovered_count} active positions")
+            save_positions()
+        else:
+            logging.info("✅ No active positions found")
+            
+    except Exception as e:
+        logging.error(f"❌ Position recovery failed: {e}")
+        logging.warning("⚠️ Bot will start with empty positions - verify manually!")
+
 async def init_bot(client: AsyncClient):
-    """Initialize bot with historical data fetching"""
-    logging.info("🔧 Initializing bot with safe historical data fetching...")
-    logging.info("📊 Using hardcoded precisions to avoid API calls")
-    logging.info("⚙️ Leverage must be set manually via Binance web interface")
+    """Initialize bot with historical data"""
+    logging.info("🔧 Initializing bot...")
+    logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
+    
+    if ENTRY_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            logging.info(f"📊 Entry MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}) with JMA({KAMA_JMA_SOURCE_LENGTH}) source (double-smoothing)")
+        else:
+            logging.info(f"📊 Entry MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW})")
+    else:
+        logging.info(f"📊 Entry MA: JMA(length={JMA_LENGTH_CLOSE}, phase={JMA_PHASE}, power={JMA_POWER})")
+    
+    if EXIT_MA_TYPE == "KAMA":
+        if KAMA_USE_JMA_SOURCE:
+            logging.info(f"📊 Exit MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}) with JMA({KAMA_JMA_SOURCE_LENGTH}) source (double-smoothing)")
+        else:
+            logging.info(f"📊 Exit MA: KAMA(ER={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW})")
+    else:
+        logging.info(f"📊 Exit MA: JMA(length={JMA_LENGTH_OPEN}, phase={JMA_PHASE}, power={JMA_POWER})")
+    
+    if USE_HEIKIN_ASHI:
+        logging.info("📊 Heikin Ashi: ENABLED")
+    else:
+        logging.info("📊 Heikin Ashi: DISABLED")
+    if USE_DI:
+        logging.info(f"📊 DMI: {DI_PERIODS} periods")
+    else:
+        logging.info("📊 DMI: DISABLED")
+    
+    if USE_ER_FILTER:
+        er_entry = "ENABLED" if USE_ER_FOR_ENTRY else "DISABLED"
+        er_exit = "ENABLED" if USE_ER_FOR_EXIT else "DISABLED"
+        logging.info(f"📊 ER Filter: Threshold={ER_THRESHOLD} | Entry={er_entry} | Exit={er_exit}")
+    else:
+        logging.info("📊 ER Filter: DISABLED")
+    
+    calc_mode = "REAL-TIME (includes current candle)" if USE_REALTIME_CALCULATION else "CANDLE-CLOSE (completed candles only)"
+    if USE_REALTIME_CALCULATION and REALTIME_EXIT_OVERRIDE:
+        calc_mode += " | Exit MA: ALWAYS completed candles"
+    logging.info(f"📊 Calculation Mode: {calc_mode}")
+    
+    logging.info(f"📊 Entry: {ENTRY_STRATEGY} | Exit: {EXIT_STRATEGY}")
 
-    # First, try to load existing data
     load_klines()
+    load_positions()
+    
+    await recover_positions_from_exchange(client)
 
-    # Check which symbols need historical data
     symbols_needing_data = []
     for symbol in SYMBOLS:
         klines = state[symbol]["klines"]
-        # Readiness requires Donchian+WMA10+ADX (ADX≥25)
-        d_ready  = len(klines) >= DONCHIAN_PERIODS and get_donchian_levels(symbol)[0] is not None
-        w_ready  = len(klines) >= WMA10_PERIODS and calculate_wma_close(symbol, WMA10_PERIODS) is not None
-        a_value  = calculate_adx(symbol)  # compute ADX if possible
-        a_ready  = (a_value is not None and a_value >= ADX_THRESHOLD)
+        entry_ma_ready = len(klines) >= ENTRY_MA_PERIOD and calculate_entry_ma(symbol, "close") is not None
+        exit_ma_ready = len(klines) >= EXIT_MA_PERIOD and calculate_exit_ma(symbol, "close") is not None
+        if USE_DI:
+            calculate_di(symbol)
+        di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
 
-        if d_ready and w_ready and a_ready:
+        if entry_ma_ready and exit_ma_ready and di_ready:
             state[symbol]["ready"] = True
-            wma_val = state[symbol]["wma10"]
-            logging.info(f"✅ {symbol} ready for trading ({len(klines)} candles, WMA10: {wma_val:.6f}, ADX {a_value:.1f}≥{ADX_THRESHOLD}) from loaded data")
+            logging.info(f"✅ {symbol} ready from loaded data")
         else:
             symbols_needing_data.append(symbol)
-            logging.info(f"📥 {symbol} needs historical data ({len(klines)}/{DONCHIAN_PERIODS} candles)")
 
-    # Fetch historical data for symbols that need it
     if symbols_needing_data:
         logging.info(f"🔄 Fetching historical data for {len(symbols_needing_data)} symbols...")
-        logging.info("⚠️ Using ultra-conservative rate limiting (2-minute delays between symbols)")
-
-        successful_fetches = 0
-
+        
         for i, symbol in enumerate(symbols_needing_data):
             try:
-                logging.info(f"📈 Fetching historical data for {symbol} ({i+1}/{len(symbols_needing_data)})...")
+                logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
 
+                needed_candles = max(MA_PERIODS + 100, (DI_PERIODS + 100 if USE_DI else 100))
                 klines_data = await safe_api_call(
                     client.futures_mark_price_klines,
                     symbol=symbol,
-                    interval="1m",
-                    limit=max(DONCHIAN_PERIODS, WMA10_PERIODS) + 50
+                    interval=BASE_TIMEFRAME,
+                    limit=min(needed_candles, 1500)
                 )
 
-                # Process the data
                 st = state[symbol]
                 st["klines"].clear()
 
                 for kline in klines_data:
-                    minute = int(float(kline[0]) / 1000 // 60)
+                    open_time = int(float(kline[0]) / 1000)
                     st["klines"].append({
-                        "minute": minute,
+                        "open_time": open_time,
+                        "open": float(kline[1]),
                         "high": float(kline[2]),
-                        "low":  float(kline[3]),
+                        "low": float(kline[3]),
                         "close": float(kline[4])
                     })
 
-                # Mark as ready if key indicators are available (with ADX ≥ threshold)
-                d_ok  = get_donchian_levels(symbol)[0] is not None
-                w_ok  = calculate_wma_close(symbol, WMA10_PERIODS) is not None
-                a_val = calculate_adx(symbol)
-                a_ok  = (a_val is not None and a_val >= ADX_THRESHOLD)
+                jma_close_ok = calculate_entry_ma(symbol, "close") is not None
+                exit_ma_ok = calculate_exit_ma(symbol, "close") is not None
+                if USE_DI:
+                    calculate_di(symbol)
+                di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
 
-                if d_ok and w_ok and a_ok:
+                if jma_close_ok and exit_ma_ok and di_ok:
                     st["ready"] = True
-                    logging.info(f"✅ {symbol} ready for trading ({len(st['klines'])} candles, WMA10: {st['wma10']:.6f}, ADX {a_val:.1f}≥{ADX_THRESHOLD}) from API")
-                    successful_fetches += 1
-                else:
-                    logging.warning(f"⚠️ {symbol} insufficient data received ({len(st['klines'])} candles)")
+                    logging.info(f"✅ {symbol} ready from API")
 
-                # Ultra-conservative delay between symbols
                 if i < len(symbols_needing_data) - 1:
-                    logging.info(f"⏳ Waiting 120 seconds before next symbol to avoid rate limits...")
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(15)
 
             except Exception as e:
-                logging.error(f"❌ {symbol} historical data fetch failed: {e}")
-                logging.info(f"📡 {symbol} will build data from WebSocket feed instead")
-
+                logging.error(f"❌ {symbol} fetch failed: {e}")
                 if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(120)
-
-        logging.info(f"📊 Historical data fetch complete: {successful_fetches}/{len(symbols_needing_data)} successful")
-
-        # Show final status
-        ready_count = sum(1 for symbol in SYMBOLS if state[symbol]["ready"])
-        pending_count = len(SYMBOLS) - ready_count
-
-        if ready_count > 0:
-            logging.info(f"🚀 {ready_count} symbols ready to trade immediately")
-
-        if pending_count > 0:
-            logging.info(f"⏳ {pending_count} symbols will build data from live WebSocket feed")
+                    await asyncio.sleep(15)
 
     else:
-        logging.info("🎯 All symbols ready from loaded data - no API calls needed!")
+        logging.info("🎯 All symbols ready!")
 
-    # Save the data we have
     save_klines()
-
     await asyncio.sleep(2)
-    logging.info("🚀 Initialization complete - Starting WebSocket feeds")
+    logging.info("🚀 Initialization complete")
 
-# ========================= MAIN =========================
 async def main():
     if not API_KEY or not API_SECRET:
-        raise ValueError("Missing Binance API credentials in .env")
+        raise ValueError("Missing Binance API credentials")
 
     client = await AsyncClient.create(API_KEY, API_SECRET)
 
     atexit.register(save_klines)
+    atexit.register(save_positions)
 
     try:
         await init_bot(client)
 
-        # Start three concurrent tasks
-        price_task  = asyncio.create_task(price_feed_loop(client))
-        trade_task  = asyncio.create_task(trading_loop(client))
+        price_task = asyncio.create_task(price_feed_loop(client))
+        trade_task = asyncio.create_task(trading_loop(client))
         status_task = asyncio.create_task(status_logger())
 
-        logging.info("🚀 Bot started - Price feed, Trading logic, and Status reporting active")
+        logging.info("🚀 Bot started")
 
         await asyncio.gather(price_task, trade_task, status_task)
 
@@ -733,22 +1194,42 @@ if __name__ == "__main__":
     )
 
     print("=" * 80)
-    print("🤖 BREAKOUT ENTRY → PULLBACK FLIPPING BOT (with 1% Buffer)")
+    ha_mode = "HEIKIN ASHI" if USE_HEIKIN_ASHI else "REGULAR CANDLES"
+    print(f"DUAL MA CROSS STRATEGY - {ha_mode}")
+    print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("=" * 80)
-    print("📍 PHASE 1 - BREAKOUT ENTRY (from FLAT, need ALL 3 conditions):")
-    print("   🚀 LONG:  price ≥ 20h Donchian HIGH  AND price > 10h WMA  AND ADX ≥ 25")
-    print("   🚀 SHORT: price ≤ 20h Donchian LOW   AND price < 10h WMA  AND ADX ≥ 25")
-    print("")
-    print("📍 PHASE 2 - PULLBACK FLIPPING with 1% BUFFER (need only 2 conditions):")
-    print("   🔄 LONG → SHORT: price < 10h WMA * 0.99  AND  ADX ≥ 25")
-    print("   🔄 SHORT → LONG: price > 10h WMA * 1.01  AND  ADX ≥ 25")
-    print("")
-    print("🛡️ 0.5% BUFFER prevents whipsaw - creates 'dead zone' around WMA10")
-    print("💡 STRATEGY: Strong breakout to enter, buffered pullback signals to flip")
-    print("❌ NEVER go FLAT again after first entry - always LONG or SHORT!")
-    print("⏱️ Live checks via markPrice@1s; 1m candles drive indicators")
-    print("📊 Data persistence enabled - faster restarts after first run")
-    print(f"📊 Symbols: {list(SYMBOLS.keys())}")
+    
+    if ENTRY_MA_TYPE == "KAMA":
+        kama_mode = f" [JMA({KAMA_JMA_SOURCE_LENGTH})→KAMA]" if KAMA_USE_JMA_SOURCE else ""
+        print(f"Entry MA: KAMA (ER Period={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}){kama_mode}")
+    else:
+        print(f"Entry MA: JMA (Length={JMA_LENGTH_CLOSE}, Phase={JMA_PHASE}, Power={JMA_POWER})")
+    
+    if EXIT_MA_TYPE == "KAMA":
+        kama_mode = f" [JMA({KAMA_JMA_SOURCE_LENGTH})→KAMA]" if KAMA_USE_JMA_SOURCE else ""
+        print(f"Exit MA: KAMA (ER Period={KAMA_ER_PERIOD}, Fast={KAMA_FAST}, Slow={KAMA_SLOW}){kama_mode}")
+    else:
+        print(f"Exit MA: JMA (Length={JMA_LENGTH_OPEN}, Phase={JMA_PHASE}, Power={JMA_POWER})")
+    
+    print(f"Timeframe: {BASE_TIMEFRAME} ({BASE_MINUTES} min)")
+    print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
+    print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
+    
+    if USE_ER_FILTER:
+        er_entry = "ENABLED" if USE_ER_FOR_ENTRY else "DISABLED"
+        er_exit = "ENABLED" if USE_ER_FOR_EXIT else "DISABLED"
+        print(f"ER Filter: Threshold={ER_THRESHOLD} | Entry={er_entry} | Exit={er_exit}")
+    else:
+        print("ER Filter: DISABLED")
+    
+    calc_mode = "REAL-TIME" if USE_REALTIME_CALCULATION else "CANDLE-CLOSE"
+    if USE_REALTIME_CALCULATION and REALTIME_EXIT_OVERRIDE:
+        calc_mode += " (Exit: Completed Only)"
+    print(f"Calculation Mode: {calc_mode}")
+    
+    print(f"Entry Strategy: {ENTRY_STRATEGY}")
+    print(f"Exit Strategy: {EXIT_STRATEGY}")
+    print(f"Symbols: {list(SYMBOLS.keys())}")
     print("=" * 80)
 
     asyncio.run(main())
