@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, asyncio, logging, websockets, time
+import os, json, asyncio, logging, websockets, time, traceback
 import atexit
 from binance import AsyncClient
 from collections import deque
@@ -34,7 +34,7 @@ else:
 
 # JMA parameters
 JMA_LENGTH_CLOSE = 7      # JMA period for entry MA
-JMA_LENGTH_OPEN = 40      # JMA period for trend MA
+JMA_LENGTH_OPEN = 42      # JMA period for trend MA
 JMA_PHASE = 50            # -100 to 100, controls lag vs overshoot
 JMA_POWER = 2             # Smoothness level, 1-3
 
@@ -55,13 +55,13 @@ KAMA_JMA_SOURCE_LENGTH = 7    # JMA length when using JMA as KAMA source
 # Efficiency Ratio (ER) Filter
 USE_ER_FILTER = True          # Enable/disable ER filter
 ER_THRESHOLD = 0.3            # Only trade when ER > threshold
-USE_ER_FOR_ENTRY = False       # Apply ER filter to entry signals
+USE_ER_FOR_ENTRY = True       # Apply ER filter to entry signals
 
 # Chaikin Money Flow (CMF) Filter
 USE_CMF_FILTER = True           # Enable/disable CMF filter
 CMF_PERIOD = 27                 # CMF lookback period
 CMF_THRESHOLD = 0.05            # Only trade when abs(CMF) > threshold
-USE_CMF_FOR_ENTRY = False        # Apply CMF filter to entry signals
+USE_CMF_FOR_ENTRY = True        # Apply CMF filter to entry signals
 USE_CMF_DIRECTION = True        # Only LONG when CMF > 0, SHORT when CMF < 0
 
 # Real-Time Calculation Mode
@@ -97,17 +97,17 @@ CMF_BUFFER = CMF_PERIOD if USE_CMF_FILTER else 0
 KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100, CMF_BUFFER + 100)
 
 # ENTRY STRATEGY
-ENTRY_STRATEGY = "SYMMETRIC"  # or "CROSSOVER"
+ENTRY_STRATEGY = "CROSSOVER"  # or "SYMMETRIC"
 
 # ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
         "klines": deque(maxlen=KLINE_LIMIT),
-        "long_signal": None,    # Independent LONG signal
-        "short_signal": None,   # Independent SHORT signal
-        "long_position": 0.0,   # LONG position size
-        "short_position": 0.0,  # SHORT position size
+        "long_signal": None,
+        "short_signal": None,
+        "long_position": 0.0,
+        "short_position": 0.0,
         "ma_close": None,
         "ma_open": None,
         "prev_ma_close": None,
@@ -120,10 +120,10 @@ state = {
         "efficiency_ratio": None,
         "cmf": None,
         "last_filter_block_log": 0,
-        "last_long_entry_time": 0,  # Prevent duplicate LONG entries
-        "last_short_entry_time": 0, # Prevent duplicate SHORT entries
-        "last_long_signal_log": 0,  # Prevent log spam for LONG signals
-        "last_short_signal_log": 0, # Prevent log spam for SHORT signals
+        "last_long_entry_time": 0,
+        "last_short_entry_time": 0,
+        "last_long_signal_log": 0,
+        "last_short_signal_log": 0,
     }
     for symbol in SYMBOLS
 }
@@ -229,7 +229,7 @@ def round_size(size: float, symbol: str) -> float:
     return round(size, prec)
 
 async def safe_api_call(func, *args, **kwargs):
-    """Make API call with exponential backoff"""
+    """Make API call with exponential backoff and detailed error logging"""
     global api_calls_count, api_calls_reset_time
 
     now = time.time()
@@ -240,7 +240,7 @@ async def safe_api_call(func, *args, **kwargs):
     if api_calls_count >= 10:
         wait_time = 60 - (now - api_calls_reset_time)
         if wait_time > 0:
-            logging.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+            logging.warning(f"⏳ Rate limit reached, waiting {wait_time:.1f}s")
             await asyncio.sleep(wait_time)
             api_calls_count = 0
             api_calls_reset_time = time.time()
@@ -248,23 +248,39 @@ async def safe_api_call(func, *args, **kwargs):
     for attempt in range(3):
         try:
             api_calls_count += 1
+            logging.debug(f"🔄 API call attempt {attempt + 1}/3")
             result = await func(*args, **kwargs)
+            logging.debug(f"✅ API call succeeded")
             return result
         except Exception as e:
-            if "-1003" in str(e) or "Way too many requests" in str(e):
+            error_msg = str(e)
+            logging.error(f"❌ API call failed (attempt {attempt + 1}/3): {error_msg}")
+            
+            if "-1003" in error_msg or "Way too many requests" in error_msg:
                 wait_time = (2 ** attempt) * 60
-                logging.warning(f"Rate limited, attempt {attempt+1}/3, waiting {wait_time}s")
+                logging.warning(f"⏳ Rate limited, waiting {wait_time}s before retry")
                 await asyncio.sleep(wait_time)
-            else:
+            elif "-2019" in error_msg:
+                logging.error(f"❌ INSUFFICIENT MARGIN - Check your account balance!")
                 raise e
+            elif "-4131" in error_msg:
+                logging.error(f"❌ HEDGE MODE ERROR - Hedge mode may not be enabled!")
+                raise e
+            else:
+                logging.error(f"❌ Unexpected API error: {type(e).__name__}: {error_msg}")
+                if attempt == 2:  # Last attempt
+                    raise e
+                await asyncio.sleep(2)  # Brief pause before retry
 
+    logging.error("❌ Max API retry attempts (3) reached - giving up")
     raise Exception("Max API retry attempts reached")
 
 async def place_market_order(client: AsyncClient, symbol: str, side: str, quantity: float, position_side: str):
-    """Place market order and return order result"""
+    """Place market order with detailed logging"""
     try:
         quantity = round_size(abs(quantity), symbol)
         if quantity == 0:
+            logging.error(f"❌ {symbol} {position_side} - Quantity is 0 after rounding!")
             return None
 
         params = {
@@ -275,22 +291,41 @@ async def place_market_order(client: AsyncClient, symbol: str, side: str, quanti
             "positionSide": position_side
         }
 
+        logging.info(f"🔄 {symbol} Calling Binance API: {side} {quantity} {position_side}")
+        
+        # Actually await the API call
         result = await safe_api_call(client.futures_create_order, **params)
-        logging.info(f"🚀 {symbol} {position_side} ENTRY - {side} {quantity} - OrderID: {result.get('orderId')}")
+        
+        # Check if result is None (API call failed)
+        if result is None:
+            logging.error(f"❌ {symbol} {position_side} - API call returned None")
+            return None
+        
+        # Log full response for debugging
+        order_id = result.get('orderId', 'N/A')
+        status = result.get('status', 'N/A')
+        executed_qty = result.get('executedQty', 'N/A')
+        
+        logging.info(f"✅ {symbol} {position_side} ORDER SUCCESS - ID:{order_id} Status:{status} Qty:{executed_qty}")
+        logging.info(f"📋 Full response: {json.dumps(result, indent=2)}")
+        
         return result
 
     except Exception as e:
-        logging.error(f"❌ {symbol} {position_side} ENTRY FAILED: {e}")
+        logging.error(f"❌ {symbol} {position_side} EXCEPTION CAUGHT")
+        logging.error(f"   Error type: {type(e).__name__}")
+        logging.error(f"   Error message: {str(e)}")
+        logging.error(f"   Traceback: {traceback.format_exc()}")
         return None
 
 async def place_trailing_stop(client: AsyncClient, symbol: str, position_side: str, quantity: float):
-    """Place trailing stop loss order"""
+    """Place trailing stop with detailed logging"""
     try:
         quantity = round_size(abs(quantity), symbol)
         if quantity == 0:
+            logging.error(f"❌ {symbol} {position_side} TRAILING STOP - Quantity is 0!")
             return None
 
-        # Determine side for trailing stop (opposite of position)
         side = "SELL" if position_side == "LONG" else "BUY"
 
         params = {
@@ -302,12 +337,29 @@ async def place_trailing_stop(client: AsyncClient, symbol: str, position_side: s
             "positionSide": position_side
         }
 
+        logging.info(f"🔄 {symbol} Calling Binance API: Trailing Stop {position_side} {TRAILING_STOP_CALLBACK}%")
+        
+        # Actually await the API call
         result = await safe_api_call(client.futures_create_order, **params)
-        logging.info(f"🛡️ {symbol} {position_side} TRAILING STOP placed - {TRAILING_STOP_CALLBACK}% callback - OrderID: {result.get('orderId')}")
+        
+        # Check if result is None
+        if result is None:
+            logging.error(f"❌ {symbol} {position_side} TRAILING STOP - API call returned None")
+            return None
+        
+        order_id = result.get('orderId', 'N/A')
+        status = result.get('status', 'N/A')
+        
+        logging.info(f"✅ {symbol} {position_side} TRAILING STOP SUCCESS - ID:{order_id} Status:{status}")
+        logging.info(f"📋 Full response: {json.dumps(result, indent=2)}")
+        
         return result
 
     except Exception as e:
-        logging.error(f"❌ {symbol} {position_side} TRAILING STOP FAILED: {e}")
+        logging.error(f"❌ {symbol} {position_side} TRAILING STOP EXCEPTION")
+        logging.error(f"   Error type: {type(e).__name__}")
+        logging.error(f"   Error message: {str(e)}")
+        logging.error(f"   Traceback: {traceback.format_exc()}")
         return None
 
 # ========================= INDICATOR CALCULATIONS =========================
@@ -613,11 +665,7 @@ def calculate_exit_ma(symbol: str, field: str = "close") -> Optional[float]:
 
 # ========================= SIMPLIFIED TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> dict:
-    """
-    SIMPLIFIED: Only generates ENTRY signals
-    NO exit logic - trailing stops handle all exits
-    NO flipping - LONG and SHORT are independent
-    """
+    """Only generates ENTRY signals - trailing stops handle exits"""
     st = state[symbol]
     price = st["price"]
 
@@ -640,7 +688,6 @@ def update_trading_signals(symbol: str) -> dict:
         st["prev_ma_open"] = ma_open
         return {"long_entry": False, "short_entry": False}
     
-    # Calculate conditions
     price_above_both = (price > ma_close) and (price > ma_open)
     price_below_both = (price < ma_close) and (price < ma_open)
     
@@ -652,7 +699,6 @@ def update_trading_signals(symbol: str) -> dict:
     di_bull = plus_di > minus_di if USE_DI else True
     di_bear = minus_di > plus_di if USE_DI else True
     
-    # Get filters
     efficiency_ratio = st.get("efficiency_ratio")
     er_allows = efficiency_ratio > ER_THRESHOLD if (USE_ER_FILTER and USE_ER_FOR_ENTRY and efficiency_ratio is not None) else True
 
@@ -661,11 +707,10 @@ def update_trading_signals(symbol: str) -> dict:
     cmf_allows_long = cmf > 0 if (USE_CMF_FILTER and USE_CMF_DIRECTION and cmf is not None) else True
     cmf_allows_short = cmf < 0 if (USE_CMF_FILTER and USE_CMF_DIRECTION and cmf is not None) else True
 
-    # MA type labels for logging
     entry_ma_label = "Entry_KAMA" if ENTRY_MA_TYPE == "KAMA" else "Entry_JMA"
     exit_ma_label = "Exit_KAMA" if EXIT_MA_TYPE == "KAMA" else "Exit_JMA"
 
-    # Determine entry signals
+    now = time.time()
     long_entry = False
     short_entry = False
 
@@ -673,8 +718,6 @@ def update_trading_signals(symbol: str) -> dict:
         long_entry = crossover_aligned_long and di_bull and er_allows and cmf_allows_entry and cmf_allows_long
         short_entry = crossover_aligned_short and di_bear and er_allows and cmf_allows_entry and cmf_allows_short
         
-        # Only log if signal is new or last logged >5 minutes ago (aligned with status report)
-        now = time.time()
         if long_entry and (now - st.get("last_long_signal_log", 0)) > 300:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
@@ -686,9 +729,7 @@ def update_trading_signals(symbol: str) -> dict:
             logging.info(f"🔴 {symbol} SHORT ENTRY SIGNAL (price {price:.6f} < {entry_ma_label} {ma_close:.6f} < {exit_ma_label} {ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
             st["last_short_signal_log"] = now
         elif not (er_allows and cmf_allows_entry) and (crossover_aligned_long or crossover_aligned_short):
-            # Log when filters block an entry
-            now = time.time()
-            if now - st["last_filter_block_log"] > 300:  # 5 minutes cooldown
+            if now - st["last_filter_block_log"] > 300:
                 block_reasons = []
                 if not er_allows:
                     block_reasons.append(f"ER={efficiency_ratio:.3f} < {ER_THRESHOLD}")
@@ -706,22 +747,18 @@ def update_trading_signals(symbol: str) -> dict:
         long_entry = price_above_both and di_bull and er_allows and cmf_allows_entry and cmf_allows_long
         short_entry = price_below_both and di_bear and er_allows and cmf_allows_entry and cmf_allows_short
         
-        # Only log if signal is new or last logged >5 seconds ago (prevent spam)
-        now = time.time()
-        if long_entry and (now - st.get("last_long_signal_log", 0)) > 5:
+        if long_entry and (now - st.get("last_long_signal_log", 0)) > 300:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🟢 {symbol} LONG ENTRY SIGNAL (price {price:.6f} > both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & +DI {plus_di:.4f} > -DI {minus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
             st["last_long_signal_log"] = now
-        elif short_entry and (now - st.get("last_short_signal_log", 0)) > 5:
+        elif short_entry and (now - st.get("last_short_signal_log", 0)) > 300:
             er_msg = f" & ER={efficiency_ratio:.3f}" if USE_ER_FILTER and efficiency_ratio is not None else ""
             cmf_msg = f" & CMF={cmf:.3f}" if USE_CMF_FILTER and cmf is not None else ""
             logging.info(f"🔴 {symbol} SHORT ENTRY SIGNAL (price {price:.6f} < both MAs: {entry_ma_label}={ma_close:.6f}, {exit_ma_label}={ma_open:.6f}" + (f" & -DI {minus_di:.4f} > +DI {plus_di:.4f}" if USE_DI else "") + er_msg + cmf_msg + ")")
             st["last_short_signal_log"] = now
         elif not (er_allows and cmf_allows_entry) and (price_above_both or price_below_both):
-            # Log when filters block an entry
-            now = time.time()
-            if now - st["last_filter_block_log"] > 300:  # 5 minutes cooldown
+            if now - st["last_filter_block_log"] > 300:
                 block_reasons = []
                 if not er_allows:
                     block_reasons.append(f"ER={efficiency_ratio:.3f} < {ER_THRESHOLD}")
@@ -884,9 +921,9 @@ async def status_logger():
         logging.info("📊 === END STATUS REPORT ===")
 
 async def trading_loop(client: AsyncClient):
-    """Main trading logic - ENTRY ONLY, exits handled by trailing stops"""
+    """Main trading logic - ENTRY ONLY"""
     while True:
-        await asyncio.sleep(1)  # Check every 1 second (was 0.1 - too fast)
+        await asyncio.sleep(1)
 
         for symbol in SYMBOLS:
             st = state[symbol]
@@ -898,35 +935,73 @@ async def trading_loop(client: AsyncClient):
             now = time.time()
             position_size = SYMBOLS[symbol]
 
-            # Handle LONG entry
             if signals["long_entry"]:
-                # Duplicate prevention: Only enter if no existing position AND 60 seconds since last entry
                 if st["long_position"] == 0 and (now - st["last_long_entry_time"]) > 60:
-                    # Place LONG market order
+                    logging.info(f"🎯 {symbol} LONG CONDITIONS MET - Executing entry...")
+                    logging.info(f"   Current LONG position: {st['long_position']}")
+                    logging.info(f"   Time since last entry: {now - st['last_long_entry_time']:.1f}s")
+                    
                     result = await place_market_order(client, symbol, "BUY", position_size, "LONG")
+                    
                     if result:
+                        logging.info(f"✅ {symbol} LONG ORDER CONFIRMED - Updating state")
                         st["long_position"] = position_size
                         st["long_signal"] = "LONG"
                         st["last_long_entry_time"] = now
                         
-                        # Place trailing stop
-                        await place_trailing_stop(client, symbol, "LONG", position_size)
+                        await asyncio.sleep(0.5)
+                        
+                        logging.info(f"🛡️ {symbol} Now placing trailing stop...")
+                        trailing_result = await place_trailing_stop(client, symbol, "LONG", position_size)
+                        
+                        if trailing_result:
+                            logging.info(f"✅ {symbol} LONG ENTRY COMPLETE (order + trailing stop)")
+                        else:
+                            logging.error(f"⚠️ {symbol} LONG entry successful but TRAILING STOP FAILED!")
+                        
                         save_positions()
+                    else:
+                        logging.error(f"❌ {symbol} LONG entry FAILED - Market order returned None")
+                else:
+                    # Log why entry was skipped
+                    if st["long_position"] != 0:
+                        logging.debug(f"⏭️ {symbol} LONG entry skipped - already have position: {st['long_position']}")
+                    elif (now - st["last_long_entry_time"]) <= 60:
+                        logging.debug(f"⏭️ {symbol} LONG entry skipped - cooldown active ({60 - (now - st['last_long_entry_time']):.1f}s remaining)")
 
-            # Handle SHORT entry
             if signals["short_entry"]:
-                # Duplicate prevention: Only enter if no existing position AND 60 seconds since last entry
                 if st["short_position"] == 0 and (now - st["last_short_entry_time"]) > 60:
-                    # Place SHORT market order
+                    logging.info(f"🎯 {symbol} SHORT CONDITIONS MET - Executing entry...")
+                    logging.info(f"   Current SHORT position: {st['short_position']}")
+                    logging.info(f"   Time since last entry: {now - st['last_short_entry_time']:.1f}s")
+                    
                     result = await place_market_order(client, symbol, "SELL", position_size, "SHORT")
+                    
                     if result:
+                        logging.info(f"✅ {symbol} SHORT ORDER CONFIRMED - Updating state")
                         st["short_position"] = position_size
                         st["short_signal"] = "SHORT"
                         st["last_short_entry_time"] = now
                         
-                        # Place trailing stop
-                        await place_trailing_stop(client, symbol, "SHORT", position_size)
+                        await asyncio.sleep(0.5)
+                        
+                        logging.info(f"🛡️ {symbol} Now placing trailing stop...")
+                        trailing_result = await place_trailing_stop(client, symbol, "SHORT", position_size)
+                        
+                        if trailing_result:
+                            logging.info(f"✅ {symbol} SHORT ENTRY COMPLETE (order + trailing stop)")
+                        else:
+                            logging.error(f"⚠️ {symbol} SHORT entry successful but TRAILING STOP FAILED!")
+                        
                         save_positions()
+                    else:
+                        logging.error(f"❌ {symbol} SHORT entry FAILED - Market order returned None")
+                else:
+                    # Log why entry was skipped
+                    if st["short_position"] != 0:
+                        logging.debug(f"⏭️ {symbol} SHORT entry skipped - already have position: {st['short_position']}")
+                    elif (now - st["last_short_entry_time"]) <= 60:
+                        logging.debug(f"⏭️ {symbol} SHORT entry skipped - cooldown active ({60 - (now - st['last_short_entry_time']):.1f}s remaining)")
 
 async def recover_positions_from_exchange(client: AsyncClient):
     """Recover actual positions from Binance"""
@@ -977,7 +1052,6 @@ async def recover_positions_from_exchange(client: AsyncClient):
 async def enable_hedge_mode(client: AsyncClient):
     """Enable hedge mode (both LONG and SHORT positions simultaneously)"""
     try:
-        # Check current position mode
         position_mode = await safe_api_call(client.futures_get_position_mode)
         dual_side = position_mode.get('dualSidePosition', False)
         
@@ -998,7 +1072,6 @@ async def init_bot(client: AsyncClient):
     logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
     logging.info(f"📊 Trailing Stop: {TRAILING_STOP_CALLBACK}% callback rate")
     
-    # Enable hedge mode first
     await enable_hedge_mode(client)
     
     if ENTRY_MA_TYPE == "KAMA":
