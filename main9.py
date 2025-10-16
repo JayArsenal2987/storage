@@ -430,7 +430,7 @@ async def trading_loop(client: AsyncClient):
 
 async def status_logger():
     """5-minute status report"""
-    await asyncio.sleep(300)  # Wait 5 minutes before first report
+    await asyncio.sleep(120)  # Wait 5 minutes before first report
     
     while True:
         current_time = time.strftime("%H:%M", time.localtime())
