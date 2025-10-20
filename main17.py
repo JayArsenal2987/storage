@@ -5,6 +5,7 @@ from binance import AsyncClient
 from collections import deque
 from typing import Optional
 from dotenv import load_dotenv
+import numpy as np
 
 # ========================= CONFIG =========================
 load_dotenv()
@@ -203,6 +204,40 @@ def load_positions():
         logging.info("💾 No positions.json found - all symbols starting fresh")
     except Exception as e:
         logging.error(f"❌ Failed to load positions: {e} - all symbols starting fresh")
+
+def kalman_filter(prices, R=0.01**2):
+    """
+    Apply a 1D Kalman Filter to a series of prices.
+    - R: Measurement noise covariance (tune this value)
+    - Returns: A smoothed series of prices
+    """
+    n_iter = len(prices)
+    sz = (n_iter,)
+
+    # Allocate space for arrays
+    xhat = np.zeros(sz)      # a posteriori estimate of x
+    P = np.zeros(sz)         # a posteriori error estimate
+    xhatminus = np.zeros(sz) # a priori estimate of x
+    Pminus = np.zeros(sz)    # a priori error estimate
+    K = np.zeros(sz)         # gain or blending factor
+
+    Q = 1e-5 # Process noise covariance
+
+    # Initial guesses
+    xhat[0] = prices[0]
+    P[0] = 1.0
+
+    for k in range(1, n_iter):
+        # Time update
+        xhatminus[k] = xhat[k-1]
+        Pminus[k] = P[k-1] + Q
+
+        # Measurement update
+        K[k] = Pminus[k] / (Pminus[k] + R)
+        xhat[k] = xhatminus[k] + K[k] * (prices[k] - xhatminus[k])
+        P[k] = (1 - K[k]) * Pminus[k]
+
+    return xhat
 
 # ========================= HEIKIN ASHI TRANSFORMATION =========================
 def convert_to_heikin_ashi(candles: list, symbol: str) -> list:
@@ -419,8 +454,12 @@ def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: 
     if USE_HEIKIN_ASHI:
         completed = convert_to_heikin_ashi(completed, symbol)
 
-    values = [k.get(field, None) for k in completed]
-    if None in values:
+    # Kalman Filter integration
+    raw_prices = [k.get(field, 0) for k in completed]
+    kalman_prices = kalman_filter(raw_prices)
+    values = kalman_prices.tolist()
+
+    if not values:
         return None
 
     phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
@@ -505,7 +544,7 @@ def calculate_di(symbol: str) -> Optional[float]:
     state[symbol]["di_ready"] = True
     return None
 
-def calculate_efficiency_ratio(symbol: str) -> Optional[float]:
+def calculate_kaufman_er(symbol: str) -> Optional[float]:
     """
     Efficiency Ratio (ER) by Perry Kaufman
     Measures trending vs choppy markets
@@ -562,33 +601,37 @@ def update_trading_signals(symbol: str) -> dict:
     if price is None or not st["ready"]:
         return result
 
-    # Calculate JMA Ribbon: HIGH (upper band), LOW (lower band), CLOSE (signal)
-    jma_high = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER)
-    jma_low = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER)
+    # TAMA Calculation
+    klines = list(st["klines"])
+    raw_prices = [k['close'] for k in klines]
+    kalman_prices = kalman_filter(raw_prices)
+
+    # Ensure jma_close is calculated with Kalman output
     jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
     
+    if jma_close is None:
+        return result
+
+    er = calculate_kaufman_er(symbol)
+    if er is None:
+        er = 0.5 # Default to a neutral value if not available
+
+    # Final TAMA output
+    alpha = 2 / (JMA_LENGTH_CLOSE + 1) # Standard EMA alpha for weighting
+    tama = jma_close + alpha * er * (kalman_prices[-1] - jma_close)
+
     if USE_DI:
         calculate_di(symbol)
-    
-    if USE_ER:
-        calculate_efficiency_ratio(symbol)
 
-    if jma_high is None or jma_low is None or jma_close is None:
-        return result
-    
     if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
         return result
-    
+
     if USE_ER and st["efficiency_ratio"] is None:
         return result
 
-    prev_jma_high = st["prev_jma_high"]
-    prev_jma_low = st["prev_jma_low"]
     prev_jma_close = st["prev_jma_close"]
 
-    if prev_jma_high is None or prev_jma_low is None or prev_jma_close is None:
-        st["prev_jma_high"] = jma_high
-        st["prev_jma_low"] = jma_low
+    if prev_jma_close is None:
         st["prev_jma_close"] = jma_close
         return result
 
@@ -605,56 +648,21 @@ def update_trading_signals(symbol: str) -> dict:
         # Market too choppy - no entries
         return result
 
-    # CROSSOVER STRATEGY: JMA close crosses through ribbon bands
-    if ENTRY_STRATEGY == "CROSSOVER":
-        # LONG: JMA close crosses above JMA high (upper band)
-        cross_above_high = (jma_close > jma_high) and (prev_jma_close <= prev_jma_high)
-        
-        # SHORT: JMA close crosses below JMA low (lower band)
-        cross_below_low = (jma_close < jma_low) and (prev_jma_close >= prev_jma_low)
-        
-        # Additional alignment checks
-        aligned_long = (price > jma_close) and (jma_close > jma_high)
-        aligned_short = (price < jma_close) and (jma_close < jma_low)
-        
-        if st["long_position"] == 0:
-            if (cross_above_high or aligned_long) and (di_bull if USE_DI else True):
-                result["long_entry"] = True
-                er_str = f", ER={er:.3f}" if USE_ER else ""
-                di_str = f", +DI={plus_di:.4f}>{minus_di:.4f}" if USE_DI else ""
-                logging.info(f"🟢 {symbol} ENTRY LONG (CROSSOVER: price={price:.6f}, close_JMA={jma_close:.6f}, high_JMA={jma_high:.6f}{di_str}{er_str})")
-        
-        if st["short_position"] == 0:
-            if (cross_below_low or aligned_short) and (di_bear if USE_DI else True):
-                result["short_entry"] = True
-                er_str = f", ER={er:.3f}" if USE_ER else ""
-                di_str = f", -DI={minus_di:.4f}>{plus_di:.4f}" if USE_DI else ""
-                logging.info(f"🟢 {symbol} ENTRY SHORT (CROSSOVER: price={price:.6f}, close_JMA={jma_close:.6f}, low_JMA={jma_low:.6f}{di_str}{er_str})")
-    
-    # SYMMETRIC STRATEGY: Price breaks above/below ribbon bands
-    elif ENTRY_STRATEGY == "SYMMETRIC":
-        # LONG: Price above both HIGH and LOW bands
-        price_above_ribbon = (price > jma_high) and (price > jma_low)
-        
-        # SHORT: Price below both HIGH and LOW bands
-        price_below_ribbon = (price < jma_high) and (price < jma_low)
-        
-        if st["long_position"] == 0:
-            if price_above_ribbon and (di_bull if USE_DI else True):
-                result["long_entry"] = True
-                er_str = f", ER={er:.3f}" if USE_ER else ""
-                di_str = f", +DI={plus_di:.4f}>{minus_di:.4f}" if USE_DI else ""
-                logging.info(f"🟢 {symbol} ENTRY LONG (SYMMETRIC: price={price:.6f} > high_JMA={jma_high:.6f} & low_JMA={jma_low:.6f}{di_str}{er_str})")
-        
-        if st["short_position"] == 0:
-            if price_below_ribbon and (di_bear if USE_DI else True):
-                result["short_entry"] = True
-                er_str = f", ER={er:.3f}" if USE_ER else ""
-                di_str = f", -DI={minus_di:.4f}>{plus_di:.4f}" if USE_DI else ""
-                logging.info(f"🟢 {symbol} ENTRY SHORT (SYMMETRIC: price={price:.6f} < high_JMA={jma_high:.6f} & low_JMA={jma_low:.6f}{di_str}{er_str})")
+    # Trading logic using TAMA
+    if st["long_position"] == 0:
+        if price > tama and (di_bull if USE_DI else True):
+            result["long_entry"] = True
+            er_str = f", ER={er:.3f}" if USE_ER else ""
+            di_str = f", +DI={plus_di:.4f}>{minus_di:.4f}" if USE_DI else ""
+            logging.info(f"🟢 {symbol} ENTRY LONG (TAMA: price={price:.6f} > tama={tama:.6f}{di_str}{er_str})")
 
-    st["prev_jma_high"] = jma_high
-    st["prev_jma_low"] = jma_low
+    if st["short_position"] == 0:
+        if price < tama and (di_bear if USE_DI else True):
+            result["short_entry"] = True
+            er_str = f", ER={er:.3f}" if USE_ER else ""
+            di_str = f", -DI={minus_di:.4f}>{plus_di:.4f}" if USE_DI else ""
+            logging.info(f"🟢 {symbol} ENTRY SHORT (TAMA: price={price:.6f} < tama={tama:.6f}{di_str}{er_str})")
+
     st["prev_jma_close"] = jma_close
 
     return result
@@ -703,7 +711,7 @@ async def price_feed_loop(client: AsyncClient):
                                     if USE_DI:
                                         calculate_di(symbol)
                                     if USE_ER:
-                                        calculate_efficiency_ratio(symbol)
+                                        calculate_kaufman_er(symbol)
                                     
                                     di_ok = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
                                     er_ok = (not USE_ER) or (state[symbol]["efficiency_ratio"] is not None)
@@ -717,7 +725,7 @@ async def price_feed_loop(client: AsyncClient):
                                     if USE_DI:
                                         calculate_di(symbol)
                                     if USE_ER:
-                                        calculate_efficiency_ratio(symbol)
+                                         calculate_kaufman_er(symbol)
 
                     except Exception as e:
                         logging.warning(f"Price processing error: {e}")
@@ -1044,7 +1052,7 @@ async def init_bot(client: AsyncClient):
         if USE_DI:
             calculate_di(symbol)
         if USE_ER:
-            calculate_efficiency_ratio(symbol)
+            calculate_kaufman_er(symbol)
         di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
         er_ready = (not USE_ER) or (state[symbol]["efficiency_ratio"] is not None)
 
