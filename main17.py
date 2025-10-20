@@ -12,9 +12,6 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
-DI_PERIODS = int(os.getenv("DI_PERIODS", "10"))
-USE_DI = False  # Toggle DMI indicator
-USE_HEIKIN_ASHI = False  # Toggle Heikin Ashi candles
 USE_LIVE_CANDLE = True  # Toggle real-time JMA calculation
 
 # Efficiency Ratio (Kaufman) - Filters choppy markets
@@ -66,11 +63,6 @@ MA_PERIODS = max(JMA_LENGTH_HIGH, JMA_LENGTH_LOW, JMA_LENGTH_CLOSE)
 ER_PERIODS_NEEDED = ER_PERIODS if USE_ER else 0
 KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100, ER_PERIODS_NEEDED + 100)
 
-# ENTRY STRATEGY TOGGLE
-ENTRY_STRATEGY = "SYMMETRIC"  # or "SYMMETRIC"
-# CROSSOVER: JMA close crosses through ribbon (high/low bands)
-# SYMMETRIC: Price breaks above/below ribbon bands
-
 # ========================= STATE =========================
 state = {
     symbol: {
@@ -82,14 +74,9 @@ state = {
         "prev_jma_high": None,
         "prev_jma_low": None,
         "prev_jma_close": None,
-        "plus_di": None,
-        "minus_di": None,
-        "di_ready": False,
         "efficiency_ratio": None,
         "er_ready": False,
         "ready": False,
-        "ha_prev_close": None,
-        "ha_prev_open": None,
         # LONG position tracking
         "long_position": 0.0,
         "long_trailing_stop_price": None,
@@ -238,43 +225,6 @@ def kalman_filter(prices, R=0.01**2):
         P[k] = (1 - K[k]) * Pminus[k]
 
     return xhat
-
-# ========================= HEIKIN ASHI TRANSFORMATION =========================
-def convert_to_heikin_ashi(candles: list, symbol: str) -> list:
-    """Convert regular candles to Heikin Ashi candles"""
-    if not candles or not USE_HEIKIN_ASHI:
-        return candles
-    
-    ha_candles = []
-    prev_ha_open = state[symbol].get("ha_prev_open")
-    prev_ha_close = state[symbol].get("ha_prev_close")
-    
-    for i, candle in enumerate(candles):
-        ha_close = (candle["open"] + candle["high"] + candle["low"] + candle["close"]) / 4
-        
-        if i == 0 and prev_ha_open is not None and prev_ha_close is not None:
-            ha_open = (prev_ha_open + prev_ha_close) / 2
-        elif i == 0:
-            ha_open = (candle["open"] + candle["close"]) / 2
-        else:
-            ha_open = (ha_candles[i-1]["open"] + ha_candles[i-1]["close"]) / 2
-        
-        ha_high = max(candle["high"], ha_open, ha_close)
-        ha_low = min(candle["low"], ha_open, ha_close)
-        
-        ha_candles.append({
-            "open_time": candle["open_time"],
-            "open": ha_open,
-            "high": ha_high,
-            "low": ha_low,
-            "close": ha_close
-        })
-    
-    if ha_candles:
-        state[symbol]["ha_prev_open"] = ha_candles[-1]["open"]
-        state[symbol]["ha_prev_close"] = ha_candles[-1]["close"]
-    
-    return ha_candles
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
@@ -451,9 +401,6 @@ def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: 
     if len(completed) < length:
         return None
 
-    if USE_HEIKIN_ASHI:
-        completed = convert_to_heikin_ashi(completed, symbol)
-
     # Kalman Filter integration
     raw_prices = [k.get(field, 0) for k in completed]
     kalman_prices = kalman_filter(raw_prices)
@@ -479,71 +426,6 @@ def calculate_jma(symbol: str, field: str, length: int, phase: int = 50, power: 
 
     return jma
 
-def calculate_true_range(high1: float, low1: float, close0: float) -> float:
-    tr1 = high1 - low1
-    tr2 = abs(high1 - close0)
-    tr3 = abs(low1 - close0)
-    return max(tr1, tr2, tr3)
-
-def calculate_directional_movement(high1: float, high0: float, low1: float, low0: float) -> tuple:
-    up_move = high1 - high0
-    down_move = low0 - low1
-    plus_dm  = up_move if (up_move > down_move and up_move > 0) else 0
-    minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
-    return plus_dm, minus_dm
-
-def calculate_di(symbol: str) -> Optional[float]:
-    """DI calculation"""
-    klines = list(state[symbol]["klines"])
-    
-    if USE_HEIKIN_ASHI:
-        klines = convert_to_heikin_ashi(klines, symbol)
-    
-    if USE_LIVE_CANDLE:
-        completed = klines
-    else:
-        completed = klines[:-1]
-    
-    if len(completed) < DI_PERIODS + 1:
-        return None
-
-    tr_values = []
-    plus_dm_values = []
-    minus_dm_values = []
-    for i in range(1, len(completed)):
-        cur = completed[i]
-        prev = completed[i - 1]
-        tr = calculate_true_range(cur["high"], cur["low"], prev["close"])
-        tr_values.append(tr)
-        plus_dm, minus_dm = calculate_directional_movement(cur["high"], prev["high"], cur["low"], prev["low"])
-        plus_dm_values.append(plus_dm)
-        minus_dm_values.append(minus_dm)
-
-    if len(tr_values) < DI_PERIODS:
-        return None
-
-    alpha = 1.0 / DI_PERIODS
-
-    sm_tr = sum(tr_values[:DI_PERIODS]) / DI_PERIODS
-    sm_pdm = sum(plus_dm_values[:DI_PERIODS]) / DI_PERIODS
-    sm_mdm = sum(minus_dm_values[:DI_PERIODS]) / DI_PERIODS
-
-    for i in range(DI_PERIODS, len(tr_values)):
-        sm_tr = alpha * tr_values[i] + (1 - alpha) * sm_tr
-        sm_pdm = alpha * plus_dm_values[i] + (1 - alpha) * sm_pdm
-        sm_mdm = alpha * minus_dm_values[i] + (1 - alpha) * sm_mdm
-
-    if sm_tr == 0:
-        return None
-
-    plus_di  = (sm_pdm / sm_tr) * 100
-    minus_di = (sm_mdm / sm_tr) * 100
-
-    state[symbol]["plus_di"] = plus_di
-    state[symbol]["minus_di"] = minus_di
-    state[symbol]["di_ready"] = True
-    return None
-
 def calculate_kaufman_er(symbol: str) -> Optional[float]:
     """
     Efficiency Ratio (ER) by Perry Kaufman
@@ -552,9 +434,6 @@ def calculate_kaufman_er(symbol: str) -> Optional[float]:
     Range: 0.0 (choppy) to 1.0 (strong trend)
     """
     klines = list(state[symbol]["klines"])
-    
-    if USE_HEIKIN_ASHI:
-        klines = convert_to_heikin_ashi(klines, symbol)
     
     if USE_LIVE_CANDLE:
         completed = klines
@@ -602,11 +481,6 @@ def update_trading_signals(symbol: str) -> dict:
         return result
 
     # TAMA Calculation
-    klines = list(st["klines"])
-    raw_prices = [k['close'] for k in klines]
-    kalman_prices = kalman_filter(raw_prices)
-
-    # Ensure jma_close is calculated with Kalman output
     jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
     
     if jma_close is None:
@@ -617,14 +491,11 @@ def update_trading_signals(symbol: str) -> dict:
         er = 0.5 # Default to a neutral value if not available
 
     # Final TAMA output
-    alpha = 2 / (JMA_LENGTH_CLOSE + 1) # Standard EMA alpha for weighting
+    alpha = 2 / (JMA_LENGTH_CLOSE + 1)
+    klines = list(st["klines"])
+    raw_prices = [k['close'] for k in klines]
+    kalman_prices = kalman_filter(raw_prices)
     tama = jma_close + alpha * er * (kalman_prices[-1] - jma_close)
-
-    if USE_DI:
-        calculate_di(symbol)
-
-    if USE_DI and (st["plus_di"] is None or st["minus_di"] is None):
-        return result
 
     if USE_ER and st["efficiency_ratio"] is None:
         return result
@@ -635,11 +506,6 @@ def update_trading_signals(symbol: str) -> dict:
         st["prev_jma_close"] = jma_close
         return result
 
-    plus_di = st["plus_di"]
-    minus_di = st["minus_di"]
-    di_bull = plus_di > minus_di if USE_DI else True
-    di_bear = minus_di > plus_di if USE_DI else True
-    
     # Efficiency Ratio filter - only trade in trending markets
     er = st["efficiency_ratio"]
     er_allows_trading = (er >= ER_THRESHOLD) if USE_ER else True
@@ -650,18 +516,16 @@ def update_trading_signals(symbol: str) -> dict:
 
     # Trading logic using TAMA
     if st["long_position"] == 0:
-        if price > tama and (di_bull if USE_DI else True):
+        if price > tama:
             result["long_entry"] = True
             er_str = f", ER={er:.3f}" if USE_ER else ""
-            di_str = f", +DI={plus_di:.4f}>{minus_di:.4f}" if USE_DI else ""
-            logging.info(f"🟢 {symbol} ENTRY LONG (TAMA: price={price:.6f} > tama={tama:.6f}{di_str}{er_str})")
+            logging.info(f"🟢 {symbol} ENTRY LONG (TAMA: price={price:.6f} > tama={tama:.6f}{er_str})")
 
     if st["short_position"] == 0:
-        if price < tama and (di_bear if USE_DI else True):
+        if price < tama:
             result["short_entry"] = True
             er_str = f", ER={er:.3f}" if USE_ER else ""
-            di_str = f", -DI={minus_di:.4f}>{plus_di:.4f}" if USE_DI else ""
-            logging.info(f"🟢 {symbol} ENTRY SHORT (TAMA: price={price:.6f} < tama={tama:.6f}{di_str}{er_str})")
+            logging.info(f"🟢 {symbol} ENTRY SHORT (TAMA: price={price:.6f} < tama={tama:.6f}{er_str})")
 
     st["prev_jma_close"] = jma_close
 
@@ -708,22 +572,16 @@ async def price_feed_loop(client: AsyncClient):
                                     jma_high = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER)
                                     jma_low = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER)
                                     jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-                                    if USE_DI:
-                                        calculate_di(symbol)
                                     if USE_ER:
                                         calculate_kaufman_er(symbol)
                                     
-                                    di_ok = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
                                     er_ok = (not USE_ER) or (state[symbol]["efficiency_ratio"] is not None)
                                     
-                                    if (jma_high is not None) and (jma_low is not None) and (jma_close is not None) and di_ok and er_ok:
+                                    if (jma_high is not None) and (jma_low is not None) and (jma_close is not None) and er_ok:
                                         state[symbol]["ready"] = True
-                                        ha_status = " (Heikin Ashi)" if USE_HEIKIN_ASHI else ""
                                         candle_mode = " [LIVE]" if USE_LIVE_CANDLE else " [COMPLETED]"
-                                        logging.info(f"✅ {symbol} ready - JMA Ribbon initialized{ha_status}{candle_mode}")
+                                        logging.info(f"✅ {symbol} ready - JMA Ribbon initialized{candle_mode}")
                                 else:
-                                    if USE_DI:
-                                        calculate_di(symbol)
                                     if USE_ER:
                                          calculate_kaufman_er(symbol)
 
@@ -754,15 +612,9 @@ async def status_logger():
 
             price = st["price"]
             jma_high = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER)
-            jma_low = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER)
             jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
 
-            if price and jma_high and jma_low and jma_close:
-                ribbon_width = jma_high - jma_low
-                ribbon_pct = (ribbon_width / price) * 100
-                
-                plus_di_str = f"{st['plus_di']:.4f}" if USE_DI and st.get("plus_di") else "N/A"
-                minus_di_str = f"{st['minus_di']:.4f}" if USE_DI and st.get("minus_di") else "N/A"
+            if price and jma_close:
                 er_str = f"{st['efficiency_ratio']:.3f}" if USE_ER and st.get("efficiency_ratio") else "N/A"
                 er_status = ""
                 if USE_ER and st.get("efficiency_ratio"):
@@ -772,8 +624,7 @@ async def status_logger():
                         er_status = " ⚠️ CHOPPY"
 
                 logging.info(f"{symbol}: Price={price:.6f}")
-                logging.info(f"  Ribbon: HIGH={jma_high:.6f} | LOW={jma_low:.6f} | Width={ribbon_width:.6f} ({ribbon_pct:.3f}%)")
-                logging.info(f"  Close_JMA={jma_close:.6f} | +DI={plus_di_str} | -DI={minus_di_str} | ER={er_str}{er_status}")
+                logging.info(f"  TAMA={jma_close:.6f} | ER={er_str}{er_status}")
                 
                 # Show positions
                 long_status = f"LONG: {st['long_position']}" if st['long_position'] > 0 else "LONG: None"
@@ -1008,10 +859,6 @@ async def init_bot(client: AsyncClient):
     logging.info(f"🛡️ Protection: 2-second duplicate prevention PER SYMBOL")
     logging.info(f"🔍 Diagnostics: Enhanced logging + automatic stop recovery PER SYMBOL")
     
-    if USE_HEIKIN_ASHI:
-        logging.info("📊 Heikin Ashi: ENABLED")
-    if USE_DI:
-        logging.info(f"📊 DMI: {DI_PERIODS} periods")
     if USE_ER:
         logging.info(f"📊 Efficiency Ratio (Kaufman): {ER_PERIODS} periods, threshold={ER_THRESHOLD} (filters choppy markets)")
 
@@ -1049,14 +896,11 @@ async def init_bot(client: AsyncClient):
         jma_high_ready = len(klines) >= JMA_LENGTH_HIGH and calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER) is not None
         jma_low_ready = len(klines) >= JMA_LENGTH_LOW and calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER) is not None
         jma_close_ready = len(klines) >= JMA_LENGTH_CLOSE and calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER) is not None
-        if USE_DI:
-            calculate_di(symbol)
         if USE_ER:
             calculate_kaufman_er(symbol)
-        di_ready = (not USE_DI) or (state[symbol]["plus_di"] is not None and state[symbol]["minus_di"] is not None)
         er_ready = (not USE_ER) or (state[symbol]["efficiency_ratio"] is not None)
 
-        if jma_high_ready and jma_low_ready and jma_close_ready and di_ready and er_ready:
+        if jma_high_ready and jma_low_ready and jma_close_ready and er_ready:
             state[symbol]["ready"] = True
             logging.info(f"✅ {symbol} ready from loaded data")
         else:
@@ -1093,14 +937,11 @@ async def init_bot(client: AsyncClient):
                 jma_high_ok = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER) is not None
                 jma_low_ok = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER) is not None
                 jma_close_ok = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER) is not None
-                if USE_DI:
-                    calculate_di(symbol)
                 if USE_ER:
-                    calculate_efficiency_ratio(symbol)
-                di_ok = (not USE_DI) or (st["plus_di"] is not None and st["minus_di"] is not None)
+                    calculate_kaufman_er(symbol)
                 er_ok = (not USE_ER) or (st["efficiency_ratio"] is not None)
 
-                if jma_high_ok and jma_low_ok and jma_close_ok and di_ok and er_ok:
+                if jma_high_ok and jma_low_ok and jma_close_ok and er_ok:
                     st["ready"] = True
                     logging.info(f"✅ {symbol} ready from API")
 
@@ -1170,8 +1011,6 @@ if __name__ == "__main__":
     print(f"  - Warns when stops are missing for specific symbols")
     print(f"  - Auto-reinitializes missing stops per symbol")
     print(f"  - Forces display of all stop states per symbol")
-    print(f"Heikin Ashi: {'ENABLED' if USE_HEIKIN_ASHI else 'DISABLED'}")
-    print(f"DMI: {'ENABLED (' + str(DI_PERIODS) + ' periods)' if USE_DI else 'DISABLED'}")
     print(f"Efficiency Ratio (Kaufman): {'ENABLED (periods=' + str(ER_PERIODS) + ', threshold=' + str(ER_THRESHOLD) + ')' if USE_ER else 'DISABLED'}")
     print(f"Exit: TRAILING STOP ONLY (no strategy exits)")
     print("=" * 80)
