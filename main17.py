@@ -63,6 +63,11 @@ MA_PERIODS = max(JMA_LENGTH_HIGH, JMA_LENGTH_LOW, JMA_LENGTH_CLOSE)
 ER_PERIODS_NEEDED = ER_PERIODS if USE_ER else 0
 KLINE_LIMIT = max(DI_PERIODS + 100 if USE_DI else 100, MA_PERIODS + 100, ER_PERIODS_NEEDED + 100)
 
+# ENTRY STRATEGY TOGGLE
+ENTRY_STRATEGY = "SYMMETRIC"  # or "SYMMETRIC"
+# CROSSOVER: JMA close crosses through ribbon (high/low bands)
+# SYMMETRIC: Price breaks above/below ribbon bands
+
 # ========================= STATE =========================
 state = {
     symbol: {
@@ -74,6 +79,9 @@ state = {
         "prev_jma_high": None,
         "prev_jma_low": None,
         "prev_jma_close": None,
+        "prev_tama_high": None,
+        "prev_tama_low": None,
+        "prev_tama_close": None,
         "efficiency_ratio": None,
         "er_ready": False,
         "ready": False,
@@ -481,21 +489,31 @@ def update_trading_signals(symbol: str) -> dict:
         return result
 
     # TAMA Calculation
+    jma_high = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER)
+    jma_low = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER)
     jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
-    
-    if jma_close is None:
+
+    if jma_high is None or jma_low is None or jma_close is None:
         return result
 
     er = calculate_kaufman_er(symbol)
     if er is None:
-        er = 0.5 # Default to a neutral value if not available
+        er = 0.5
 
-    # Final TAMA output
     alpha = 2 / (JMA_LENGTH_CLOSE + 1)
     klines = list(st["klines"])
-    raw_prices = [k['close'] for k in klines]
-    kalman_prices = kalman_filter(raw_prices)
-    tama = jma_close + alpha * er * (kalman_prices[-1] - jma_close)
+
+    raw_high_prices = [k['high'] for k in klines]
+    kalman_high_prices = kalman_filter(raw_high_prices)
+    tama_high = jma_high + alpha * er * (kalman_high_prices[-1] - jma_high)
+
+    raw_low_prices = [k['low'] for k in klines]
+    kalman_low_prices = kalman_filter(raw_low_prices)
+    tama_low = jma_low + alpha * er * (kalman_low_prices[-1] - jma_low)
+
+    raw_close_prices = [k['close'] for k in klines]
+    kalman_close_prices = kalman_filter(raw_close_prices)
+    tama_close = jma_close + alpha * er * (kalman_close_prices[-1] - jma_close)
 
     if USE_ER and st["efficiency_ratio"] is None:
         return result
@@ -507,26 +525,58 @@ def update_trading_signals(symbol: str) -> dict:
         return result
 
     # Efficiency Ratio filter - only trade in trending markets
-    er = st["efficiency_ratio"]
     er_allows_trading = (er >= ER_THRESHOLD) if USE_ER else True
     
     if USE_ER and not er_allows_trading:
         # Market too choppy - no entries
         return result
 
-    # Trading logic using TAMA
-    if st["long_position"] == 0:
-        if price > tama:
-            result["long_entry"] = True
-            er_str = f", ER={er:.3f}" if USE_ER else ""
-            logging.info(f"🟢 {symbol} ENTRY LONG (TAMA: price={price:.6f} > tama={tama:.6f}{er_str})")
+    # CROSSOVER STRATEGY: composite close crosses through composite bands
+    if ENTRY_STRATEGY == "CROSSOVER":
+        prev_tama_high = st.get("prev_tama_high", tama_high)
+        prev_tama_low = st.get("prev_tama_low", tama_low)
+        prev_tama_close = st.get("prev_tama_close", tama_close)
 
-    if st["short_position"] == 0:
-        if price < tama:
-            result["short_entry"] = True
-            er_str = f", ER={er:.3f}" if USE_ER else ""
-            logging.info(f"🟢 {symbol} ENTRY SHORT (TAMA: price={price:.6f} < tama={tama:.6f}{er_str})")
+        # LONG: TAMA close crosses above TAMA high (upper band)
+        cross_above_high = (tama_close > tama_high) and (prev_tama_close <= prev_tama_high)
 
+        # SHORT: TAMA close crosses below TAMA low (lower band)
+        cross_below_low = (tama_close < tama_low) and (prev_tama_close >= prev_tama_low)
+
+        if st["long_position"] == 0:
+            if cross_above_high:
+                result["long_entry"] = True
+                er_str = f", ER={er:.3f}" if USE_ER else ""
+                logging.info(f"🟢 {symbol} ENTRY LONG (CROSSOVER: tama_close={tama_close:.6f} > tama_high={tama_high:.6f}{er_str})")
+
+        if st["short_position"] == 0:
+            if cross_below_low:
+                result["short_entry"] = True
+                er_str = f", ER={er:.3f}" if USE_ER else ""
+                logging.info(f"🟢 {symbol} ENTRY SHORT (CROSSOVER: tama_close={tama_close:.6f} < tama_low={tama_low:.6f}{er_str})")
+
+    # SYMMETRIC STRATEGY: Price breaks above/below composite bands
+    elif ENTRY_STRATEGY == "SYMMETRIC":
+        # LONG: Price above both HIGH and LOW bands
+        price_above_ribbon = (price > tama_high) and (price > tama_low)
+
+        # SHORT: Price below both HIGH and LOW bands
+        price_below_ribbon = (price < tama_high) and (price < tama_low)
+
+        if st["long_position"] == 0:
+            if price_above_ribbon:
+                result["long_entry"] = True
+                er_str = f", ER={er:.3f}" if USE_ER else ""
+                logging.info(f"🟢 {symbol} ENTRY LONG (SYMMETRIC: price={price:.6f} > tama_high={tama_high:.6f} & tama_low={tama_low:.6f}{er_str})")
+
+        if st["short_position"] == 0:
+            if price_below_ribbon:
+                result["short_entry"] = True
+                er_str = f", ER={er:.3f}" if USE_ER else ""
+                logging.info(f"🟢 {symbol} ENTRY SHORT (SYMMETRIC: price={price:.6f} < tama_high={tama_high:.6f} & tama_low={tama_low:.6f}{er_str})")
+
+    st["prev_jma_high"] = jma_high
+    st["prev_jma_low"] = jma_low
     st["prev_jma_close"] = jma_close
 
     return result
@@ -612,9 +662,10 @@ async def status_logger():
 
             price = st["price"]
             jma_high = calculate_jma(symbol, "high", JMA_LENGTH_HIGH, JMA_PHASE, JMA_POWER)
+            jma_low = calculate_jma(symbol, "low", JMA_LENGTH_LOW, JMA_PHASE, JMA_POWER)
             jma_close = calculate_jma(symbol, "close", JMA_LENGTH_CLOSE, JMA_PHASE, JMA_POWER)
 
-            if price and jma_close:
+            if price and jma_high and jma_low and jma_close:
                 er_str = f"{st['efficiency_ratio']:.3f}" if USE_ER and st.get("efficiency_ratio") else "N/A"
                 er_status = ""
                 if USE_ER and st.get("efficiency_ratio"):
@@ -624,7 +675,8 @@ async def status_logger():
                         er_status = " ⚠️ CHOPPY"
 
                 logging.info(f"{symbol}: Price={price:.6f}")
-                logging.info(f"  TAMA={jma_close:.6f} | ER={er_str}{er_status}")
+                logging.info(f"  TAMA Bands: HIGH={jma_high:.6f} | LOW={jma_low:.6f}")
+                logging.info(f"  TAMA Close={jma_close:.6f} | ER={er_str}{er_status}")
                 
                 # Show positions
                 long_status = f"LONG: {st['long_position']}" if st['long_position'] > 0 else "LONG: None"
@@ -848,12 +900,12 @@ async def recover_positions_from_exchange(client: AsyncClient):
 async def init_bot(client: AsyncClient):
     """Initialize bot with historical data"""
     logging.info("🔧 Initializing bot...")
-    logging.info(f"📊 STRATEGY: JMA RIBBON (HIGH/LOW bands)")
+    logging.info(f"📊 STRATEGY: TAMA (Triple-Layer Adaptive Moving Average)")
     logging.info(f"📊 MODE: TRUE HEDGE MODE (LONG + SHORT simultaneously)")
     logging.info(f"📊 SYMBOLS: {len(SYMBOLS)} symbols tracked INDEPENDENTLY")
     logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
-    logging.info(f"📊 JMA Ribbon: high={JMA_LENGTH_HIGH}, low={JMA_LENGTH_LOW}, close={JMA_LENGTH_CLOSE}, phase={JMA_PHASE}, power={JMA_POWER}")
-    logging.info(f"📊 JMA Mode: {'LIVE CANDLE' if USE_LIVE_CANDLE else 'COMPLETED ONLY'}")
+    logging.info(f"📊 TAMA Bands: high={JMA_LENGTH_HIGH}, low={JMA_LENGTH_LOW}, close={JMA_LENGTH_CLOSE}, phase={JMA_PHASE}, power={JMA_POWER}")
+    logging.info(f"📊 TAMA Mode: {'LIVE CANDLE' if USE_LIVE_CANDLE else 'COMPLETED ONLY'}")
     logging.info(f"📊 Entry Strategy: {ENTRY_STRATEGY}")
     logging.info(f"📊 Trailing Stop: {TRAILING_STOP_PERCENT}% (~{TRAILING_STOP_PERCENT * LEVERAGE:.1f}% pos risk @ {LEVERAGE}x)")
     logging.info(f"🛡️ Protection: 2-second duplicate prevention PER SYMBOL")
@@ -990,17 +1042,17 @@ if __name__ == "__main__":
     )
 
     print("=" * 80)
-    print("JMA RIBBON STRATEGY - TRUE HEDGE MODE")
+    print("TAMA STRATEGY - TRUE HEDGE MODE")
     print(f"TIMEFRAME: {BASE_TIMEFRAME}")
     print("ENHANCED DIAGNOSTICS + PER-SYMBOL ISOLATION")
     print("=" * 80)
-    print(f"Strategy: JMA Ribbon (HIGH/LOW bands prevent ping-pong)")
+    print(f"Strategy: TAMA (Triple-Layer Adaptive Moving Average)")
     print(f"Mode: TRUE HEDGE (can hold LONG + SHORT simultaneously)")
     print(f"Symbols: {len(SYMBOLS)} symbols - EACH TRACKED INDEPENDENTLY")
     print(f"  {', '.join(SYMBOLS.keys())}")
-    print(f"JMA Ribbon: high={JMA_LENGTH_HIGH}, low={JMA_LENGTH_LOW}, close={JMA_LENGTH_CLOSE}")
-    print(f"JMA Parameters: phase={JMA_PHASE}, power={JMA_POWER}")
-    print(f"JMA Calculation: {'LIVE CANDLE' if USE_LIVE_CANDLE else 'COMPLETED ONLY'}")
+    print(f"TAMA Bands: high={JMA_LENGTH_HIGH}, low={JMA_LENGTH_LOW}, close={JMA_LENGTH_CLOSE}")
+    print(f"TAMA Parameters: phase={JMA_PHASE}, power={JMA_POWER}")
+    print(f"TAMA Calculation: {'LIVE CANDLE' if USE_LIVE_CANDLE else 'COMPLETED ONLY'}")
     print(f"Entry Strategy: {ENTRY_STRATEGY}")
     print(f"  - CROSSOVER: JMA close crosses through ribbon bands")
     print(f"  - SYMMETRIC: Price breaks above/below ribbon")
