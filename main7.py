@@ -3,9 +3,8 @@ import os, json, asyncio, logging, websockets, time
 import atexit
 from binance import AsyncClient
 from collections import deque
-from typing import Optional
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
-import numpy as np
 
 # ========================= CONFIG =========================
 load_dotenv()
@@ -14,26 +13,30 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
 USE_LIVE_CANDLE = True
 
+# ========================= ENTRY MODE TOGGLE =========================
+# Set to True for CROSSOVER mode (requires actual cross)
+# Set to False for SYMMETRICAL mode (just needs to be above/below)
+USE_CROSSOVER_ENTRY = False # <-- TOGGLE THIS
+
 # TAMA (Triple-Layer Adaptive Moving Average) PARAMETERS
 USE_TAMA = True
 
 # Layer 1: Kalman Filter Parameters
-KALMAN_Q = 0.001  # Process noise covariance (lower = smoother)
-KALMAN_R = 0.01   # Measurement noise covariance (lower = more responsive)
+KALMAN_Q = 0.001
+KALMAN_R = 0.01
 
 # Layer 2: JMA Parameters
-JMA_LENGTH_FAST = 7   # Fast JMA (signal line)
-JMA_LENGTH_SLOW = 100  # Slow JMA (baseline)
+JMA_LENGTH_FAST = 7
+JMA_LENGTH_SLOW = 100
 JMA_PHASE = 0
 JMA_POWER = 3
 
 # Layer 3: Efficiency Ratio Parameters
 ER_PERIODS = 100
-ALPHA_WEIGHT = 1.0  # ER influence multiplier
+ALPHA_WEIGHT = 1.0
 
 # Trailing Stop Configuration
 TRAILING_STOP_PERCENT = 0.7
-TRAILING_UPDATE_THRESHOLD = 0.1  # % change required to update trailing stop
 
 # Timeframe configuration
 BASE_TIMEFRAME = "15m"
@@ -70,42 +73,32 @@ state = {
     symbol: {
         "price": None,
         "klines": deque(maxlen=KLINE_LIMIT),
-        # Kalman Filter state (Layer 1)
         "kalman_x": None,
         "kalman_p": 1.0,
         "kalman_close": None,
-        # JMA values (Layer 2)
-        "jma_fast": None,      # JMA-7
-        "jma_slow": None,      # JMA-50
-        # TAMA final values (Layer 3 - adaptive)
+        "jma_fast": None,
+        "jma_slow": None,
         "tama_fast": None,
         "tama_slow": None,
-        # Previous TAMA values for crossover detection
         "prev_tama_fast": None,
         "prev_tama_slow": None,
-        # Efficiency Ratio
         "efficiency_ratio": None,
         "er_ready": False,
         "ready": False,
-        # LONG position tracking
         "long_position": 0.0,
         "long_trailing_stop_price": None,
         "long_peak_price": None,
         "last_long_exec_ts": 0.0,
-        "long_entry_allowed": True,  # Crossover lock
-        "long_stop_order_id": None,
-        # SHORT position tracking
+        "long_entry_allowed": True,
         "short_position": 0.0,
         "short_trailing_stop_price": None,
         "short_lowest_price": None,
         "last_short_exec_ts": 0.0,
-        "short_entry_allowed": True,  # Crossover lock
-        "short_stop_order_id": None,
-        # Stop warning flag
+        "short_entry_allowed": True,
         "stop_warning_logged": False,
-        # Last close ts for dedup
-        "last_long_close_ts": 0.0,
-        "last_short_close_ts": 0.0,
+        # Exit cooldown tracking (prevent spam)
+        "last_long_exit_signal_ts": 0.0,
+        "last_short_exit_signal_ts": 0.0,
     }
     for symbol in SYMBOLS
 }
@@ -113,91 +106,104 @@ state = {
 api_calls_count = 0
 api_calls_reset_time = time.time()
 
-# ========================= PERSISTENCE FUNCTIONS =========================
+# ========================= PERSISTENCE =========================
 def save_klines():
-    save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
-    with open('klines.json', 'w') as f:
-        json.dump(save_data, f)
-    logging.info("📥 Saved klines to klines.json")
+    try:
+        save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
+        if os.path.exists('klines.json'):
+            try:
+                os.rename('klines.json', 'klines.json.backup')
+            except Exception:
+                pass
+        with open('klines.json', 'w') as f:
+            json.dump(save_data, f)
+        logging.info("📥 Saved klines")
+    except Exception as e:
+        logging.error(f"Failed to save klines: {e}")
 
 def load_klines():
     try:
         with open('klines.json', 'r') as f:
             load_data = json.load(f)
+        if not isinstance(load_data, dict):
+            return
         for sym in SYMBOLS:
-            state[sym]["klines"] = deque(load_data.get(sym, []), maxlen=KLINE_LIMIT)
-        logging.info("📤 Loaded klines from klines.json")
+            if sym in load_data and isinstance(load_data[sym], list):
+                state[sym]["klines"] = deque(load_data[sym], maxlen=KLINE_LIMIT)
+        logging.info("📤 Loaded klines")
     except FileNotFoundError:
-        logging.info("No klines.json found - starting fresh")
+        logging.info("No klines.json - starting fresh")
+    except json.JSONDecodeError:
+        logging.error("Corrupt klines.json")
     except Exception as e:
-        logging.error(f"Failed to load klines: {e} - starting fresh")
+        logging.error(f"Failed to load klines: {e}")
 
 def save_positions():
-    position_data = {}
-    for sym in SYMBOLS:
-        position_data[sym] = {
-            "long_position": state[sym]["long_position"],
-            "long_trailing_stop_price": state[sym]["long_trailing_stop_price"],
-            "long_peak_price": state[sym]["long_peak_price"],
-            "long_entry_allowed": state[sym]["long_entry_allowed"],
-            "long_stop_order_id": state[sym]["long_stop_order_id"],
-            "short_position": state[sym]["short_position"],
-            "short_trailing_stop_price": state[sym]["short_trailing_stop_price"],
-            "short_lowest_price": state[sym]["short_lowest_price"],
-            "short_entry_allowed": state[sym]["short_entry_allowed"],
-            "short_stop_order_id": state[sym]["short_stop_order_id"],
-        }
-    with open('positions.json', 'w') as f:
-        json.dump(position_data, f, indent=2)
+    try:
+        position_data = {}
+        for sym in SYMBOLS:
+            position_data[sym] = {
+                "long_position": float(state[sym]["long_position"]),
+                "long_trailing_stop_price": float(state[sym]["long_trailing_stop_price"]) if state[sym]["long_trailing_stop_price"] is not None else None,
+                "long_peak_price": float(state[sym]["long_peak_price"]) if state[sym]["long_peak_price"] is not None else None,
+                "long_entry_allowed": bool(state[sym]["long_entry_allowed"]),
+                "short_position": float(state[sym]["short_position"]),
+                "short_trailing_stop_price": float(state[sym]["short_trailing_stop_price"]) if state[sym]["short_trailing_stop_price"] is not None else None,
+                "short_lowest_price": float(state[sym]["short_lowest_price"]) if state[sym]["short_lowest_price"] is not None else None,
+                "short_entry_allowed": bool(state[sym]["short_entry_allowed"]),
+            }
+        if os.path.exists('positions.json'):
+            try:
+                os.rename('positions.json', 'positions.json.backup')
+            except Exception:
+                pass
+        with open('positions.json', 'w') as f:
+            json.dump(position_data, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save positions: {e}")
 
 def load_positions():
     try:
         with open('positions.json', 'r') as f:
             position_data = json.load(f)
-        logging.info("💾 Loading positions from positions.json...")
+        if not isinstance(position_data, dict):
+            return
+        logging.info("💾 Loading positions...")
         for sym in SYMBOLS:
             if sym not in position_data:
-                logging.info(f"   [{sym}]: No saved data - starting fresh")
                 continue
-            loaded_long = position_data[sym].get("long_position", 0.0)
-            loaded_short = position_data[sym].get("short_position", 0.0)
-            state[sym]["long_position"] = loaded_long
-            state[sym]["long_trailing_stop_price"] = position_data[sym].get("long_trailing_stop_price")
-            state[sym]["long_peak_price"] = position_data[sym].get("long_peak_price")
-            state[sym]["long_entry_allowed"] = position_data[sym].get("long_entry_allowed", True)
-            state[sym]["long_stop_order_id"] = position_data[sym].get("long_stop_order_id")
-            state[sym]["short_position"] = loaded_short
-            state[sym]["short_trailing_stop_price"] = position_data[sym].get("short_trailing_stop_price")
-            state[sym]["short_lowest_price"] = position_data[sym].get("short_lowest_price")
-            state[sym]["short_entry_allowed"] = position_data[sym].get("short_entry_allowed", True)
-            state[sym]["short_stop_order_id"] = position_data[sym].get("short_stop_order_id")
-            
-            if loaded_long > 0:
-                if state[sym]["long_trailing_stop_price"] is None or state[sym]["long_peak_price"] is None:
-                    logging.warning(f"⚠️ [{sym}] STALE LONG DATA: position={loaded_long} but stops missing")
-                else:
-                    logging.info(f"✅ [{sym}] LONG loaded: pos={loaded_long}, peak={state[sym]['long_peak_price']:.6f}")
-            
-            if loaded_short > 0:
-                if state[sym]["short_trailing_stop_price"] is None or state[sym]["short_lowest_price"] is None:
-                    logging.warning(f"⚠️ [{sym}] STALE SHORT DATA: position={loaded_short} but stops missing")
-                else:
-                    logging.info(f"✅ [{sym}] SHORT loaded: pos={loaded_short}, low={state[sym]['short_lowest_price']:.6f}")
-            
-            if loaded_long == 0 and loaded_short == 0:
-                logging.info(f"   [{sym}]: FLAT (no positions)")
-                        
+            try:
+                loaded_long = float(position_data[sym].get("long_position", 0.0))
+                loaded_short = float(position_data[sym].get("short_position", 0.0))
+                state[sym]["long_position"] = loaded_long
+                state[sym]["long_trailing_stop_price"] = position_data[sym].get("long_trailing_stop_price")
+                state[sym]["long_peak_price"] = position_data[sym].get("long_peak_price")
+                state[sym]["long_entry_allowed"] = bool(position_data[sym].get("long_entry_allowed", True))
+                state[sym]["short_position"] = loaded_short
+                state[sym]["short_trailing_stop_price"] = position_data[sym].get("short_trailing_stop_price")
+                state[sym]["short_lowest_price"] = position_data[sym].get("short_lowest_price")
+                state[sym]["short_entry_allowed"] = bool(position_data[sym].get("short_entry_allowed", True))
+                if loaded_long > 0:
+                    logging.info(f"✅ [{sym}] LONG loaded: {loaded_long}")
+                if loaded_short > 0:
+                    logging.info(f"✅ [{sym}] SHORT loaded: {loaded_short}")
+            except (TypeError, ValueError) as e:
+                logging.error(f"❌ [{sym}] Invalid data: {e}")
         logging.info("💾 Position loading complete")
-        
     except FileNotFoundError:
-        logging.info("💾 No positions.json found - all symbols starting fresh")
+        logging.info("💾 No positions.json")
+    except json.JSONDecodeError:
+        logging.error("Corrupt positions.json")
     except Exception as e:
-        logging.error(f"❌ Failed to load positions: {e} - all symbols starting fresh")
+        logging.error(f"❌ Failed to load positions: {e}")
 
 # ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
-    prec = PRECISIONS.get(symbol, 3)
-    return round(size, prec)
+    try:
+        prec = PRECISIONS.get(symbol, 3)
+        return round(float(size), prec)
+    except (TypeError, ValueError):
+        return 0.0
 
 async def safe_api_call(func, *args, **kwargs):
     global api_calls_count, api_calls_reset_time
@@ -205,10 +211,9 @@ async def safe_api_call(func, *args, **kwargs):
     if now - api_calls_reset_time > 60:
         api_calls_count = 0
         api_calls_reset_time = now
-    if api_calls_count >= 50:  # Increased from 10 to 50
+    if api_calls_count >= 10:
         wait_time = 60 - (now - api_calls_reset_time)
         if wait_time > 0:
-            logging.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
             await asyncio.sleep(wait_time)
             api_calls_count = 0
             api_calls_reset_time = time.time()
@@ -218,388 +223,377 @@ async def safe_api_call(func, *args, **kwargs):
             result = await func(*args, **kwargs)
             return result
         except Exception as e:
-            if "-1003" in str(e) or "Way too many requests" in str(e):
+            error_str = str(e)
+            if "-1003" in error_str or "too many requests" in error_str.lower():
                 wait_time = (2 ** attempt) * 60
-                logging.warning(f"Rate limited, attempt {attempt+1}/3, waiting {wait_time}s")
+                logging.warning(f"Rate limited, retry {attempt+1}/3, wait {wait_time}s")
                 await asyncio.sleep(wait_time)
             else:
-                raise e
-    raise Exception("Max API retry attempts reached")
+                if attempt == 2:
+                    raise e
+                await asyncio.sleep(2 ** attempt)
+    raise Exception("Max retries reached")
 
-async def place_order(client: AsyncClient, symbol: str, side: str, quantity: float, action: str, order_type: str = "MARKET", stop_price: Optional[float] = None):
+async def place_order(client: AsyncClient, symbol: str, side: str, quantity: float, action: str) -> bool:
     try:
         quantity = round_size(abs(quantity), symbol)
         if quantity == 0:
-            return None
-        if "LONG" in action:
+            return True
+        if "LONG" in action.upper():
             position_side = "LONG"
-        elif "SHORT" in action:
+        elif "SHORT" in action.upper():
             position_side = "SHORT"
         else:
-            logging.error(f"Unknown action type: {action}")
-            return None
+            logging.error(f"Unknown action: {action}")
+            return False
         params = {
             "symbol": symbol,
             "side": side,
-            "type": order_type,
+            "type": "MARKET",
             "quantity": quantity,
-            "positionSide": position_side,
+            "positionSide": position_side
         }
-        if "CLOSE" in action or order_type == "STOP_MARKET":
-            params["reduceOnly"] = True
-        if order_type == "STOP_MARKET" and stop_price is not None:
-            params["stopPrice"] = stop_price
         result = await safe_api_call(client.futures_create_order, **params)
-        logging.info(f"🚀 {symbol} {action} EXECUTED - {side} {quantity} - OrderID: {result.get('orderId')} Type: {order_type}")
-        return result
+        if result and 'orderId' in result:
+            logging.info(f"🚀 {symbol} {action} OK - {side} {quantity}")
+            return True
+        return False
     except Exception as e:
         logging.error(f"❌ {symbol} {action} FAILED: {e}")
-        return None
-
-async def cancel_order(client: AsyncClient, symbol: str, order_id: int):
-    try:
-        result = await safe_api_call(client.futures_cancel_order, symbol=symbol, orderId=order_id)
-        logging.info(f"🗑️ Order {order_id} canceled for {symbol}")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Failed to cancel order {order_id} for {symbol}: {e}")
         return False
 
-# ========================= TRAILING STOP FUNCTIONS =========================
-async def initialize_trailing_stop(client: AsyncClient, symbol: str, side: str, entry_price: float):
-    st = state[symbol]
-    if side == "LONG":
-        st["long_peak_price"] = entry_price
-        st["long_trailing_stop_price"] = entry_price * (1 - TRAILING_STOP_PERCENT / 100)
-        logging.info(f"🎯 {symbol} LONG Trailing Stop initialized: Peak={entry_price:.6f}, Stop={st['long_trailing_stop_price']:.6f}")
-        await place_trailing_stop_order(client, symbol, "LONG")
-    elif side == "SHORT":
-        st["short_lowest_price"] = entry_price
-        st["short_trailing_stop_price"] = entry_price * (1 + TRAILING_STOP_PERCENT / 100)
-        logging.info(f"🎯 {symbol} SHORT Trailing Stop initialized: Lowest={entry_price:.6f}, Stop={st['short_trailing_stop_price']:.6f}")
-        await place_trailing_stop_order(client, symbol, "SHORT")
-    st["stop_warning_logged"] = False
-    save_positions()
-
-async def place_trailing_stop_order(client: AsyncClient, symbol: str, side: str):
-    st = state[symbol]
-    if side == "LONG":
-        order_side = "SELL"
-        quantity = st["long_position"]
-        stop_price = st["long_trailing_stop_price"]
-    else:
-        order_side = "BUY"
-        quantity = st["short_position"]
-        stop_price = st["short_trailing_stop_price"]
-    result = await place_order(client, symbol, order_side, quantity, f"{side} TRAILING STOP", order_type="STOP_MARKET", stop_price=stop_price)
-    if result:
-        st[f"{side.lower()}_stop_order_id"] = result.get('orderId')
+# ========================= TRAILING STOPS =========================
+def initialize_trailing_stop(symbol: str, side: str, entry_price: float):
+    try:
+        st = state[symbol]
+        if entry_price is None or entry_price <= 0:
+            return
+        if side == "LONG":
+            st["long_peak_price"] = float(entry_price)
+            st["long_trailing_stop_price"] = float(entry_price) * (1 - TRAILING_STOP_PERCENT / 100)
+            logging.info(f"🎯 {symbol} LONG Stop: Peak={entry_price:.6f}, Stop={st['long_trailing_stop_price']:.6f}")
+        elif side == "SHORT":
+            st["short_lowest_price"] = float(entry_price)
+            st["short_trailing_stop_price"] = float(entry_price) * (1 + TRAILING_STOP_PERCENT / 100)
+            logging.info(f"🎯 {symbol} SHORT Stop: Low={entry_price:.6f}, Stop={st['short_trailing_stop_price']:.6f}")
+        st["stop_warning_logged"] = False
         save_positions()
+    except Exception as e:
+        logging.error(f"❌ Init stop failed {symbol} {side}: {e}")
 
-async def update_trailing_stop(client: AsyncClient, symbol: str, current_price: float) -> dict:
+def update_trailing_stop(symbol: str, current_price: float) -> Dict[str, bool]:
     st = state[symbol]
-    result = {"long_updated": False, "short_updated": False}
-    
-    if st["long_position"] > 0:
-        if st["long_peak_price"] is None or st["long_trailing_stop_price"] is None:
-            if not st["stop_warning_logged"]:
-                logging.warning(f"⚠️ {symbol} LONG position exists but stop is None - will auto-fix")
-                st["stop_warning_logged"] = True
+    result = {"long_hit": False, "short_hit": False}
+    try:
+        if current_price is None or current_price <= 0:
             return result
-        if current_price > st["long_peak_price"]:
-            st["long_peak_price"] = current_price
-            new_stop = current_price * (1 - TRAILING_STOP_PERCENT / 100)
-            if new_stop > st["long_trailing_stop_price"] * (1 + TRAILING_UPDATE_THRESHOLD / 100):
-                await cancel_trailing_stop_order(client, symbol, "LONG")
-                st["long_trailing_stop_price"] = new_stop
-                await place_trailing_stop_order(client, symbol, "LONG")
-                result["long_updated"] = True
-                save_positions()
-    
-    if st["short_position"] > 0:
-        if st["short_lowest_price"] is None or st["short_trailing_stop_price"] is None:
-            if not st["stop_warning_logged"]:
-                logging.warning(f"⚠️ {symbol} SHORT position exists but stop is None - will auto-fix")
-                st["stop_warning_logged"] = True
-            return result
-        if current_price < st["short_lowest_price"]:
-            st["short_lowest_price"] = current_price
-            new_stop = current_price * (1 + TRAILING_STOP_PERCENT / 100)
-            if new_stop < st["short_trailing_stop_price"] * (1 - TRAILING_UPDATE_THRESHOLD / 100):
-                await cancel_trailing_stop_order(client, symbol, "SHORT")
-                st["short_trailing_stop_price"] = new_stop
-                await place_trailing_stop_order(client, symbol, "SHORT")
-                result["short_updated"] = True
-                save_positions()
-    
+        current_price = float(current_price)
+        
+        # LONG trailing stop
+        if st["long_position"] > 0:
+            if st["long_peak_price"] is None or st["long_trailing_stop_price"] is None:
+                if not st["stop_warning_logged"]:
+                    logging.warning(f"⚠️ {symbol} LONG missing stop")
+                    st["stop_warning_logged"] = True
+                return result
+            if current_price > st["long_peak_price"]:
+                st["long_peak_price"] = float(current_price)
+                new_stop = float(current_price) * (1 - TRAILING_STOP_PERCENT / 100)
+                if new_stop > st["long_trailing_stop_price"]:
+                    st["long_trailing_stop_price"] = new_stop
+                    save_positions()
+            if current_price <= st["long_trailing_stop_price"]:
+                logging.info(f"🛑 {symbol} LONG Stop HIT: {current_price:.6f} <= {st['long_trailing_stop_price']:.6f}")
+                result["long_hit"] = True
+        
+        # SHORT trailing stop
+        if st["short_position"] > 0:
+            if st["short_lowest_price"] is None or st["short_trailing_stop_price"] is None:
+                if not st["stop_warning_logged"]:
+                    logging.warning(f"⚠️ {symbol} SHORT missing stop")
+                    st["stop_warning_logged"] = True
+                return result
+            if current_price < st["short_lowest_price"]:
+                st["short_lowest_price"] = float(current_price)
+                new_stop = float(current_price) * (1 + TRAILING_STOP_PERCENT / 100)
+                if new_stop < st["short_trailing_stop_price"]:
+                    st["short_trailing_stop_price"] = new_stop
+                    save_positions()
+            if current_price >= st["short_trailing_stop_price"]:
+                logging.info(f"🛑 {symbol} SHORT Stop HIT: {current_price:.6f} >= {st['short_trailing_stop_price']:.6f}")
+                result["short_hit"] = True
+    except Exception as e:
+        logging.error(f"❌ Update stop error {symbol}: {e}")
     return result
-
-async def cancel_trailing_stop_order(client: AsyncClient, symbol: str, side: str):
-    st = state[symbol]
-    order_id = st[f"{side.lower()}_stop_order_id"]
-    if order_id:
-        success = await cancel_order(client, symbol, order_id)
-        if success:
-            st[f"{side.lower()}_stop_order_id"] = None
-            save_positions()
 
 def reset_trailing_stop(symbol: str, side: str):
-    st = state[symbol]
-    if side == "LONG":
-        st["long_trailing_stop_price"] = None
-        st["long_peak_price"] = None
-        st["long_entry_allowed"] = True  # Re-enable crossover entries
-        st["long_stop_order_id"] = None
-        logging.info(f"🔓 {symbol} LONG entry re-enabled (position closed)")
-    elif side == "SHORT":
-        st["short_trailing_stop_price"] = None
-        st["short_lowest_price"] = None
-        st["short_entry_allowed"] = True  # Re-enable crossover entries
-        st["short_stop_order_id"] = None
-        logging.info(f"🔓 {symbol} SHORT entry re-enabled (position closed)")
-    save_positions()
+    try:
+        st = state[symbol]
+        if side == "LONG":
+            st["long_trailing_stop_price"] = None
+            st["long_peak_price"] = None
+            st["long_entry_allowed"] = True
+            logging.info(f"🔓 {symbol} LONG re-enabled")
+        elif side == "SHORT":
+            st["short_trailing_stop_price"] = None
+            st["short_lowest_price"] = None
+            st["short_entry_allowed"] = True
+            logging.info(f"🔓 {symbol} SHORT re-enabled")
+        save_positions()
+    except Exception as e:
+        logging.error(f"❌ Reset stop error {symbol}: {e}")
 
-# ========================= TAMA INDICATOR CALCULATIONS =========================
-
+# ========================= TAMA CALCULATIONS =========================
 def kalman_filter(symbol: str, measurement: float) -> Optional[float]:
-    """
-    LAYER 1: Kalman Filter
-    Removes noise from raw price data and provides predictive smoothing
-    """
-    st = state[symbol]
-    
-    if st["kalman_x"] is None:
-        st["kalman_x"] = measurement
-        st["kalman_p"] = 1.0
-        return measurement
-    
-    # Prediction step
-    x_pred = st["kalman_x"]
-    p_pred = st["kalman_p"] + KALMAN_Q
-    
-    # Update step
-    kalman_gain = p_pred / (p_pred + KALMAN_R)
-    x_updated = x_pred + kalman_gain * (measurement - x_pred)
-    p_updated = (1 - kalman_gain) * p_pred
-    
-    # Store updated state
-    st["kalman_x"] = x_updated
-    st["kalman_p"] = p_updated
-    
-    return x_updated
+    try:
+        st = state[symbol]
+        if measurement is None:
+            return None
+        measurement = float(measurement)
+        if st["kalman_x"] is None:
+            st["kalman_x"] = measurement
+            st["kalman_p"] = 1.0
+            return measurement
+        x_pred = st["kalman_x"]
+        p_pred = st["kalman_p"] + KALMAN_Q
+        kalman_gain = p_pred / (p_pred + KALMAN_R)
+        x_updated = x_pred + kalman_gain * (measurement - x_pred)
+        p_updated = (1 - kalman_gain) * p_pred
+        st["kalman_x"] = x_updated
+        st["kalman_p"] = p_updated
+        return x_updated
+    except Exception as e:
+        logging.error(f"Kalman error {symbol}: {e}")
+        return None
 
 def apply_kalman_to_klines(symbol: str):
-    """Apply Kalman filter to close price of latest kline"""
-    klines = state[symbol]["klines"]
-    if len(klines) == 0:
-        return
-    latest = klines[-1]
-    state[symbol]["kalman_close"] = kalman_filter(symbol, latest["close"])
+    try:
+        klines = state[symbol]["klines"]
+        if len(klines) == 0:
+            return
+        latest = klines[-1]
+        if "close" not in latest:
+            return
+        state[symbol]["kalman_close"] = kalman_filter(symbol, latest["close"])
+    except Exception as e:
+        logging.error(f"Apply Kalman error {symbol}: {e}")
 
 def calculate_jma_from_kalman(symbol: str, length: int, phase: int = 50, power: int = 2) -> Optional[float]:
-    """
-    LAYER 2: Jurik Moving Average
-    Feeds Kalman-filtered data into JMA for low-lag smoothing
-    """
-    klines = state[symbol]["klines"]
-    if len(klines) < length + 1:
-        return None
-    
-    if USE_LIVE_CANDLE:
-        completed = list(klines)
-    else:
-        completed = list(klines)[:-1]
-    
-    if len(completed) < length:
-        return None
-    
-    # Build Kalman-filtered values for historical data
-    values = []
-    temp_kalman_x = None
-    temp_kalman_p = 1.0
-    
-    for k in completed:
-        close_val = k["close"]
-        if temp_kalman_x is None:
-            temp_kalman_x = close_val
-            temp_kalman_p = 1.0
-            values.append(close_val)
+    try:
+        klines = state[symbol]["klines"]
+        if len(klines) < length + 1:
+            return None
+        if USE_LIVE_CANDLE:
+            completed = list(klines)
         else:
-            # Kalman prediction
-            x_pred = temp_kalman_x
-            p_pred = temp_kalman_p + KALMAN_Q
-            # Kalman update
-            kalman_gain = p_pred / (p_pred + KALMAN_R)
-            temp_kalman_x = x_pred + kalman_gain * (close_val - x_pred)
-            temp_kalman_p = (1 - kalman_gain) * p_pred
-            values.append(temp_kalman_x)
-    
-    if len(values) < length:
+            completed = list(klines)[:-1]
+        if len(completed) < length:
+            return None
+        values = []
+        temp_kalman_x = None
+        temp_kalman_p = 1.0
+        for k in completed:
+            if "close" not in k:
+                continue
+            close_val = float(k["close"])
+            if temp_kalman_x is None:
+                temp_kalman_x = close_val
+                temp_kalman_p = 1.0
+                values.append(close_val)
+            else:
+                x_pred = temp_kalman_x
+                p_pred = temp_kalman_p + KALMAN_Q
+                kalman_gain = p_pred / (p_pred + KALMAN_R)
+                temp_kalman_x = x_pred + kalman_gain * (close_val - x_pred)
+                temp_kalman_p = (1 - kalman_gain) * p_pred
+                values.append(temp_kalman_x)
+        if len(values) < length:
+            return None
+        phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
+        beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+        alpha = beta ** power
+        e0 = 0.0
+        e1 = 0.0
+        e2 = 0.0
+        jma = 0.0
+        for src in values:
+            e0 = (1 - alpha) * src + alpha * e0
+            e1 = (src - e0) * (1 - beta) + beta * e1
+            e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
+            jma = e2 + jma
+        return jma
+    except Exception as e:
+        logging.error(f"JMA error {symbol}: {e}")
         return None
-    
-    # JMA calculation on Kalman-filtered data
-    phaseRatio = 0.5 if phase < -100 else (2.5 if phase > 100 else phase / 100 + 1.5)
-    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
-    alpha = beta ** power
-    
-    e0 = 0.0
-    e1 = 0.0
-    e2 = 0.0
-    jma = 0.0
-    
-    for src in values:
-        e0 = (1 - alpha) * src + alpha * e0
-        e1 = (src - e0) * (1 - beta) + beta * e1
-        e2 = (e0 + phaseRatio * e1 - jma) * ((1 - alpha) ** 2) + (alpha ** 2) * e2
-        jma = e2 + jma
-    
-    return jma
 
 def calculate_efficiency_ratio(symbol: str) -> Optional[float]:
-    """
-    LAYER 3 INPUT: Efficiency Ratio (Kaufman)
-    Measures trend strength for adaptive weighting
-    """
-    klines = list(state[symbol]["klines"])
-    if USE_LIVE_CANDLE:
-        completed = klines
-    else:
-        completed = klines[:-1]
-    if len(completed) < ER_PERIODS + 1:
+    try:
+        klines = list(state[symbol]["klines"])
+        if USE_LIVE_CANDLE:
+            completed = klines
+        else:
+            completed = klines[:-1]
+        if len(completed) < ER_PERIODS + 1:
+            return None
+        closes = []
+        for k in completed[-(ER_PERIODS + 1):]:
+            if "close" in k:
+                closes.append(float(k["close"]))
+        if len(closes) < ER_PERIODS + 1:
+            return None
+        net_change = abs(closes[-1] - closes[0])
+        sum_changes = sum(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
+        if sum_changes == 0:
+            return None
+        er = net_change / sum_changes
+        state[symbol]["efficiency_ratio"] = er
+        state[symbol]["er_ready"] = True
+        return er
+    except Exception as e:
+        logging.error(f"ER error {symbol}: {e}")
         return None
-    closes = [k["close"] for k in completed[-(ER_PERIODS + 1):]]
-    net_change = abs(closes[-1] - closes[0])
-    sum_changes = sum(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
-    if sum_changes == 0:
-        return None
-    er = net_change / sum_changes
-    state[symbol]["efficiency_ratio"] = er
-    state[symbol]["er_ready"] = True
-    return er
 
 def calculate_tama(symbol: str, jma_value: Optional[float], kalman_price: float, er: Optional[float]) -> Optional[float]:
-    """
-    LAYER 3: Triple-Layer Adaptive Moving Average (TAMA)
-    Uses Kalman-filtered price (not raw price) for consistency
-    
-    Formula: TAMA = JMA + (α × ER × (Kalman_Price - JMA))
-    
-    Flow:
-    1. Raw Price → Kalman Filter (noise reduction)
-    2. Kalman Output → JMA (low-lag smoothing)
-    3. JMA + ER + Kalman_Price → TAMA (adaptive responsiveness)
-    """
-    if jma_value is None:
+    try:
+        if jma_value is None or kalman_price is None:
+            return None
+        jma_value = float(jma_value)
+        kalman_price = float(kalman_price)
+        if not USE_TAMA or er is None:
+            return jma_value
+        er = float(er)
+        adjustment = ALPHA_WEIGHT * er * (kalman_price - jma_value)
+        tama = jma_value + adjustment
+        return tama
+    except Exception as e:
+        logging.error(f"TAMA error {symbol}: {e}")
         return None
-    
-    if not USE_TAMA or er is None:
-        return jma_value
-    
-    # Use Kalman-filtered price for consistency across all layers
-    adjustment = ALPHA_WEIGHT * er * (kalman_price - jma_value)
-    tama = jma_value + adjustment
-    
-    return tama
 
 # ========================= TRADING LOGIC =========================
-def update_trading_signals(symbol: str) -> dict:
-    """
-    TAMA CROSSOVER Strategy
-    Entry Rules:
-    - LONG: TAMA-Fast crosses ABOVE TAMA-Slow (once per trend)
-    - SHORT: TAMA-Fast crosses BELOW TAMA-Slow (once per trend)
-    
-    Exit Rules:
-    - Trailing stop only (no forced exits from opposite crossovers)
-    
-    Anti-Ping-Pong:
-    - Once position opened, lock further entries until position fully closed
-    - Only trailing stop can close position
-    - After close, crossover lock is released for next signal
-    """
+def update_trading_signals(symbol: str) -> Dict[str, bool]:
     st = state[symbol]
     price = st["price"]
-    result = {"long_entry": False, "short_entry": False}
-    
-    if price is None or not st["ready"]:
-        return result
-    
-    # Apply Kalman filter to current kline
-    apply_kalman_to_klines(symbol)
-    kalman_close = st["kalman_close"]
-    
-    if kalman_close is None:
-        return result
-    
-    # Calculate JMA from Kalman-filtered data (Layer 1 → Layer 2)
-    jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
-    jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-    
-    # Calculate Efficiency Ratio for adaptive weighting
-    er = calculate_efficiency_ratio(symbol)
-    
-    if jma_fast is None or jma_slow is None or er is None:
-        return result
-    
-    # Apply TAMA formula (Layer 2 → Layer 3)
-    # IMPORTANT: Use kalman_close instead of raw price
-    tama_fast = calculate_tama(symbol, jma_fast, kalman_close, er)
-    tama_slow = calculate_tama(symbol, jma_slow, kalman_close, er)
-    
-    if tama_fast is None or tama_slow is None:
-        return result
-    
-    # Store current TAMA values
-    st["tama_fast"] = tama_fast
-    st["tama_slow"] = tama_slow
-    st["jma_fast"] = jma_fast
-    st["jma_slow"] = jma_slow
-    
-    prev_tama_fast = st["prev_tama_fast"]
-    prev_tama_slow = st["prev_tama_slow"]
-    
-    # Initialize previous values
-    if prev_tama_fast is None or prev_tama_slow is None:
+    result = {"long_entry": False, "short_entry": False, "long_exit": False, "short_exit": False}
+    try:
+        if price is None or not st["ready"]:
+            return result
+        apply_kalman_to_klines(symbol)
+        kalman_close = st["kalman_close"]
+        if kalman_close is None:
+            return result
+        jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
+        jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
+        er = calculate_efficiency_ratio(symbol)
+        if jma_fast is None or jma_slow is None or er is None:
+            return result
+        tama_fast = calculate_tama(symbol, jma_fast, kalman_close, er)
+        tama_slow = calculate_tama(symbol, jma_slow, kalman_close, er)
+        if tama_fast is None or tama_slow is None:
+            return result
+        st["tama_fast"] = tama_fast
+        st["tama_slow"] = tama_slow
+        st["jma_fast"] = jma_fast
+        st["jma_slow"] = jma_slow
+        prev_tama_fast = st["prev_tama_fast"]
+        prev_tama_slow = st["prev_tama_slow"]
+        if prev_tama_fast is None or prev_tama_slow is None:
+            st["prev_tama_fast"] = tama_fast
+            st["prev_tama_slow"] = tama_slow
+            return result
+        
+        # ============ ENTRY CONDITION LOGIC (TOGGLEABLE) ============
+        
+        if USE_CROSSOVER_ENTRY:
+            # CROSSOVER MODE: Requires actual cross event
+            bullish_signal = (tama_fast > tama_slow) and (prev_tama_fast <= prev_tama_slow)
+            bearish_signal = (tama_fast < tama_slow) and (prev_tama_fast >= prev_tama_slow)
+        else:
+            # SYMMETRICAL MODE: Just needs to be above/below (no cross required)
+            bullish_signal = (price > tama_fast) and (tama_fast > tama_slow)
+            bearish_signal = (price < tama_fast) and (tama_fast < tama_slow)
+        
+        # ============ ENTRY LOGIC ============
+        
+        # LONG entry: Bullish signal when flat
+        if bullish_signal and st["long_position"] == 0 and st["short_position"] == 0 and st["long_entry_allowed"]:
+            result["long_entry"] = True
+            st["long_entry_allowed"] = False
+            save_positions()
+            mode_str = "Crossover" if USE_CROSSOVER_ENTRY else "Symmetrical"
+            logging.info(f"🟢 {symbol} LONG ENTRY ({mode_str} Mode)")
+            logging.info(f"   Price={price:.6f}, Fast={tama_fast:.6f}, Slow={tama_slow:.6f}")
+        
+        # SHORT entry: Bearish signal when flat
+        if bearish_signal and st["short_position"] == 0 and st["long_position"] == 0 and st["short_entry_allowed"]:
+            result["short_entry"] = True
+            st["short_entry_allowed"] = False
+            save_positions()
+            mode_str = "Crossover" if USE_CROSSOVER_ENTRY else "Symmetrical"
+            logging.info(f"🟢 {symbol} SHORT ENTRY ({mode_str} Mode)")
+            logging.info(f"   Price={price:.6f}, Fast={tama_fast:.6f}, Slow={tama_slow:.6f}")
+        
+        # ============ EXIT LOGIC (Always uses crossover for symmetry) ============
+        
+        # Detect crossovers for exits
+        bullish_cross = (tama_fast > tama_slow) and (prev_tama_fast <= prev_tama_slow)
+        bearish_cross = (tama_fast < tama_slow) and (prev_tama_fast >= prev_tama_slow)
+        
+        # Close LONG on bearish crossover (with cooldown to prevent spam)
+        if bearish_cross and st["long_position"] > 0:
+            now = time.time()
+            # Only trigger if no exit signal in last 5 seconds
+            if (now - st["last_long_exit_signal_ts"]) >= 5.0:
+                result["long_exit"] = True
+                st["last_long_exit_signal_ts"] = now
+                logging.info(f"🔴 {symbol} LONG EXIT SIGNAL (Bearish Crossover)")
+                logging.info(f"   Position: {st['long_position']}, Price: {price:.6f}")
+        
+        # Close SHORT on bullish crossover (with cooldown to prevent spam)
+        if bullish_cross and st["short_position"] > 0:
+            now = time.time()
+            # Only trigger if no exit signal in last 5 seconds
+            if (now - st["last_short_exit_signal_ts"]) >= 5.0:
+                result["short_exit"] = True
+                st["last_short_exit_signal_ts"] = now
+                logging.info(f"🔴 {symbol} SHORT EXIT SIGNAL (Bullish Crossover)")
+                logging.info(f"   Position: {st['short_position']}, Price: {price:.6f}")
+        
         st["prev_tama_fast"] = tama_fast
         st["prev_tama_slow"] = tama_slow
-        return result
-    
-    # Detect crossovers
-    bullish_cross = (tama_fast > tama_slow) and (prev_tama_fast <= prev_tama_slow)
-    bearish_cross = (tama_fast < tama_slow) and (prev_tama_fast >= prev_tama_slow)
-    
-    # LONG Entry: Only if position is flat AND crossover lock is released
-    if bullish_cross and st["long_position"] == 0 and st["long_entry_allowed"]:
-        result["long_entry"] = True
-        st["long_entry_allowed"] = False  # Lock further LONG entries
-        save_positions()
-        logging.info(f"🟢 {symbol} ENTRY LONG (TAMA CROSSOVER)")
-        logging.info(f"   TAMA-Fast={tama_fast:.6f} crossed ABOVE TAMA-Slow={tama_slow:.6f}")
-        logging.info(f"   Kalman_Close={kalman_close:.6f}, ER={er:.3f}, α={ALPHA_WEIGHT}")
-        logging.info(f"🔒 {symbol} LONG crossover lock engaged (no re-entry until stop closes position)")
-    
-    # SHORT Entry: Only if position is flat AND crossover lock is released
-    if bearish_cross and st["short_position"] == 0 and st["short_entry_allowed"]:
-        result["short_entry"] = True
-        st["short_entry_allowed"] = False  # Lock further SHORT entries
-        save_positions()
-        logging.info(f"🟢 {symbol} ENTRY SHORT (TAMA CROSSOVER)")
-        logging.info(f"   TAMA-Fast={tama_fast:.6f} crossed BELOW TAMA-Slow={tama_slow:.6f}")
-        logging.info(f"   Kalman_Close={kalman_close:.6f}, ER={er:.3f}, α={ALPHA_WEIGHT}")
-        logging.info(f"🔒 {symbol} SHORT crossover lock engaged (no re-entry until stop closes position)")
-    
-    # Log ignored crossovers (anti-ping-pong in action)
-    if bullish_cross and st["long_position"] == 0 and not st["long_entry_allowed"]:
-        logging.info(f"⚠️ {symbol} Bullish crossover IGNORED (LONG lock active - waiting for SHORT to close)")
-    
-    if bearish_cross and st["short_position"] == 0 and not st["short_entry_allowed"]:
-        logging.info(f"⚠️ {symbol} Bearish crossover IGNORED (SHORT lock active - waiting for LONG to close)")
-    
-    # Update previous values
-    st["prev_tama_fast"] = tama_fast
-    st["prev_tama_slow"] = tama_slow
-    
+    except Exception as e:
+        logging.error(f"❌ Signal error {symbol}: {e}")
     return result
+
+# ========================= EXECUTION =========================
+async def execute_open_position(client: AsyncClient, symbol: str, side: str, size: float) -> bool:
+    try:
+        st = state[symbol]
+        now = time.time()
+        if side == "LONG":
+            if (now - st["last_long_exec_ts"]) < 2.0:
+                return False
+            st["last_long_exec_ts"] = now
+        elif side == "SHORT":
+            if (now - st["last_short_exec_ts"]) < 2.0:
+                return False
+            st["last_short_exec_ts"] = now
+        else:
+            return False
+        order_side = "BUY" if side == "LONG" else "SELL"
+        success = await place_order(client, symbol, order_side, size, f"{side} ENTRY")
+        return success
+    except Exception as e:
+        logging.error(f"❌ Open error {symbol} {side}: {e}")
+        return False
+
+async def execute_close_position(client: AsyncClient, symbol: str, side: str, size: float) -> bool:
+    try:
+        order_side = "SELL" if side == "LONG" else "BUY"
+        success = await place_order(client, symbol, order_side, size, f"{side} CLOSE")
+        return success
+    except Exception as e:
+        logging.error(f"❌ Close error {symbol} {side}: {e}")
+        return False
 
 # ========================= MAIN LOOPS =========================
 async def price_feed_loop(client: AsyncClient):
@@ -607,410 +601,273 @@ async def price_feed_loop(client: AsyncClient):
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 logging.info("📡 WebSocket connected")
                 async for message in ws:
                     try:
-                        data = json.loads(message).get("data", {})
-                        if "k" in data:
-                            k = data["k"]
-                            symbol = k["s"]
-                            if symbol in SYMBOLS:
-                                state[symbol]["price"] = float(k["c"])
-                                kline_data = {
-                                    "open_time": int(k["t"] / 1000),
-                                    "open": float(k["o"]),
-                                    "high": float(k["h"]),
-                                    "low": float(k["l"]),
-                                    "close": float(k["c"])
-                                }
-                                klines = state[symbol]["klines"]
-                                if klines and klines[-1]["open_time"] == kline_data["open_time"]:
-                                    klines[-1] = kline_data
-                                else:
-                                    klines.append(kline_data)
-                                if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
-                                    apply_kalman_to_klines(symbol)
-                                    jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
-                                    jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-                                    er = calculate_efficiency_ratio(symbol)
-                                    if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
-                                        state[symbol]["ready"] = True
-                                        candle_mode = " [LIVE]" if USE_LIVE_CANDLE else " [COMPLETED]"
-                                        logging.info(f"✅ {symbol} ready - TAMA initialized{candle_mode}")
-                                else:
-                                    calculate_efficiency_ratio(symbol)
+                        data = json.loads(message)
+                        if not isinstance(data, dict) or "data" not in data:
+                            continue
+                        data = data.get("data", {})
+                        if "k" not in data:
+                            continue
+                        k = data["k"]
+                        symbol = k.get("s")
+                        if symbol not in SYMBOLS:
+                            continue
+                        state[symbol]["price"] = float(k["c"])
+                        kline_data = {
+                            "open_time": int(k["t"] / 1000),
+                            "open": float(k["o"]),
+                            "high": float(k["h"]),
+                            "low": float(k["l"]),
+                            "close": float(k["c"])
+                        }
+                        klines = state[symbol]["klines"]
+                        if len(klines) > 0 and klines[-1]["open_time"] == kline_data["open_time"]:
+                            klines[-1] = kline_data
+                        else:
+                            klines.append(kline_data)
+                        if len(state[symbol]["klines"]) >= MA_PERIODS and not state[symbol]["ready"]:
+                            apply_kalman_to_klines(symbol)
+                            jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
+                            jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
+                            er = calculate_efficiency_ratio(symbol)
+                            if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
+                                state[symbol]["ready"] = True
+                                logging.info(f"✅ {symbol} ready")
+                        else:
+                            calculate_efficiency_ratio(symbol)
+                    except json.JSONDecodeError:
+                        pass
+                    except KeyError:
+                        pass
                     except Exception as e:
-                        logging.warning(f"Price processing error: {e}")
+                        logging.warning(f"Price error: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            logging.warning("WS closed, reconnecting...")
+            await asyncio.sleep(5)
         except Exception as e:
-            logging.warning(f"WebSocket error: {e}. Reconnecting...")
+            logging.warning(f"WS error: {e}")
             await asyncio.sleep(5)
 
-async def status_logger():
-    """2-minute status report"""
-    while True:
-        await asyncio.sleep(120)
-        current_time = time.strftime("%H:%M", time.localtime())
-        logging.info(f"📊 === STATUS REPORT {current_time} ===")
-        for symbol in SYMBOLS:
-            st = state[symbol]
-            if not st["ready"]:
-                candle_count = len(st["klines"])
-                price = st["price"]
-                price_str = f"Price={price:.6f} | " if price else ""
-                logging.info(f"{symbol}: {price_str}Not ready - {candle_count} {BASE_TIMEFRAME} candles")
-                continue
-            price = st["price"]
-            tama_fast = st.get("tama_fast")
-            tama_slow = st.get("tama_slow")
-            kalman_close = st.get("kalman_close")
-            er = st.get("efficiency_ratio")
-            
-            if price and tama_fast and tama_slow and kalman_close and er is not None:
-                # Determine crossover state
-                if tama_fast > tama_slow:
-                    trend = "BULLISH ▲"
-                elif tama_fast < tama_slow:
-                    trend = "BEARISH ▼"
-                else:
-                    trend = "NEUTRAL ═"
-                
-                distance = abs(tama_fast - tama_slow)
-                distance_pct = (distance / price) * 100
-                
-                logging.info(f"{symbol}: Price={price:.6f} | Kalman={kalman_close:.6f}")
-                logging.info(f"  TAMA-Fast({JMA_LENGTH_FAST})={tama_fast:.6f} | TAMA-Slow({JMA_LENGTH_SLOW})={tama_slow:.6f}")
-                logging.info(f"  Trend: {trend} | Distance={distance:.6f} ({distance_pct:.3f}%) | ER={er:.3f}")
-                
-                # Show positions and lock status
-                long_status = f"LONG: {st['long_position']}" if st['long_position'] > 0 else "LONG: None"
-                short_status = f"SHORT: {st['short_position']}" if st['short_position'] > 0 else "SHORT: None"
-                long_lock = "🔒" if not st['long_entry_allowed'] else "🔓"
-                short_lock = "🔒" if not st['short_entry_allowed'] else "🔓"
-                logging.info(f"  {long_status} {long_lock} | {short_status} {short_lock}")
-                
-                # Show trailing stops
-                if st["long_position"] > 0:
-                    if st["long_trailing_stop_price"] and st["long_peak_price"]:
-                        distance_stop = ((price - st["long_trailing_stop_price"]) / price) * 100
-                        logging.info(f"  LONG Stop: ${st['long_trailing_stop_price']:.6f} (Peak: ${st['long_peak_price']:.6f}, Dist: {distance_stop:.2f}%)")
-                    else:
-                        logging.warning(f"  ⚠️ LONG Stop: MISSING!")
-                
-                if st["short_position"] > 0:
-                    if st["short_trailing_stop_price"] and st["short_lowest_price"]:
-                        distance_stop = ((st["short_trailing_stop_price"] - price) / price) * 100
-                        logging.info(f"  SHORT Stop: ${st['short_trailing_stop_price']:.6f} (Low: ${st['short_lowest_price']:.6f}, Dist: {distance_stop:.2f}%)")
-                    else:
-                        logging.warning(f"  ⚠️ SHORT Stop: MISSING!")
-        
-        logging.info("📊 === END STATUS REPORT ===")
-
 async def trading_loop(client: AsyncClient):
-    """Main trading logic - Crossover Strategy with Anti-Ping-Pong"""
     while True:
-        await asyncio.sleep(0.1)
-        for symbol in SYMBOLS:
-            st = state[symbol]
-            if not st["ready"]:
-                continue
-            price = st["price"]
-            if price is None:
-                continue
-            
-            # Safety check - reinitialize missing stops
-            if st["long_position"] > 0 and (st["long_trailing_stop_price"] is None or st["long_peak_price"] is None or st["long_stop_order_id"] is None):
-                logging.warning(f"🔧 [{symbol}] SAFETY: Re-initializing missing LONG stop")
-                await initialize_trailing_stop(client, symbol, "LONG", price)
-            if st["short_position"] > 0 and (st["short_trailing_stop_price"] is None or st["short_lowest_price"] is None or st["short_stop_order_id"] is None):
-                logging.warning(f"🔧 [{symbol}] SAFETY: Re-initializing missing SHORT stop")
-                await initialize_trailing_stop(client, symbol, "SHORT", price)
-            
-            # Update trailing stops (dynamic STOP_MARKET orders)
-            await update_trailing_stop(client, symbol, price)
-            
-            # Check entry signals (respects crossover locks)
-            signals = update_trading_signals(symbol)
-            
-            # Handle LONG entry (only if lock is released)
-            if signals["long_entry"] and st["long_position"] == 0:
-                target_size = SYMBOLS[symbol]
-                success = await execute_open_position(client, symbol, "LONG", target_size)
-                if success:
-                    st["long_position"] = target_size
-                    await initialize_trailing_stop(client, symbol, "LONG", price)
-                    save_positions()
-                    logging.info(f"✅ [{symbol}] LONG position opened")
-            
-            # Handle SHORT entry (only if lock is released)
-            if signals["short_entry"] and st["short_position"] == 0:
-                target_size = SYMBOLS[symbol]
-                success = await execute_open_position(client, symbol, "SHORT", target_size)
-                if success:
-                    st["short_position"] = target_size
-                    await initialize_trailing_stop(client, symbol, "SHORT", price)
-                    save_positions()
-                    logging.info(f"✅ [{symbol}] SHORT position opened")
-
-async def position_polling_loop(client: AsyncClient):
-    """Poll positions to detect closures by trailing stops and sync locks"""
-    while True:
-        await asyncio.sleep(30)  # Increased from 5 to 30 seconds
         try:
-            positions = await safe_api_call(client.futures_position_information)
-            for pos in positions:
-                symbol = pos['symbol']
-                if symbol not in SYMBOLS:
-                    continue
-                st = state[symbol]
-                position_side = pos['positionSide']
-                amt = float(pos['positionAmt'])
-                if position_side == "LONG":
-                    if amt <= 0:
-                        if st["long_position"] > 0:
-                            logging.info(f"🛑 [{symbol}] LONG position closed by trailing stop (detected via poll)")
+            await asyncio.sleep(0.1)
+            for symbol in SYMBOLS:
+                try:
+                    st = state[symbol]
+                    if not st["ready"]:
+                        continue
+                    price = st["price"]
+                    if price is None:
+                        continue
+                    if st["long_position"] > 0 and (st["long_trailing_stop_price"] is None or st["long_peak_price"] is None):
+                        initialize_trailing_stop(symbol, "LONG", price)
+                    if st["short_position"] > 0 and (st["short_trailing_stop_price"] is None or st["short_lowest_price"] is None):
+                        initialize_trailing_stop(symbol, "SHORT", price)
+                    stop_result = update_trailing_stop(symbol, price)
+                    if stop_result["long_hit"] and st["long_position"] > 0:
+                        success = await execute_close_position(client, symbol, "LONG", st["long_position"])
+                        if success:
                             st["long_position"] = 0.0
                             reset_trailing_stop(symbol, "LONG")
                             save_positions()
-                        if not st["long_entry_allowed"]:
-                            logging.warning(f"🔧 [{symbol}] LONG lock stuck without position - forcing unlock")
-                            st["long_entry_allowed"] = True
-                            save_positions()
-                elif position_side == "SHORT":
-                    if amt >= 0:
-                        if st["short_position"] > 0:
-                            logging.info(f"🛑 [{symbol}] SHORT position closed by trailing stop (detected via poll)")
+                    if stop_result["short_hit"] and st["short_position"] > 0:
+                        success = await execute_close_position(client, symbol, "SHORT", st["short_position"])
+                        if success:
                             st["short_position"] = 0.0
                             reset_trailing_stop(symbol, "SHORT")
                             save_positions()
-                        if not st["short_entry_allowed"]:
-                            logging.warning(f"🔧 [{symbol}] SHORT lock stuck without position - forcing unlock")
+                    signals = update_trading_signals(symbol)
+                    if signals["long_entry"] and st["long_position"] == 0:
+                        target_size = SYMBOLS[symbol]
+                        success = await execute_open_position(client, symbol, "LONG", target_size)
+                        if success:
+                            st["long_position"] = target_size
+                            initialize_trailing_stop(symbol, "LONG", price)
+                            save_positions()
+                        else:
+                            st["long_entry_allowed"] = True
+                            save_positions()
+                    if signals["short_entry"] and st["short_position"] == 0:
+                        target_size = SYMBOLS[symbol]
+                        success = await execute_open_position(client, symbol, "SHORT", target_size)
+                        if success:
+                            st["short_position"] = target_size
+                            initialize_trailing_stop(symbol, "SHORT", price)
+                            save_positions()
+                        else:
                             st["short_entry_allowed"] = True
                             save_positions()
+                except Exception as e:
+                    logging.error(f"❌ Trade loop error {symbol}: {e}")
+                    continue
         except Exception as e:
-            logging.error(f"❌ Position poll failed: {e}")
+            logging.error(f"❌ Critical trade loop error: {e}")
+            await asyncio.sleep(1)
 
-async def execute_open_position(client: AsyncClient, symbol: str, side: str, size: float) -> bool:
-    """Open new position with 2-second duplicate protection and retries"""
-    st = state[symbol]
-    now = time.time()
-    if side == "LONG":
-        if (now - st["last_long_exec_ts"]) < 2.0:
-            logging.info(f"🛡️ {symbol} LONG dedup: skipping duplicate entry")
-            return False
-        st["last_long_exec_ts"] = now
-    else:
-        if (now - st["last_short_exec_ts"]) < 2.0:
-            logging.info(f"🛡️ {symbol} SHORT dedup: skipping duplicate entry")
-            return False
-        st["last_short_exec_ts"] = now
-    order_side = "BUY" if side == "LONG" else "SELL"
-    for attempt in range(3):
-        result = await place_order(client, symbol, order_side, size, f"{side} ENTRY")
-        if result:
-            return True
-        logging.warning(f"⚠️ {symbol} {side} ENTRY attempt {attempt+1}/3 failed - retrying...")
-        await asyncio.sleep(1)
-    return False
-
-async def execute_close_position(client: AsyncClient, symbol: str, side: str, size: float) -> bool:
-    """Close existing position with dedup and retries"""
-    st = state[symbol]
-    now = time.time()
-    if side == "LONG":
-        if (now - st["last_long_close_ts"]) < 2.0:
-            logging.info(f"🛡️ {symbol} LONG dedup: skipping duplicate close")
-            return False
-        st["last_long_close_ts"] = now
-    else:
-        if (now - st["last_short_close_ts"]) < 2.0:
-            logging.info(f"🛡️ {symbol} SHORT dedup: skipping duplicate close")
-            return False
-        st["last_short_close_ts"] = now
-    order_side = "SELL" if side == "LONG" else "BUY"
-    for attempt in range(3):
-        result = await place_order(client, symbol, order_side, size, f"{side} CLOSE")
-        if result:
-            # Log slippage if possible
-            order_id = result.get('orderId')
-            order_details = await safe_api_call(client.futures_get_order, symbol=symbol, orderId=order_id)
-            if order_details and 'avgPrice' in order_details:
-                avg_fill = float(order_details['avgPrice'])
-                expected_stop = st[f"{side.lower()}_trailing_stop_price"]
-                slippage = abs(avg_fill - expected_stop) / expected_stop * 100 if expected_stop else 0
-                logging.info(f"📉 {symbol} {side} CLOSE slippage: {slippage:.2f}% (Fill: {avg_fill:.6f} vs Stop: {expected_stop:.6f})")
-            return True
-        logging.warning(f"⚠️ {symbol} {side} CLOSE attempt {attempt+1}/3 failed - retrying...")
-        await asyncio.sleep(1)
-    logging.error(f"❌ {symbol} {side} CLOSE FAILED after retries - position remains open!")
-    return False
+async def status_logger():
+    while True:
+        try:
+            await asyncio.sleep(120)
+            current_time = time.strftime("%H:%M", time.localtime())
+            logging.info(f"📊 === STATUS {current_time} ===")
+            for symbol in SYMBOLS:
+                st = state[symbol]
+                if not st["ready"]:
+                    candle_count = len(st["klines"])
+                    logging.info(f"{symbol}: {candle_count} candles (not ready)")
+                    continue
+                price = st["price"]
+                tama_fast = st.get("tama_fast")
+                tama_slow = st.get("tama_slow")
+                er = st.get("efficiency_ratio")
+                if price and tama_fast and tama_slow and er is not None:
+                    trend = "BULL ▲" if tama_fast > tama_slow else ("BEAR ▼" if tama_fast < tama_slow else "FLAT ═")
+                    logging.info(f"{symbol}: ${price:.6f} | {trend} | ER={er:.3f}")
+                    long_lock = "🔒" if not st['long_entry_allowed'] else "🔓"
+                    short_lock = "🔒" if not st['short_entry_allowed'] else "🔓"
+                    if st["long_position"] > 0:
+                        logging.info(f"  LONG: {st['long_position']} {long_lock}")
+                    if st["short_position"] > 0:
+                        logging.info(f"  SHORT: {st['short_position']} {short_lock}")
+            logging.info("📊 === END STATUS ===")
+        except Exception as e:
+            logging.error(f"Status error: {e}")
 
 async def recover_positions_from_exchange(client: AsyncClient):
-    """Recover actual positions from Binance and open orders"""
-    logging.info("🔍 Checking exchange for existing positions and orders...")
+    logging.info("🔍 Checking exchange...")
     try:
-        positions = await safe_api_call(client.futures_position_information)
-        all_open_orders = await safe_api_call(client.futures_get_open_orders)
-        for pos in positions:
-            symbol = pos['symbol']
-            if symbol not in SYMBOLS:
+        account_info = await safe_api_call(client.futures_account)
+        if not account_info or 'positions' not in account_info:
+            return
+        positions = account_info.get('positions', [])
+        recovered_count = 0
+        for position in positions:
+            try:
+                symbol = position.get('symbol')
+                if symbol not in SYMBOLS:
+                    continue
+                position_amt = float(position.get('positionAmt', 0))
+                position_side = position.get('positionSide')
+                if abs(position_amt) > 0.0001:
+                    entry_price = float(position.get('entryPrice', 0))
+                    mark_price = float(position.get('markPrice', 0))
+                    if position_side == "LONG" and position_amt > 0:
+                        logging.info(f"♻️ [{symbol}] RECOVERED LONG: {position_amt}")
+                        state[symbol]["long_position"] = position_amt
+                        state[symbol]["long_entry_allowed"] = False
+                        recovered_count += 1
+                        init_price = mark_price if mark_price > 0 else (state[symbol]["price"] if state[symbol]["price"] else entry_price)
+                        if init_price and init_price > 0:
+                            initialize_trailing_stop(symbol, "LONG", init_price)
+                    elif position_side == "SHORT" and position_amt < 0:
+                        logging.info(f"♻️ [{symbol}] RECOVERED SHORT: {abs(position_amt)}")
+                        state[symbol]["short_position"] = abs(position_amt)
+                        state[symbol]["short_entry_allowed"] = False
+                        recovered_count += 1
+                        init_price = mark_price if mark_price > 0 else (state[symbol]["price"] if state[symbol]["price"] else entry_price)
+                        if init_price and init_price > 0:
+                            initialize_trailing_stop(symbol, "SHORT", init_price)
+            except (TypeError, ValueError, KeyError) as e:
+                logging.error(f"Error processing position: {e}")
                 continue
-            st = state[symbol]
-            position_side = pos['positionSide']
-            amt = float(pos['positionAmt'])
-            if position_side == "LONG" and amt > 0.0001:
-                entry_price = float(pos['entryPrice'])
-                mark_price = float(pos['markPrice'])
-                logging.info(f"♻️ [{symbol}] RECOVERED LONG: Amt={amt}, Entry={entry_price:.6f}")
-                st["long_position"] = abs(amt)
-                st["long_entry_allowed"] = False
-                init_price = mark_price if mark_price > 0 else (st["price"] if st["price"] else entry_price)
-                if init_price:
-                    await initialize_trailing_stop(client, symbol, "LONG", init_price)
-                    logging.info(f"✅ [{symbol}] LONG stop initialized at {init_price:.6f}")
-                    logging.info(f"🔒 [{symbol}] LONG crossover lock engaged (existing position)")
-            elif position_side == "SHORT" and amt < -0.0001:
-                entry_price = float(pos['entryPrice'])
-                mark_price = float(pos['markPrice'])
-                logging.info(f"♻️ [{symbol}] RECOVERED SHORT: Amt={abs(amt)}, Entry={entry_price:.6f}")
-                st["short_position"] = abs(amt)
-                st["short_entry_allowed"] = False
-                init_price = mark_price if mark_price > 0 else (st["price"] if st["price"] else entry_price)
-                if init_price:
-                    await initialize_trailing_stop(client, symbol, "SHORT", init_price)
-                    logging.info(f"✅ [{symbol}] SHORT stop initialized at {init_price:.6f}")
-                    logging.info(f"🔒 [{symbol}] SHORT crossover lock engaged (existing position)")
-            else:
-                # No position on exchange - force unlock if stuck
-                if position_side == "LONG" and not st["long_entry_allowed"]:
-                    logging.warning(f"🔧 [{symbol}] LONG lock stuck without position - forcing unlock")
-                    st["long_entry_allowed"] = True
-                if position_side == "SHORT" and not st["short_entry_allowed"]:
-                    logging.warning(f"🔧 [{symbol}] SHORT lock stuck without position - forcing unlock")
-                    st["short_entry_allowed"] = True
-        # Check for existing stop orders
-        for order in all_open_orders:
-            symbol = order['symbol']
-            if symbol not in SYMBOLS:
-                continue
-            st = state[symbol]
-            if order['type'] == 'STOP_MARKET' and order['reduceOnly']:
-                if order['positionSide'] == 'LONG' and order['side'] == 'SELL':
-                    st["long_stop_order_id"] = order['orderId']
-                    st["long_trailing_stop_price"] = float(order['stopPrice'])
-                elif order['positionSide'] == 'SHORT' and order['side'] == 'BUY':
-                    st["short_stop_order_id"] = order['orderId']
-                    st["short_trailing_stop_price"] = float(order['stopPrice'])
-        save_positions()
-        logging.info("✅ Recovery complete")
+        if recovered_count > 0:
+            logging.info(f"✅ Recovered {recovered_count} positions")
+            save_positions()
+        else:
+            logging.info("✅ No positions on exchange")
     except Exception as e:
-        logging.error(f"❌ Position recovery failed: {e}")
+        logging.error(f"❌ Recovery failed: {e}")
 
 async def init_bot(client: AsyncClient):
-    """Initialize bot with historical data"""
-    logging.info("🔧 Initializing bot...")
-    logging.info(f"📊 STRATEGY: TAMA CROSSOVER (Anti-Ping-Pong)")
-    logging.info(f"📊   Layer 1: Kalman Filter (Q={KALMAN_Q}, R={KALMAN_R})")
-    logging.info(f"📊   Layer 2: JMA Fast={JMA_LENGTH_FAST}, Slow={JMA_LENGTH_SLOW}")
-    logging.info(f"📊   Layer 3: ER Adaptation (periods={ER_PERIODS}, α={ALPHA_WEIGHT})")
-    logging.info(f"📊 ENTRY: TAMA-{JMA_LENGTH_FAST} crosses TAMA-{JMA_LENGTH_SLOW} (once per trend)")
-    logging.info(f"📊 EXIT: Trailing stop ONLY ({TRAILING_STOP_PERCENT}%)")
-    logging.info(f"📊 ANTI-PING-PONG: Crossover lock until position closed")
-    logging.info(f"📊 SYMBOLS: {len(SYMBOLS)} symbols")
-    logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
-    
-    load_klines()
-    load_positions()
-    
-    logging.info("📋 Initial state per symbol:")
-    for sym in SYMBOLS:
-        st = state[sym]
-        long_str = f"LONG={st['long_position']}" if st['long_position'] > 0 else "LONG=None"
-        short_str = f"SHORT={st['short_position']}" if st['short_position'] > 0 else "SHORT=None"
-        long_lock = "🔒" if not st['long_entry_allowed'] else "🔓"
-        short_lock = "🔒" if not st['short_entry_allowed'] else "🔓"
-        logging.info(f"   [{sym}]: {long_str} {long_lock}, {short_str} {short_lock}")
-    
-    await recover_positions_from_exchange(client)
-    
-    logging.info("📋 Final state after exchange verification:")
-    for sym in SYMBOLS:
-        st = state[sym]
-        status_parts = []
-        if st['long_position'] > 0:
-            stop_status = "✅" if (st['long_trailing_stop_price'] and st['long_peak_price']) else "❌"
-            lock_status = "🔒" if not st['long_entry_allowed'] else "🔓"
-            status_parts.append(f"LONG={st['long_position']} {stop_status} {lock_status}")
-        if st['short_position'] > 0:
-            stop_status = "✅" if (st['short_trailing_stop_price'] and st['short_lowest_price']) else "❌"
-            lock_status = "🔒" if not st['short_entry_allowed'] else "🔓"
-            status_parts.append(f"SHORT={st['short_position']} {stop_status} {lock_status}")
-        if not status_parts:
-            status_parts.append("FLAT 🔓🔓")
-        logging.info(f"   [{sym}]: {', '.join(status_parts)}")
-    
-    symbols_needing_data = []
-    for symbol in SYMBOLS:
-        klines = state[symbol]["klines"]
-        if len(klines) >= MA_PERIODS:
-            apply_kalman_to_klines(symbol)
-            jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
-            jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-            er = calculate_efficiency_ratio(symbol)
-            if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
-                state[symbol]["ready"] = True
-                logging.info(f"✅ {symbol} ready from loaded data")
-            else:
-                symbols_needing_data.append(symbol)
+    try:
+        logging.info("🔧 Initializing...")
+        logging.info(f"📊 TAMA Crossover Strategy")
+        
+        # Show entry mode
+        if USE_CROSSOVER_ENTRY:
+            logging.info(f"📊 ENTRY MODE: CROSSOVER (requires actual cross event)")
         else:
-            symbols_needing_data.append(symbol)
-    
-    if symbols_needing_data:
-        logging.info(f"🔄 Fetching historical data for {len(symbols_needing_data)} symbols...")
-        for i, symbol in enumerate(symbols_needing_data):
-            try:
-                logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})...")
-                needed_candles = max(MA_PERIODS + 100, 100)
-                klines_data = await safe_api_call(
-                    client.futures_mark_price_klines,
-                    symbol=symbol,
-                    interval=BASE_TIMEFRAME,
-                    limit=min(needed_candles, 1500)
-                )
-                st = state[symbol]
-                st["klines"].clear()
-                for kline in klines_data:
-                    open_time = int(float(kline[0]) / 1000)
-                    st["klines"].append({
-                        "open_time": open_time,
-                        "open": float(kline[1]),
-                        "high": float(kline[2]),
-                        "low": float(kline[3]),
-                        "close": float(kline[4])
-                    })
+            logging.info(f"📊 ENTRY MODE: SYMMETRICAL (price > fast MA > slow MA)")
+        
+        logging.info(f"📊 EXIT MODE: Always uses crossover (symmetrical)")
+        logging.info(f"📊 Timeframe: {BASE_TIMEFRAME}")
+        logging.info(f"📊 Fast={JMA_LENGTH_FAST}, Slow={JMA_LENGTH_SLOW}")
+        logging.info(f"📊 Trailing Stop: {TRAILING_STOP_PERCENT}%")
+        load_klines()
+        load_positions()
+        await recover_positions_from_exchange(client)
+        symbols_needing_data = []
+        for symbol in SYMBOLS:
+            klines = state[symbol]["klines"]
+            if len(klines) >= MA_PERIODS:
                 apply_kalman_to_klines(symbol)
                 jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
                 jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
                 er = calculate_efficiency_ratio(symbol)
                 if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
-                    st["ready"] = True
-                    logging.info(f"✅ {symbol} ready from API")
-                if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(15)
-            except Exception as e:
-                logging.error(f"❌ {symbol} fetch failed: {e}")
-                if i < len(symbols_needing_data) - 1:
-                    await asyncio.sleep(15)
-    else:
-        logging.info("🎯 All symbols ready!")
-    
-    save_klines()
-    await asyncio.sleep(2)
-    logging.info("🚀 Initialization complete")
+                    state[symbol]["ready"] = True
+                    logging.info(f"✅ {symbol} ready (loaded)")
+                else:
+                    symbols_needing_data.append(symbol)
+            else:
+                symbols_needing_data.append(symbol)
+        if symbols_needing_data:
+            logging.info(f"🔄 Fetching data for {len(symbols_needing_data)} symbols...")
+            for i, symbol in enumerate(symbols_needing_data):
+                try:
+                    logging.info(f"📈 Fetching {symbol} ({i+1}/{len(symbols_needing_data)})")
+                    needed_candles = max(MA_PERIODS + 100, 100)
+                    klines_data = await safe_api_call(
+                        client.futures_mark_price_klines,
+                        symbol=symbol,
+                        interval=BASE_TIMEFRAME,
+                        limit=min(needed_candles, 1500)
+                    )
+                    if not klines_data or not isinstance(klines_data, list):
+                        continue
+                    st = state[symbol]
+                    st["klines"].clear()
+                    for kline in klines_data:
+                        try:
+                            open_time = int(float(kline[0]) / 1000)
+                            st["klines"].append({
+                                "open_time": open_time,
+                                "open": float(kline[1]),
+                                "high": float(kline[2]),
+                                "low": float(kline[3]),
+                                "close": float(kline[4])
+                            })
+                        except (IndexError, ValueError, TypeError):
+                            continue
+                    apply_kalman_to_klines(symbol)
+                    jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
+                    jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
+                    er = calculate_efficiency_ratio(symbol)
+                    if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
+                        st["ready"] = True
+                        logging.info(f"✅ {symbol} ready (API)")
+                    if i < len(symbols_needing_data) - 1:
+                        await asyncio.sleep(15)
+                except Exception as e:
+                    logging.error(f"❌ {symbol} fetch failed: {e}")
+                    if i < len(symbols_needing_data) - 1:
+                        await asyncio.sleep(15)
+        else:
+            logging.info("🎯 All symbols ready!")
+        save_klines()
+        await asyncio.sleep(2)
+        logging.info("🚀 Initialization complete")
+    except Exception as e:
+        logging.error(f"❌ Init error: {e}")
+        raise
 
 async def main():
     if not API_KEY or not API_SECRET:
-        raise ValueError("Missing Binance API credentials")
+        raise ValueError("Missing API credentials in .env")
     client = await AsyncClient.create(API_KEY, API_SECRET)
     atexit.register(save_klines)
     atexit.register(save_positions)
@@ -1018,10 +875,12 @@ async def main():
         await init_bot(client)
         price_task = asyncio.create_task(price_feed_loop(client))
         trade_task = asyncio.create_task(trading_loop(client))
-        poll_task = asyncio.create_task(position_polling_loop(client))
         status_task = asyncio.create_task(status_logger())
-        logging.info("🚀 Bot started - TAMA CROSSOVER STRATEGY")
-        await asyncio.gather(price_task, trade_task, poll_task, status_task)
+        logging.info("🚀 Bot started - TAMA CROSSOVER")
+        await asyncio.gather(price_task, trade_task, status_task)
+    except Exception as e:
+        logging.error(f"❌ Critical error: {e}")
+        raise
     finally:
         await client.close_connection()
 
@@ -1032,29 +891,42 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S"
     )
     print("=" * 80)
-    print("TAMA CROSSOVER STRATEGY (Anti-Ping-Pong)")
+    print("TAMA TRADING STRATEGY (Toggleable Entry Mode)")
     print("=" * 80)
     print(f"Triple-Layer Adaptive Moving Average:")
     print(f"  Layer 1: Kalman Filter (Q={KALMAN_Q}, R={KALMAN_R})")
     print(f"  Layer 2: JMA Fast={JMA_LENGTH_FAST}, Slow={JMA_LENGTH_SLOW}")
     print(f"  Layer 3: ER Adaptation (α={ALPHA_WEIGHT})")
     print(f"")
-    print(f"Entry Rules:")
-    print(f"  • LONG: TAMA-{JMA_LENGTH_FAST} crosses ABOVE TAMA-{JMA_LENGTH_SLOW}")
-    print(f"  • SHORT: TAMA-{JMA_LENGTH_FAST} crosses BELOW TAMA-{JMA_LENGTH_SLOW}")
-    print(f"  • One entry per trend (crossover lock until position closed)")
+    
+    # Show current entry mode
+    if USE_CROSSOVER_ENTRY:
+        print(f"ENTRY MODE: CROSSOVER (Active)")
+        print(f"  • LONG ENTRY: Fast MA crosses ABOVE Slow MA")
+        print(f"  • SHORT ENTRY: Fast MA crosses BELOW Slow MA")
+        print(f"  • Requires actual crossover event (waits for cross)")
+    else:
+        print(f"ENTRY MODE: SYMMETRICAL (Active)")
+        print(f"  • LONG ENTRY: Price > Fast MA AND Fast MA > Slow MA")
+        print(f"  • SHORT ENTRY: Price < Fast MA AND Fast MA < Slow MA")
+        print(f"  • No cross required (continuous condition)")
+    
     print(f"")
-    print(f"Exit Rules:")
-    print(f"  • Trailing stop ONLY: {TRAILING_STOP_PERCENT}% (~{TRAILING_STOP_PERCENT * LEVERAGE:.1f}% @ {LEVERAGE}x)")
-    print(f"  • No forced exits from opposite crossovers")
+    print(f"EXIT MODE: CROSSOVER (Always Active)")
+    print(f"  • LONG EXIT: Fast MA crosses BELOW Slow MA (opposite signal)")
+    print(f"  • SHORT EXIT: Fast MA crosses ABOVE Slow MA (opposite signal)")
+    print(f"  • Backup: Trailing stop at {TRAILING_STOP_PERCENT}% (~{TRAILING_STOP_PERCENT * LEVERAGE:.1f}% @ {LEVERAGE}x)")
     print(f"")
-    print(f"Anti-Ping-Pong Logic:")
-    print(f"  • Position opened → Crossover lock engaged 🔒")
-    print(f"  • Trailing stop closes position → Lock released 🔓")
-    print(f"  • Fresh crossover after flat → New entry allowed")
+    print(f"How to Toggle:")
+    print(f"  → Set USE_CROSSOVER_ENTRY = True (Crossover mode - waits for cross)")
+    print(f"  → Set USE_CROSSOVER_ENTRY = False (Symmetrical mode - continuous)")
     print("=" * 80)
     print(f"Symbols: {len(SYMBOLS)} - {', '.join(SYMBOLS.keys())}")
     print(f"Timeframe: {BASE_TIMEFRAME}")
-    print(f"Data Flow: Raw Price → Kalman → JMA → TAMA (ER-adjusted)")
     print("=" * 80)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 Bot stopped by user")
+    except Exception as e:
+        logging.error(f"❌ Fatal error: {e}")
