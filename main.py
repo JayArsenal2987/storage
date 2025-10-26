@@ -1,509 +1,169 @@
-#!/usr/bin/env python3
-import os, json, asyncio, threading, logging, websockets
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
-from binance import AsyncClient
-from collections import deque
-import time
+//@version=5
+indicator("TAMA - Triple Adaptive MA with Dual ER", overlay=true, max_bars_back=500)
 
-# ────────────── CONFIG ──────────────
-load_dotenv()
-API_KEY    = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-LEVERAGE   = int(os.getenv("LEVERAGE", "50"))
+// ==================== INPUTS ====================
 
-SYMBOLS = {
-    "ADAUSDT": 10,  "BNBUSDT": 0.03,  "SOLUSDT": 0.10,
-    "XRPUSDT": 10,
-}
+// Kalman Filter Parameters
+kalman_q = input.float(0.001, "Kalman Q (Process Noise)", minval=0.0001, maxval=0.1, step=0.001, group="Layer 1: Kalman Filter")
+kalman_r = input.float(0.01, "Kalman R (Measurement Noise)", minval=0.001, maxval=1.0, step=0.001, group="Layer 1: Kalman Filter")
 
-# Simple configuration
-ROLLING_PERIOD_MINUTES = 720  # 12 hours rolling window
-ENTRY_THRESHOLD_PCT = 0.02    # 2% above lowest / below highest for entry
-TRAILING_STOP_PCT = 0.02      # 2% trailing stop for exits/flips
-MAX_LOSS_PCT = 0.02           # 2% maximum loss protection (MANDATORY EXIT)
-ANALYSIS_INTERVAL_SECONDS = 60  # Update highest/lowest every 60 seconds
-FLIP_COOLDOWN_SECS = 1.0      # 1 second cooldown after flip
+// JMA Parameters
+jma_length_fast = input.int(7, "JMA Fast Length", minval=1, maxval=500, group="Layer 2: JMA")
+jma_length_slow = input.int(100, "JMA Slow Length", minval=1, maxval=500, group="Layer 2: JMA")
+jma_phase = input.int(0, "JMA Phase", minval=-100, maxval=100, group="Layer 2: JMA")
+jma_power = input.int(3, "JMA Power", minval=1, maxval=10, group="Layer 2: JMA")
 
-# ────────────── QUIET /ping ──────────
-class Ping(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/ping":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"pong")
-    def log_message(self, *_) : pass
+// Efficiency Ratio Parameters
+er_periods_fast = input.int(20, "ER Fast Periods", minval=5, maxval=200, group="Layer 3: Efficiency Ratio")
+er_periods_slow = input.int(100, "ER Slow Periods", minval=10, maxval=500, group="Layer 3: Efficiency Ratio")
+alpha_weight = input.float(1.0, "Alpha Weight", minval=0.1, maxval=2.0, step=0.1, group="Layer 3: Efficiency Ratio")
 
-def start_ping():
-    HTTPServer(("0.0.0.0", 10000), Ping).serve_forever()
+// Visual Settings
+show_fast = input.bool(true, "Show TAMA Fast", group="Display")
+show_slow = input.bool(true, "Show TAMA Slow", group="Display")
+show_signals = input.bool(true, "Show Entry Signals", group="Display")
+show_er_info = input.bool(true, "Show ER Values in Table", group="Display")
 
-# ───────────── ORDER HELPERS ─────────
-def open_long(sym):
-    return dict(symbol=sym, side="BUY",  type="MARKET",
-                quantity=SYMBOLS[sym], positionSide="LONG")
-def close_long(sym):
-    return dict(symbol=sym, side="SELL", type="MARKET",
-                quantity=SYMBOLS[sym], positionSide="LONG")
-def open_short(sym):
-    return dict(symbol=sym, side="SELL", type="MARKET",
-                quantity=SYMBOLS[sym], positionSide="SHORT")
-def close_short(sym):
-    return dict(symbol=sym, side="BUY",  type="MARKET",
-                quantity=SYMBOLS[sym], positionSide="SHORT")
+// Entry Mode Selection
+use_crossover_entry = input.bool(false, "Use Crossover Entry Mode", tooltip="TRUE = Requires actual crossover event | FALSE = Symmetrical mode (Price > Fast > Slow)", group="Entry Mode")
+entry_mode_info = use_crossover_entry ? "CROSSOVER MODE: Waits for MA cross" : "SYMMETRICAL MODE: Continuous condition"
 
-# ───────────── RUNTIME STATE ─────────
-state = {
-    s: {
-        # Position flags
-        "in_long": False, "long_pending": False,
-        "in_short": False, "short_pending": False,
+// ==================== KALMAN FILTER ====================
 
-        # Entry prices
-        "long_entry_price": None,
-        "short_entry_price": None,
+var float kalman_x = na
+var float kalman_p = 1.0
 
-        # Rolling 720-minute data (updated every minute)
-        "rolling_highest": None,      # Highest price in last 720 minutes
-        "rolling_lowest": None,       # Lowest price in last 720 minutes
-        "last_analysis_time": 0,
-
-        # Trailing stop tracking
-        "trail_extremum": None,       # Peak for long, trough for short
-        "trail_side": None,           # "LONG" or "SHORT" when active
-
-        # Entry triggers (calculated from rolling data)
-        "long_entry_trigger": None,   # rolling_lowest * 1.02
-        "short_entry_trigger": None,  # rolling_highest * 0.98
-
-        # Flip cooldown
-        "cooldown_until": 0.0,
-
-        "last_price": None,
-        "order_lock": asyncio.Lock(),
-        "last_order_id": None,
-    }
-    for s in SYMBOLS
-}
-
-# ───────────── POSITION VALIDATION ─────────
-async def get_position_size(cli: AsyncClient, symbol: str, side: str) -> float:
-    """Get current position size from Binance"""
-    try:
-        positions = await cli.futures_position_information(symbol=symbol)
-        for pos in positions:
-            if pos['positionSide'] == side:
-                return abs(float(pos['positionAmt']))
-    except Exception as e:
-        logging.error(f"Failed to get position for {symbol} {side}: {e}")
-    return 0.0
-
-async def safe_order_execution(cli: AsyncClient, order_params: dict, symbol: str, action: str) -> bool:
-    """Execute order with duplicate prevention and validation"""
-    try:
-        # Validate close-size roughly
-        if action.startswith("CLOSE") or "EXIT" in action:
-            side = "LONG" if "LONG" in action else "SHORT"
-            current_pos = await get_position_size(cli, symbol, side)
-            required_qty = order_params['quantity']
-            if current_pos < required_qty * 0.99:  # tolerance
-                logging.warning(f"{symbol} {action}: Insufficient position size {current_pos} < {required_qty}")
-                return False
-
-        # Execute the order
-        result = await cli.futures_create_order(**order_params)
-        state[symbol]["last_order_id"] = result.get('orderId')
-        logging.info(f"{symbol} {action} executed - OrderID: {state[symbol]['last_order_id']}")
-        return True
-    except Exception as e:
-        logging.error(f"{symbol} {action} failed: {e}")
-        return False
-
-# ───────────── ROLLING ANALYSIS ─────────
-async def update_rolling_levels(cli: AsyncClient, symbol: str):
-    """
-    Update rolling 720-minute highest and lowest prices every minute
-    """
-    try:
-        # Get rolling 720 minutes of 1-minute candles
-        klines = await cli.get_klines(
-            symbol=symbol, 
-            interval="1m", 
-            limit=ROLLING_PERIOD_MINUTES
-        )
+f_kalman_filter(float measurement) =>
+    var float x = na
+    var float p = 1.0
+    
+    if na(x)
+        x := measurement
+        p := 1.0
+        x
+    else
+        // Prediction
+        x_pred = x
+        p_pred = p + kalman_q
         
-        # Find highest and lowest prices from the candles
-        highest = max(float(kline[2]) for kline in klines)  # High prices
-        lowest = min(float(kline[3]) for kline in klines)   # Low prices
+        // Update
+        kalman_gain = p_pred / (p_pred + kalman_r)
+        x := x_pred + kalman_gain * (measurement - x_pred)
+        p := (1 - kalman_gain) * p_pred
+        x
+
+// Apply Kalman filter to close price
+kalman_close = f_kalman_filter(close)
+
+// ==================== JMA CALCULATION ====================
+
+f_jma(series float src, simple int length, simple int phase, simple int power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    
+    var float e0 = 0.0
+    var float e1 = 0.0
+    var float e2 = 0.0
+    var float jma = 0.0
+    
+    e0 := (1 - alpha) * src + alpha * e0
+    e1 := (src - e0) * (1 - beta) + beta * e1
+    e2 := (e0 + phaseRatio * e1 - jma) * math.pow((1 - alpha), 2) + math.pow(alpha, 2) * e2
+    jma := e2 + jma
+    jma
+
+// Calculate JMA on Kalman-filtered data
+jma_fast = f_jma(kalman_close, jma_length_fast, jma_phase, jma_power)
+jma_slow = f_jma(kalman_close, jma_length_slow, jma_phase, jma_power)
+
+// ==================== EFFICIENCY RATIO ====================
+
+f_efficiency_ratio(simple int periods) =>
+    if bar_index < periods
+        na
+    else
+        net_change = math.abs(close - close[periods])
+        sum_changes = 0.0
+        for i = 1 to periods
+            sum_changes := sum_changes + math.abs(close[i-1] - close[i])
         
-        # Update state
-        st = state[symbol]
-        st["rolling_highest"] = highest
-        st["rolling_lowest"] = lowest
-        st["last_analysis_time"] = time.time()
-        
-        # Calculate entry triggers
-        st["long_entry_trigger"] = lowest * (1 + ENTRY_THRESHOLD_PCT)   # 2% above lowest
-        st["short_entry_trigger"] = highest * (1 - ENTRY_THRESHOLD_PCT) # 2% below highest
-        
-        logging.info(f"{symbol} ROLLING UPDATE: Highest=${highest:.4f}, Lowest=${lowest:.4f}")
-        logging.info(f"{symbol} ENTRY TRIGGERS: LONG>${st['long_entry_trigger']:.4f}, SHORT<${st['short_entry_trigger']:.4f}")
-        
-        return True
-        
-    except Exception as e:
-        logging.error(f"{symbol} Rolling analysis failed: {e}")
-        return False
+        sum_changes == 0 ? 0 : net_change / sum_changes
 
-# ───────────── LOSS PROTECTION ─────────
-async def check_loss_protection(cli: AsyncClient, sym: str, price: float):
-    """
-    MANDATORY 2% loss protection - Exit immediately if loss reaches 2%
-    """
-    st = state[sym]
+// Calculate separate ERs
+er_fast = f_efficiency_ratio(er_periods_fast)
+er_slow = f_efficiency_ratio(er_periods_slow)
+
+// ==================== TAMA CALCULATION ====================
+
+f_tama(float jma_value, float kalman_price, float er) =>
+    if na(jma_value) or na(kalman_price) or na(er)
+        na
+    else
+        adjustment = alpha_weight * er * (kalman_price - jma_value)
+        jma_value + adjustment
+
+// Calculate TAMA Fast and Slow
+tama_fast = f_tama(jma_fast, kalman_close, er_fast)
+tama_slow = f_tama(jma_slow, kalman_close, er_slow)
+
+// ==================== SIGNALS ====================
+
+// Crossover detection
+bullish_cross = ta.crossover(tama_fast, tama_slow)
+bearish_cross = ta.crossunder(tama_fast, tama_slow)
+
+// Entry conditions (Symmetrical mode - can be changed)
+bullish_condition = close > tama_fast and tama_fast > tama_slow
+bearish_condition = close < tama_fast and tama_fast < tama_slow
+
+// ==================== PLOTTING ====================
+
+// Plot TAMA lines
+plot(show_fast ? tama_fast : na, "TAMA Fast", color=color.new(color.blue, 0), linewidth=2)
+plot(show_slow ? tama_slow : na, "TAMA Slow", color=color.new(color.red, 0), linewidth=2)
+
+// Plot crossover signals
+plotshape(show_signals and bullish_cross, "Bullish Cross", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.small)
+plotshape(show_signals and bearish_cross, "Bearish Cross", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// Background color for trend
+bgcolor(bullish_condition ? color.new(color.green, 95) : bearish_condition ? color.new(color.red, 95) : na)
+
+// ==================== INFO TABLE ====================
+
+if show_er_info and barstate.islast
+    var table info_table = table.new(position.top_right, 2, 6, border_width=1)
     
-    # Only check if we have a position
-    if not (st["in_long"] or st["in_short"]):
-        return
+    // Header
+    table.cell(info_table, 0, 0, "TAMA Info", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 0, "Value", text_color=color.white, bgcolor=color.gray)
     
-    entry_price = st["long_entry_price"] if st["in_long"] else st["short_entry_price"]
-    if not entry_price:
-        return
+    // Trend
+    trend_text = tama_fast > tama_slow ? "BULL ▲" : tama_fast < tama_slow ? "BEAR ▼" : "FLAT ═"
+    trend_color = tama_fast > tama_slow ? color.green : tama_fast < tama_slow ? color.red : color.gray
+    table.cell(info_table, 0, 1, "Trend", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 1, trend_text, text_color=color.white, bgcolor=trend_color)
     
-    # Calculate current loss percentage
-    if st["in_long"]:
-        loss_pct = (entry_price - price) / entry_price  # Loss when price drops
-    else:  # SHORT
-        loss_pct = (price - entry_price) / entry_price  # Loss when price rises
+    // ER Fast
+    table.cell(info_table, 0, 2, "ER Fast", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 2, str.tostring(er_fast, "#.###"), text_color=color.white, bgcolor=color.blue)
     
-    # MANDATORY EXIT: If loss reaches 2%, close position immediately
-    if loss_pct >= MAX_LOSS_PCT:
-        logging.warning(f"{sym} LOSS PROTECTION! Loss {loss_pct*100:.2f}% reached {MAX_LOSS_PCT*100:.1f}% limit")
-        
-        async with st["order_lock"]:
-            if st["in_long"] and not st["long_pending"]:
-                st["long_pending"] = True
-                try:
-                    if await safe_order_execution(cli, close_long(sym), sym, "LOSS PROTECTION EXIT"):
-                        st["in_long"] = False
-                        st["long_entry_price"] = None
-                        st["trail_side"] = None
-                        st["trail_extremum"] = None
-                        logging.warning(f"{sym} LONG position closed at {loss_pct*100:.2f}% loss @ ${price:.4f}")
-                finally:
-                    st["long_pending"] = False
-            
-            elif st["in_short"] and not st["short_pending"]:
-                st["short_pending"] = True  
-                try:
-                    if await safe_order_execution(cli, close_short(sym), sym, "LOSS PROTECTION EXIT"):
-                        st["in_short"] = False
-                        st["short_entry_price"] = None
-                        st["trail_side"] = None
-                        st["trail_extremum"] = None
-                        logging.warning(f"{sym} SHORT position closed at {loss_pct*100:.2f}% loss @ ${price:.4f}")
-                finally:
-                    st["short_pending"] = False
-
-async def enter_long(cli: AsyncClient, sym: str, price: float, reason: str = ""):
-    st = state[sym]
-    async with st["order_lock"]:
-        if st["in_long"] or st["long_pending"] or st["in_short"] or st["short_pending"]:
-            return False
-        st["long_pending"] = True
-    try:
-        if await safe_order_execution(cli, open_long(sym), sym, f"LONG ENTRY {reason}"):
-            st["in_long"] = True
-            st["long_entry_price"] = price
-            st["trail_side"] = "LONG"
-            st["trail_extremum"] = price  # Start tracking peak from entry
-            logging.info(f"{sym} LONG OPEN @ ${price:.4f} | trail={TRAILING_STOP_PCT*100:.1f}% below peak {reason}")
-            return True
-    finally:
-        st["long_pending"] = False
-    return False
-
-async def enter_short(cli: AsyncClient, sym: str, price: float, reason: str = ""):
-    st = state[sym]
-    async with st["order_lock"]:
-        if st["in_short"] or st["short_pending"] or st["in_long"] or st["long_pending"]:
-            return False
-        st["short_pending"] = True
-    try:
-        if await safe_order_execution(cli, open_short(sym), sym, f"SHORT ENTRY {reason}"):
-            st["in_short"] = True
-            st["short_entry_price"] = price
-            st["trail_side"] = "SHORT"
-            st["trail_extremum"] = price  # Start tracking trough from entry
-            logging.info(f"{sym} SHORT OPEN @ ${price:.4f} | trail={TRAILING_STOP_PCT*100:.1f}% above trough {reason}")
-            return True
-    finally:
-        st["short_pending"] = False
-    return False
-
-# ───────────── ENTRY SIGNAL DETECTION ─────────
-async def check_entry_signals(cli: AsyncClient, sym: str, price: float):
-    """
-    Check if price crosses 2% thresholds for entry signals
-    """
-    st = state[sym]
+    // ER Slow
+    table.cell(info_table, 0, 3, "ER Slow", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 3, str.tostring(er_slow, "#.###"), text_color=color.white, bgcolor=color.red)
     
-    # Skip if no rolling data yet or already in position
-    if not st["long_entry_trigger"] or not st["short_entry_trigger"]:
-        return
+    // TAMA Fast
+    table.cell(info_table, 0, 4, "TAMA Fast", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 4, str.tostring(tama_fast, "#.####"), text_color=color.white, bgcolor=color.blue)
     
-    # Skip if already in a position
-    if st["in_long"] or st["in_short"]:
-        return
-    
-    # Check LONG entry: price crosses ABOVE (lowest * 1.02)
-    if price >= st["long_entry_trigger"]:
-        await enter_long(cli, sym, price, f"(CROSS ABOVE ${st['long_entry_trigger']:.4f})")
-    
-    # Check SHORT entry: price crosses BELOW (highest * 0.98) 
-    elif price <= st["short_entry_trigger"]:
-        await enter_short(cli, sym, price, f"(CROSS BELOW ${st['short_entry_trigger']:.4f})")
+    // TAMA Slow
+    table.cell(info_table, 0, 5, "TAMA Slow", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 5, str.tostring(tama_slow, "#.####"), text_color=color.white, bgcolor=color.red)
 
-# ───────────── TRAILING STOP LOGIC ─────────
-async def handle_trailing_stops(cli: AsyncClient, sym: str, price: float):
-    """
-    Handle 2% trailing stops for position flips
-    """
-    st = state[sym]
-    side = st["trail_side"]
-    
-    # Only run if we have a position
-    if side not in ("LONG", "SHORT"):
-        return
+// ==================== ALERTS ====================
 
-    now = time.time()
-    # Check cooldown
-    if st["cooldown_until"] and now < st["cooldown_until"]:
-        # Still update extremum during cooldown
-        if side == "LONG" and (st["trail_extremum"] is None or price > st["trail_extremum"]):
-            st["trail_extremum"] = price
-        elif side == "SHORT" and (st["trail_extremum"] is None or price < st["trail_extremum"]):
-            st["trail_extremum"] = price
-        return
-
-    if side == "LONG":
-        # Update peak
-        if st["trail_extremum"] is None or price > st["trail_extremum"]:
-            st["trail_extremum"] = price
-        
-        # Check for 2% pullback from peak → FLIP to SHORT
-        trigger_price = st["trail_extremum"] * (1 - TRAILING_STOP_PCT)
-        if price <= trigger_price:
-            async with st["order_lock"]:
-                if st["long_pending"] or st["short_pending"]:
-                    return
-                st["long_pending"] = True
-            try:
-                if await safe_order_execution(cli, close_long(sym), sym, "LONG EXIT (TRAIL)"):
-                    st["in_long"] = False
-                    st["long_entry_price"] = None
-                    
-                    if await safe_order_execution(cli, open_short(sym), sym, "SHORT ENTRY (FLIP)"):
-                        st["in_short"] = True
-                        st["short_entry_price"] = price
-                        st["trail_side"] = "SHORT"
-                        st["trail_extremum"] = price  # Reset to new trough
-                        st["cooldown_until"] = time.time() + FLIP_COOLDOWN_SECS
-                        
-                        logging.info(f"{sym} FLIP: LONG→SHORT @ ${price:.4f} "
-                                   f"(peak=${st['trail_extremum']/(1-TRAILING_STOP_PCT):.4f}, "
-                                   f"trigger=${trigger_price:.4f}) | cooldown {FLIP_COOLDOWN_SECS:.1f}s")
-            finally:
-                st["long_pending"] = False
-
-    elif side == "SHORT":
-        # Update trough
-        if st["trail_extremum"] is None or price < st["trail_extremum"]:
-            st["trail_extremum"] = price
-        
-        # Check for 2% bounce from trough → FLIP to LONG
-        trigger_price = st["trail_extremum"] * (1 + TRAILING_STOP_PCT)
-        if price >= trigger_price:
-            async with st["order_lock"]:
-                if st["short_pending"] or st["long_pending"]:
-                    return
-                st["short_pending"] = True
-            try:
-                if await safe_order_execution(cli, close_short(sym), sym, "SHORT EXIT (TRAIL)"):
-                    st["in_short"] = False
-                    st["short_entry_price"] = None
-                    
-                    if await safe_order_execution(cli, open_long(sym), sym, "LONG ENTRY (FLIP)"):
-                        st["in_long"] = True
-                        st["long_entry_price"] = price
-                        st["trail_side"] = "LONG"
-                        st["trail_extremum"] = price  # Reset to new peak
-                        st["cooldown_until"] = time.time() + FLIP_COOLDOWN_SECS
-                        
-                        logging.info(f"{sym} FLIP: SHORT→LONG @ ${price:.4f} "
-                                   f"(trough=${st['trail_extremum']/(1+TRAILING_STOP_PCT):.4f}, "
-                                   f"trigger=${trigger_price:.4f}) | cooldown {FLIP_COOLDOWN_SECS:.1f}s")
-            finally:
-                st["short_pending"] = False
-
-# ───────────── ROLLING ANALYSIS SCHEDULER ─────────
-async def rolling_analysis_scheduler(cli: AsyncClient):
-    """
-    Update rolling 720-minute highest/lowest every minute
-    """
-    while True:
-        try:
-            for symbol in SYMBOLS:
-                st = state[symbol]
-                
-                now = time.time()
-                if now - st["last_analysis_time"] >= ANALYSIS_INTERVAL_SECONDS:
-                    await update_rolling_levels(cli, symbol)
-            
-            await asyncio.sleep(10)  # Check every 10 seconds if update is due
-            
-        except Exception as e:
-            logging.error(f"Rolling analysis scheduler error: {e}")
-            await asyncio.sleep(30)
-
-# ───────────── MAIN LOOP ─────────
-async def run(cli: AsyncClient):
-    for s in SYMBOLS:
-        await cli.futures_change_leverage(symbol=s, leverage=LEVERAGE)
-
-    # Start rolling analysis scheduler (updates highest/lowest every minute)
-    asyncio.create_task(rolling_analysis_scheduler(cli))
-    
-    streams = [f"{s.lower()}@trade" for s in SYMBOLS]
-    url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
-
-    async with websockets.connect(url) as ws:
-        async for raw in ws:
-            m = json.loads(raw)
-            stype = m["stream"]; d = m["data"]
-            if not stype.endswith("@trade"):
-                continue
-
-            sym = d["s"]
-            price = float(d["p"])
-            st = state[sym]
-
-            # Update current price
-            st["last_price"] = price
-
-            # PRIORITY 1: Check loss protection (prevent catastrophic losses)
-            await check_loss_protection(cli, sym, price)
-
-            # PRIORITY 2: Check for entry signals (only if no position)
-            await check_entry_signals(cli, sym, price)
-
-            # PRIORITY 3: Handle trailing stops (only if still in position)
-            await handle_trailing_stops(cli, sym, price)
-
-async def main():
-    # /ping server
-    threading.Thread(target=start_ping, daemon=True).start()
-    if not (API_KEY and API_SECRET):
-        raise RuntimeError("Missing Binance API creds")
-    cli = await AsyncClient.create(API_KEY, API_SECRET)
-    await run(cli)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ───────────  EXCHANGE TRAILING STOP (OPTIONAL HELPERS, NOT CALLED)  ─────────
-# These helpers let you place *exchange-native* trailing stops like in your
-# screenshot (TRAILING_STOP_MARKET with a 2.0% callback and an activation price).
-# They do not change any logic above. Call them yourself if/when you want.
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def exchange_cancel_trailing_stop(cli: AsyncClient, symbol: str, side: str) -> None:
-    """
-    Cancel existing exchange-native TRAILING_STOP_MARKET for a given symbol+positionSide.
-    side: "LONG" or "SHORT" (matches positionSide)
-    """
-    try:
-        orders = await cli.futures_get_open_orders(symbol=symbol)
-        for o in orders:
-            if o.get("origType") == "TRAILING_STOP_MARKET" and o.get("positionSide") == side:
-                await cli.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                logging.info(f"{symbol} {side} canceled trailing stop (order {o['orderId']})")
-    except Exception as e:
-        logging.error(f"{symbol} {side} cancel trailing stop failed: {e}")
-
-async def exchange_place_trailing_stop(
-    cli: AsyncClient,
-    symbol: str,
-    side: str,                      # "LONG" to close a long (SELL), "SHORT" to close a short (BUY)
-    activation_price: float = None, # set to current price for immediate activation like the app
-    callback_rate: float = None,    # percent, e.g., 2.0; default uses TRAILING_STOP_PCT
-    working_type: str = "MARK_PRICE",
-    reduce_only: bool = True
-) -> bool:
-    """
-    Place an exchange-native trailing stop *close* order (like the Binance app):
-
-      - For LONG positionSide → creates a SELL TRAILING_STOP_MARKET
-      - For SHORT positionSide → creates a BUY  TRAILING_STOP_MARKET
-
-    Notes:
-      * If the API rejects `reduceOnly` for TRAILING_STOP_MARKET on your account,
-        this function will automatically retry without `reduceOnly`.
-      * This helper does not update any local state; it's purely additive.
-    """
-    try:
-        qty = await get_position_size(cli, symbol, side)
-        if qty <= 0:
-            logging.warning(f"{symbol} {side} no size to protect; trailing not placed.")
-            return False
-
-        order_side = "SELL" if side == "LONG" else "BUY"
-        cb = round((callback_rate if callback_rate is not None else TRAILING_STOP_PCT * 100.0), 1)
-
-        params = dict(
-            symbol=symbol,
-            side=order_side,
-            positionSide=side,
-            type="TRAILING_STOP_MARKET",
-            quantity=qty,
-            callbackRate=cb,
-            workingType=working_type,
-            newOrderRespType="RESULT",
-        )
-        if activation_price is not None:
-            params["activationPrice"] = float(activation_price)
-        if reduce_only:
-            params["reduceOnly"] = True  # some accounts/APIs allow this; if not, we'll retry below
-
-        try:
-            res = await cli.futures_create_order(**params)
-        except Exception as e:
-            # Retry once without reduceOnly if the API complains about it
-            if reduce_only:
-                params.pop("reduceOnly", None)
-                logging.warning(f"{symbol} {side} trailing: retrying without reduceOnly due to: {e}")
-                res = await cli.futures_create_order(**params)
-            else:
-                raise
-
-        logging.info(
-            f"{symbol} {side} trailing stop placed "
-            f"(side={order_side}, qty={qty}, cb={cb}%, "
-            f"activation={params.get('activationPrice','<immediate>')}) | orderId={res.get('orderId')}"
-        )
-        return True
-    except Exception as e:
-        logging.error(f"{symbol} {side} place trailing stop failed: {e}")
-        return False
-
-# Example usage (optional):
-#   await exchange_place_trailing_stop(cli, "XRPUSDT", "SHORT",
-#                                      activation_price=state["XRPUSDT"]["last_price"],
-#                                      callback_rate=2.0, reduce_only=True)
-
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s:%(message)s",
-        datefmt="%b %d %H:%M:%S"
-    )
-    asyncio.run(main())
+alertcondition(bullish_cross, "TAMA Bullish Cross", "TAMA Fast crossed above TAMA Slow - Potential LONG entry")
+alertcondition(bearish_cross, "TAMA Bearish Cross", "TAMA Fast crossed below TAMA Slow - Potential SHORT entry")
+alertcondition(bullish_condition, "TAMA Bullish Condition", "Price > Fast > Slow - Bullish trend")
+alertcondition(bearish_condition, "TAMA Bearish Condition", "Price < Fast < Slow - Bearish trend")
