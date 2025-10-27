@@ -24,19 +24,19 @@ KALMAN_Q = 0.001
 KALMAN_R = 0.01
 
 # Layer 2: JMA Parameters
-JMA_LENGTH_FAST = 7
+JMA_LENGTH_FAST = 4
 JMA_LENGTH_SLOW = 100
 JMA_PHASE = 0
 JMA_POWER = 3
 
 # Layer 3: Efficiency Ratio Parameters
-ER_PERIODS_FAST = 20   # Shorter period for fast MA (more responsive)
+ER_PERIODS_FAST = 10   # Shorter period for fast MA (more responsive)
 ER_PERIODS_SLOW = 100  # Longer period for slow MA (more stable)
 ALPHA_WEIGHT = 1.0
 
 # Trailing Stop Configuration - Asymmetric
-TRAILING_GAIN_PERCENT = 1.0
-TRAILING_LOSS_PERCENT = 0.5
+TRAILING_GAIN_PERCENT = 2.0
+TRAILING_LOSS_PERCENT = 1.0
 
 # Timeframe configuration
 BASE_TIMEFRAME = "15m"
@@ -75,17 +75,11 @@ else:
 
 # Trading symbols and sizes
 SYMBOLS = {
-    "BNBUSDT": 0.03,
-    "XRPUSDT": 10.0,
     "SOLUSDT": 0.1,
-    "ADAUSDT": 10.0,
-    "DOGEUSDT": 40.0,
-    "TRXUSDT": 20.0,
 }
 
 PRECISIONS = {
-    "ETHUSDT": 3, "BNBUSDT": 2, "XRPUSDT": 1, "SOLUSDT": 3, 
-    "ADAUSDT": 0, "DOGEUSDT": 0, "TRXUSDT": 0
+    "SOLUSDT": 3, 
 }
 
 MA_PERIODS = max(JMA_LENGTH_FAST, JMA_LENGTH_SLOW)
@@ -884,6 +878,10 @@ async def status_logger():
                             lowest_gain = ((entry - lowest) / entry) * 100 if entry else 0
                             logging.info(f"    Lowest=${lowest:.6f} (+{lowest_gain:.2f}%) | Stop=${stop:.6f}")
                             logging.info(f"    Distance to Stop: {distance_to_stop:.2f}%")
+                    
+                    # Show hedge mode indicator if both positions open
+                    if st["long_position"] > 0 and st["short_position"] > 0:
+                        logging.info(f"  ⚖️ HEDGE MODE ACTIVE - Both positions running")
                     
                     # Show if flat but locked
                     if st["long_position"] == 0 and not st['long_entry_allowed']:
