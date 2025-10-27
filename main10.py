@@ -30,7 +30,8 @@ JMA_PHASE = 0
 JMA_POWER = 3
 
 # Layer 3: Efficiency Ratio Parameters
-ER_PERIODS = 100
+ER_PERIODS_FAST = 20   # Shorter period for fast MA (more responsive)
+ER_PERIODS_SLOW = 100  # Longer period for slow MA (more stable)
 ALPHA_WEIGHT = 1.0
 
 # Trailing Stop Configuration - Asymmetric
@@ -88,7 +89,7 @@ PRECISIONS = {
 }
 
 MA_PERIODS = max(JMA_LENGTH_FAST, JMA_LENGTH_SLOW)
-KLINE_LIMIT = max(100, MA_PERIODS + 100, ER_PERIODS + 100)
+KLINE_LIMIT = max(100, MA_PERIODS + 100, ER_PERIODS_FAST + 100, ER_PERIODS_SLOW + 100)
 
 # ========================= STATE =========================
 state = {
@@ -104,8 +105,10 @@ state = {
         "tama_slow": None,
         "prev_tama_fast": None,
         "prev_tama_slow": None,
-        "efficiency_ratio": None,
-        "er_ready": False,
+        "efficiency_ratio_fast": None,
+        "efficiency_ratio_slow": None,
+        "er_fast_ready": False,
+        "er_slow_ready": False,
         "ready": False,
         "long_position": 0.0,
         "long_entry_price": None,
@@ -113,15 +116,18 @@ state = {
         "long_peak_price": None,
         "last_long_exec_ts": 0.0,
         "long_entry_allowed": True,
+        "long_signal_active": False,  # NEW: Track if signal is already processed
         "short_position": 0.0,
         "short_entry_price": None,
         "short_trailing_stop_price": None,
         "short_lowest_price": None,
         "last_short_exec_ts": 0.0,
         "short_entry_allowed": True,
+        "short_signal_active": False,  # NEW: Track if signal is already processed
         "stop_warning_logged": False,
         "last_long_exit_signal_ts": 0.0,
         "last_short_exit_signal_ts": 0.0,
+        "last_signal_check_time": 0.0,  # NEW: Throttle signal checks
     }
     for symbol in SYMBOLS
 }
@@ -365,12 +371,14 @@ def reset_trailing_stop(symbol: str, side: str):
             st["long_trailing_stop_price"] = None
             st["long_peak_price"] = None
             st["long_entry_allowed"] = True
+            st["long_signal_active"] = False  # Reset signal flag
             logging.info(f"🔓 {symbol} LONG re-enabled")
         elif side == "SHORT":
             st["short_entry_price"] = None
             st["short_trailing_stop_price"] = None
             st["short_lowest_price"] = None
             st["short_entry_allowed"] = True
+            st["short_signal_active"] = False  # Reset signal flag
             logging.info(f"🔓 {symbol} SHORT re-enabled")
         save_positions()
     except Exception as e:
@@ -459,17 +467,17 @@ def calculate_jma_from_kalman(symbol: str, length: int, phase: int = 50, power: 
         logging.error(f"JMA error {symbol}: {e}")
         return None
 
-def calculate_efficiency_ratio(symbol: str) -> Optional[float]:
+def calculate_efficiency_ratio(symbol: str, periods: int, er_type: str) -> Optional[float]:
     try:
         klines = list(state[symbol]["klines"])
         if USE_LIVE_CANDLE:
             completed = klines
         else:
             completed = klines[:-1]
-        if len(completed) < ER_PERIODS + 1:
+        if len(completed) < periods + 1:
             return None
         closes = []
-        slice_data = completed[-(ER_PERIODS + 1):] if len(completed) >= ER_PERIODS + 1 else completed
+        slice_data = completed[-(periods + 1):] if len(completed) >= periods + 1 else completed
         for k in slice_data:
             if not isinstance(k, dict) or "close" not in k:
                 continue
@@ -477,18 +485,25 @@ def calculate_efficiency_ratio(symbol: str) -> Optional[float]:
                 closes.append(float(k["close"]))
             except (TypeError, ValueError):
                 continue
-        if len(closes) < ER_PERIODS + 1:
+        if len(closes) < periods + 1:
             return None
         net_change = abs(closes[-1] - closes[0])
         sum_changes = sum(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
         if sum_changes == 0:
             return None
         er = net_change / sum_changes
-        state[symbol]["efficiency_ratio"] = er
-        state[symbol]["er_ready"] = True
+        
+        # Store in appropriate state variable
+        if er_type == "fast":
+            state[symbol]["efficiency_ratio_fast"] = er
+            state[symbol]["er_fast_ready"] = True
+        elif er_type == "slow":
+            state[symbol]["efficiency_ratio_slow"] = er
+            state[symbol]["er_slow_ready"] = True
+            
         return er
     except Exception as e:
-        logging.error(f"ER error {symbol}: {e}")
+        logging.error(f"ER error {symbol} ({er_type}): {e}")
         return None
 
 def calculate_tama(symbol: str, jma_value: Optional[float], kalman_price: float, er: Optional[float]) -> Optional[float]:
@@ -513,6 +528,12 @@ def update_trading_signals(symbol: str) -> Dict[str, bool]:
     price = st["price"]
     result = {"long_entry": False, "short_entry": False, "long_exit": False, "short_exit": False}
     try:
+        # Throttle signal checks - only check every 1 second minimum
+        now = time.time()
+        if (now - st["last_signal_check_time"]) < 1.0:
+            return result
+        st["last_signal_check_time"] = now
+        
         if price is None or not st["ready"]:
             return result
         try:
@@ -526,11 +547,12 @@ def update_trading_signals(symbol: str) -> Dict[str, bool]:
             return result
         jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
         jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-        er = calculate_efficiency_ratio(symbol)
-        if jma_fast is None or jma_slow is None or er is None:
+        er_fast = calculate_efficiency_ratio(symbol, ER_PERIODS_FAST, "fast")
+        er_slow = calculate_efficiency_ratio(symbol, ER_PERIODS_SLOW, "slow")
+        if jma_fast is None or jma_slow is None or er_fast is None or er_slow is None:
             return result
-        tama_fast = calculate_tama(symbol, jma_fast, kalman_close, er)
-        tama_slow = calculate_tama(symbol, jma_slow, kalman_close, er)
+        tama_fast = calculate_tama(symbol, jma_fast, kalman_close, er_fast)
+        tama_slow = calculate_tama(symbol, jma_slow, kalman_close, er_slow)
         if tama_fast is None or tama_slow is None:
             return result
         try:
@@ -609,6 +631,8 @@ async def execute_open_position(client: AsyncClient, symbol: str, side: str, siz
     try:
         st = state[symbol]
         now = time.time()
+        
+        # Update timestamp BEFORE attempting order
         if side == "LONG":
             if (now - st["last_long_exec_ts"]) < 2.0:
                 return False
@@ -619,6 +643,7 @@ async def execute_open_position(client: AsyncClient, symbol: str, side: str, siz
             st["last_short_exec_ts"] = now
         else:
             return False
+        
         order_side = "BUY" if side == "LONG" else "SELL"
         success = await place_order(client, symbol, order_side, size, f"{side} ENTRY")
         return success
@@ -689,12 +714,14 @@ async def price_feed_loop(client: AsyncClient):
                             apply_kalman_to_klines(symbol)
                             jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
                             jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-                            er = calculate_efficiency_ratio(symbol)
-                            if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
+                            er_fast = calculate_efficiency_ratio(symbol, ER_PERIODS_FAST, "fast")
+                            er_slow = calculate_efficiency_ratio(symbol, ER_PERIODS_SLOW, "slow")
+                            if (jma_fast is not None) and (jma_slow is not None) and (er_fast is not None) and (er_slow is not None):
                                 state[symbol]["ready"] = True
                                 logging.info(f"✅ {symbol} ready")
                         else:
-                            calculate_efficiency_ratio(symbol)
+                            calculate_efficiency_ratio(symbol, ER_PERIODS_FAST, "fast")
+                            calculate_efficiency_ratio(symbol, ER_PERIODS_SLOW, "slow")
                     except Exception as e:
                         logging.warning(f"Price feed error: {e}")
         except websockets.exceptions.ConnectionClosed:
@@ -707,7 +734,7 @@ async def price_feed_loop(client: AsyncClient):
 async def trading_loop(client: AsyncClient):
     while True:
         try:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)  # Increased from 0.1 to 1.0 second
             for symbol in SYMBOLS:
                 try:
                     st = state[symbol]
@@ -813,11 +840,12 @@ async def status_logger():
                 price = st["price"]
                 tama_fast = st.get("tama_fast")
                 tama_slow = st.get("tama_slow")
-                er = st.get("efficiency_ratio")
+                er_fast = st.get("efficiency_ratio_fast")
+                er_slow = st.get("efficiency_ratio_slow")
                 
-                if price and tama_fast and tama_slow and er is not None:
+                if price and tama_fast and tama_slow and er_fast is not None and er_slow is not None:
                     trend = "BULL ▲" if tama_fast > tama_slow else ("BEAR ▼" if tama_fast < tama_slow else "FLAT ═")
-                    logging.info(f"{symbol}: ${price:.6f} | {trend} | ER={er:.3f}")
+                    logging.info(f"{symbol}: ${price:.6f} | {trend} | ER_Fast={er_fast:.3f} ER_Slow={er_slow:.3f}")
                     logging.info(f"  TAMA Fast=${tama_fast:.6f} | Slow=${tama_slow:.6f}")
                     
                     long_lock = "🔒" if not st['long_entry_allowed'] else "🔓"
@@ -1026,8 +1054,9 @@ async def init_bot(client: AsyncClient):
                 apply_kalman_to_klines(symbol)
                 jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
                 jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-                er = calculate_efficiency_ratio(symbol)
-                if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
+                er_fast = calculate_efficiency_ratio(symbol, ER_PERIODS_FAST, "fast")
+                er_slow = calculate_efficiency_ratio(symbol, ER_PERIODS_SLOW, "slow")
+                if (jma_fast is not None) and (jma_slow is not None) and (er_fast is not None) and (er_slow is not None):
                     state[symbol]["ready"] = True
                     logging.info(f"✅ {symbol} ready (loaded)")
                 else:
@@ -1065,8 +1094,9 @@ async def init_bot(client: AsyncClient):
                     apply_kalman_to_klines(symbol)
                     jma_fast = calculate_jma_from_kalman(symbol, JMA_LENGTH_FAST, JMA_PHASE, JMA_POWER)
                     jma_slow = calculate_jma_from_kalman(symbol, JMA_LENGTH_SLOW, JMA_PHASE, JMA_POWER)
-                    er = calculate_efficiency_ratio(symbol)
-                    if (jma_fast is not None) and (jma_slow is not None) and (er is not None):
+                    er_fast = calculate_efficiency_ratio(symbol, ER_PERIODS_FAST, "fast")
+                    er_slow = calculate_efficiency_ratio(symbol, ER_PERIODS_SLOW, "slow")
+                    if (jma_fast is not None) and (jma_slow is not None) and (er_fast is not None) and (er_slow is not None):
                         st["ready"] = True
                         logging.info(f"✅ {symbol} ready (API)")
                     if i < len(symbols_needing_data) - 1:
@@ -1116,7 +1146,7 @@ if __name__ == "__main__":
     print(f"Triple-Layer Adaptive Moving Average:")
     print(f"  Layer 1: Kalman Filter (Q={KALMAN_Q}, R={KALMAN_R})")
     print(f"  Layer 2: JMA Fast={JMA_LENGTH_FAST}, Slow={JMA_LENGTH_SLOW}")
-    print(f"  Layer 3: ER Adaptation (α={ALPHA_WEIGHT})")
+    print(f"  Layer 3: Dual ER Adaptation - Fast ER={ER_PERIODS_FAST} periods, Slow ER={ER_PERIODS_SLOW} periods (α={ALPHA_WEIGHT})")
     print(f"")
     if USE_CROSSOVER_ENTRY:
         print(f"ENTRY MODE: CROSSOVER (Active)")
