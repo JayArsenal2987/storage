@@ -507,10 +507,26 @@ def apply_particle_filter_to_klines(symbol: str):
         klines = st["klines"]
         if len(klines) == 0:
             return
-        latest = klines[-1]
-        if "close" not in latest:
-            return
-        close_price = float(latest["close"])
+        if st["particle_filter"] is None:
+            if len(klines) > 0:
+                first_close = float(klines[0]["close"])
+                st["particle_filter"] = ParticleFilter(
+                    num_particles=PARTICLE_COUNT,
+                    process_noise=PARTICLE_PROCESS_NOISE,
+                    measurement_noise=PARTICLE_MEASUREMENT_NOISE,
+                    initial_price=first_close
+                )
+                for k in list(klines)[1:]:
+                    close = float(k["close"])
+                    filtered, uncertainty = st["particle_filter"].filter_step(close)
+                    st["particle_filtered_close"] = filtered
+                    st["particle_uncertainty"] = uncertainty
+        else:
+            latest = klines[-1]
+            close = float(latest["close"])
+            filtered, uncertainty = st["particle_filter"].filter_step(close)
+            st["particle_filtered_close"] = filtered
+            st["particle_uncertainty"] = uncertainty
     except Exception as e:
         logging.error(f"Particle filter application error {symbol}: {e}")
 
