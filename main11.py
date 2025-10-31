@@ -7,23 +7,23 @@ from collections import deque
 from typing import Optional, Dict, Any, Tuple
 from dotenv import load_dotenv
 
-========================= CONFIG =========================
+# ========================= CONFIG =========================
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 LEVERAGE = int(os.getenv("LEVERAGE", "50"))
 USE_LIVE_CANDLE = True
 
-========================= HEDGE MODE TOGGLE =========================
+# ========================= HEDGE MODE TOGGLE =========================
 USE_HEDGE_MODE = True
 
-========================= ENTRY MODE TOGGLE =========================
+# ========================= ENTRY MODE TOGGLE =========================
 USE_CROSSOVER_ENTRY = False
 
 #TAMA (Triple-Layer Adaptive Moving Average) PARAMETERS
 USE_TAMA = True
 #Layer 1: Particle Filter Parameters (REPLACES KALMAN)
-PARTICLE_COUNT = 100
+PARTICLE_COUNT = 50
 PARTICLE_PROCESS_NOISE = 0.001
 PARTICLE_MEASUREMENT_NOISE = 0.01
 #Layer 2: JMA Parameters
@@ -32,18 +32,18 @@ JMA_LENGTH_SLOW = 10
 JMA_PHASE = 0
 JMA_POWER = 3
 #Layer 3: Triple Efficiency Parameters (Yang-Zhang + Hurst + FDI)
-YZ_VOLATILITY_PERIOD = 14
-YZ_BASELINE_PERIOD = 100
-HURST_PERIODS_FAST = 30
-HURST_PERIODS_SLOW = 100
-FDI_PERIODS_FAST = 10
-FDI_PERIODS_SLOW = 30
+YZ_VOLATILITY_PERIOD = 7
+YZ_BASELINE_PERIOD = 50
+HURST_PERIODS_FAST = 15
+HURST_PERIODS_SLOW = 50
+FDI_PERIODS_FAST = 5
+FDI_PERIODS_SLOW = 15
 ALPHA_WEIGHT = 1.0
 #Layer 4: CMA Parameters
 CMA_PERIOD = 10
 #Trailing Stop Configuration
-TRAILING_GAIN_PERCENT = 1.5
-TRAILING_LOSS_PERCENT = 0.8
+TRAILING_GAIN_PERCENT = 1.2
+TRAILING_LOSS_PERCENT = 0.7
 #Timeframe configuration
 BASE_TIMEFRAME = "15m"
 SUPPORTED_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
@@ -82,7 +82,7 @@ PRECISIONS = {"SOLUSDT": 3}
 MA_PERIODS = max(JMA_LENGTH_FAST, JMA_LENGTH_SLOW)
 KLINE_LIMIT = max(100, MA_PERIODS + 100, HURST_PERIODS_FAST + 100, HURST_PERIODS_SLOW + 100, YZ_BASELINE_PERIOD + 100)
    
-========================= PARTICLE FILTER =========================
+# ========================= PARTICLE FILTER =========================
 class ParticleFilter:
     """
     Particle Filter for non-linear, non-Gaussian price filtering
@@ -205,7 +205,7 @@ class ParticleFilter:
         filtered_price = self.update(measurement)
         return filtered_price, np.sqrt(self.variance)
    
-========================= STATE =========================
+# ========================= STATE =========================
 state = {
     symbol: {
         "price": None,
@@ -254,7 +254,7 @@ state = {
 api_calls_count = 0
 api_calls_reset_time = time.time()
 
-========================= PERSISTENCE =========================
+# ========================= PERSISTENCE =========================
 def save_klines():
     try:
         save_data = {sym: list(state[sym]["klines"]) for sym in SYMBOLS}
@@ -352,7 +352,7 @@ def load_positions():
     except Exception as e:
         logging.error(f"❌ Failed to load positions: {e}")
 
-========================= HELPERS =========================
+# ========================= HELPERS =========================
 def round_size(size: float, symbol: str) -> float:
     try:
         prec = PRECISIONS.get(symbol, 3)
@@ -417,7 +417,7 @@ async def place_order(client: AsyncClient, symbol: str, side: str, quantity: flo
         logging.error(f"❌ {symbol} {action} FAILED: {e}")
         return False
 
-========================= TRAILING STOPS =========================
+# ========================= TRAILING STOPS =========================
 def initialize_trailing_stop(symbol: str, side: str, entry_price: float):
     try:
         st = state[symbol]
@@ -500,7 +500,7 @@ def reset_trailing_stop(symbol: str, side: str):
     except Exception as e:
         logging.error(f"❌ Reset stop error {symbol}: {e}")
 
-========================= PARTICLE FILTER APPLICATION =========================
+# ========================= PARTICLE FILTER APPLICATION =========================
 def apply_particle_filter_to_klines(symbol: str):
     try:
         st = state[symbol]
@@ -514,7 +514,7 @@ def apply_particle_filter_to_klines(symbol: str):
     except Exception as e:
         logging.error(f"Particle filter application error {symbol}: {e}")
 
-========================= JMA WITH PARTICLE FILTER =========================
+# ========================= JMA WITH PARTICLE FILTER =========================
 def calculate_jma_from_particle(symbol: str, length: int, phase: int = 50, power: int = 2) -> Optional[float]:
     try:
         klines = state[symbol]["klines"]
@@ -560,7 +560,7 @@ def calculate_jma_from_particle(symbol: str, length: int, phase: int = 50, power
         logging.error(f"JMA from particle error {symbol}: {e}")
         return None
 
-========================= YANG-ZHANG VOLATILITY =========================
+# ========================= YANG-ZHANG VOLATILITY =========================
 def calculate_yang_zhang_volatility(symbol: str, periods: int = 14) -> Optional[float]:
     try:
         klines = list(state[symbol]["klines"])
@@ -633,7 +633,7 @@ def calculate_yang_zhang_volatility(symbol: str, periods: int = 14) -> Optional[
         logging.error(f"Yang-Zhang error {symbol}: {e}")
         return None
 
-========================= HURST EXPONENT =========================
+# ========================= HURST EXPONENT =========================
 def calculate_hurst_simplified(symbol: str, periods: int = 50) -> Optional[float]:
     try:
         klines = list(state[symbol]["klines"])
@@ -696,7 +696,7 @@ def calculate_hurst_simplified(symbol: str, periods: int = 50) -> Optional[float
         logging.error(f"Hurst error {symbol}: {e}")
         return None
 
-========================= FRACTAL DIMENSION INDEX =========================
+# ========================= FRACTAL DIMENSION INDEX =========================
 def calculate_fdi(symbol: str, periods: int = 20) -> Optional[float]:
     try:
         klines = list(state[symbol]["klines"])
@@ -735,7 +735,7 @@ def calculate_fdi(symbol: str, periods: int = 20) -> Optional[float]:
         logging.error(f"FDI error {symbol}: {e}")
         return None
 
-========================= TRIPLE EFFICIENCY (YZ + HURST + FDI) =========================
+# ========================= TRIPLE EFFICIENCY (YZ + HURST + FDI) =========================
 def calculate_triple_efficiency(symbol: str, timeframe: str = "fast") -> Optional[float]:
     """
     Combine Yang-Zhang + Hurst + FDI for optimal efficiency metric
@@ -851,7 +851,7 @@ def calculate_triple_efficiency(symbol: str, timeframe: str = "fast") -> Optiona
         logging.error(f"Triple efficiency error {symbol} ({timeframe}): {e}")
         return None
 
-========================= TAMA =========================
+# ========================= TAMA =========================
 def calculate_tama(symbol: str, jma_value: Optional[float], particle_price: float, efficiency: Optional[float]) -> Optional[float]:
     try:
         if jma_value is None or particle_price is None:
@@ -868,7 +868,7 @@ def calculate_tama(symbol: str, jma_value: Optional[float], particle_price: floa
         logging.error(f"TAMA error {symbol}: {e}")
         return None
 
-========================= CMA =========================
+# ========================= CMA =========================
 def calculate_cma(tama_value: Optional[float], particle_close: float, period: int) -> Optional[float]:
     try:
         if tama_value is None or particle_close is None:
@@ -884,7 +884,7 @@ def calculate_cma(tama_value: Optional[float], particle_close: float, period: in
         logging.error(f"CMA error: {e}")
         return None
 
-========================= TRADING LOGIC =========================
+# ========================= TRADING LOGIC =========================
 def update_trading_signals(symbol: str) -> Dict[str, bool]:
     st = state[symbol]
     price = st["price"]
@@ -1043,7 +1043,7 @@ async def execute_close_position(client: AsyncClient, symbol: str, side: str, si
         logging.error(f"❌ Close error {symbol} {side}: {e}")
         return False
 
-========================= WEBSOCKET FEED =========================
+# ========================= WEBSOCKET FEED =========================
 async def price_feed_loop(client: AsyncClient):
     streams = [f"{s.lower()}@kline_{BASE_TIMEFRAME.lower()}" for s in SYMBOLS]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
@@ -1108,7 +1108,7 @@ async def price_feed_loop(client: AsyncClient):
             logging.warning(f"WS error: {e}")
             await asyncio.sleep(5)
 
-========================= TRADING LOOP =========================
+# ========================= TRADING LOOP =========================
 async def trading_loop(client: AsyncClient):
     while True:
         try:
@@ -1184,7 +1184,7 @@ async def trading_loop(client: AsyncClient):
             logging.error(f"❌ Critical trade loop error: {e}")
             await asyncio.sleep(1)
 
-========================= STATUS LOGGER =========================
+# ========================= STATUS LOGGER =========================
 async def status_logger():
     while True:
         try:
@@ -1282,7 +1282,7 @@ async def status_logger():
         except Exception as e:
             logging.error(f"Status error: {e}")
 
-========================= POSITION SANITY CHECK =========================
+# ========================= POSITION SANITY CHECK =========================
 async def position_sanity_check(client: AsyncClient):
     while True:
         try:
@@ -1385,7 +1385,7 @@ async def recover_positions_from_exchange(client: AsyncClient):
     except Exception as e:
         logging.error(f"❌ Recovery failed: {e}")
 
-========================= INITIALIZATION =========================
+# ========================= INITIALIZATION =========================
 async def init_bot(client: AsyncClient):
     try:
         logging.info("🔧 Initializing...")
@@ -1438,7 +1438,7 @@ async def init_bot(client: AsyncClient):
         logging.error(f"❌ Init error: {e}")
         raise
 
-========================= MAIN =========================
+# ========================= MAIN =========================
 async def main():
     if not API_KEY or not API_SECRET:
         raise ValueError("Missing API credentials")
