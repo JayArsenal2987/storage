@@ -18,7 +18,7 @@ USE_LIVE_CANDLE = True
 USE_HEDGE_MODE = True
 
 # ========================= ENTRY MODE TOGGLE =========================
-USE_CROSSOVER_ENTRY = False
+USE_CROSSOVER_ENTRY = True 
 
 #TAMA (Triple-Layer Adaptive Moving Average) PARAMETERS
 USE_TAMA = True
