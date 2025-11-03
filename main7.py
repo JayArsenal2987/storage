@@ -35,10 +35,10 @@ LMA_LENGTH = 15  # Leo Moving Average period
 
 # ========================= FIXED TP/SL PERCENTAGES =========================
 # These are the ONLY exit conditions - no cross-signals
-LONG_TP_PERCENT = 2.5   # Long take profit: 2.5%
-LONG_SL_PERCENT = 2.0   # Long stop loss: 2.0%
-SHORT_TP_PERCENT = 2.5  # Short take profit: 2.5%
-SHORT_SL_PERCENT = 2.0  # Short stop loss: 2.0%
+LONG_TP_PERCENT = 1.5   # Long take profit: 1.5%
+LONG_SL_PERCENT = 1.2   # Long stop loss: 1.2%
+SHORT_TP_PERCENT = 1.5  # Short take profit: 1.5%
+SHORT_SL_PERCENT = 1.2  # Short stop loss: 1.2%
 
 # Validate percentages are positive
 assert LONG_TP_PERCENT > 0 and LONG_SL_PERCENT > 0, "TP/SL must be positive"
